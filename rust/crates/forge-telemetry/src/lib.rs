@@ -9,4 +9,4 @@ mod protocol;
 mod server;
 
 pub use protocol::{ClientMessage, Decl, Kind, Scalar, Tensor, Timing, Track, DEFAULT_MAX_DIM};
-pub use server::{Event, TelemetryServer};
+pub use server::{Event, Symbolicator, TelemetryServer};

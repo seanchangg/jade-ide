@@ -366,6 +366,48 @@ async fn server_initiated_rename_translates_track_to_probe_name() {
 }
 
 #[tokio::test]
+async fn rename_of_enabled_item_rebroadcasts_track_under_new_name() {
+    let path = test_socket("retrack");
+    let (server, mut events) = TelemetryServer::start(path.clone()).unwrap();
+
+    let mut client = UnixStream::connect(&path).await.unwrap();
+    let mut reader = BufReader::new(UnixStream::connect(&path).await.unwrap()).lines();
+
+    // Placeholder declared and enabled BEFORE the probe labels it.
+    client
+        .write_all(b"{\"type\":\"decl\",\"kind\":\"buffer\",\"name\":\"buffer#0\"}\n")
+        .await
+        .unwrap();
+    match next_event(&mut events).await {
+        Event::Decl { name, .. } => assert_eq!(name, "buffer#0"),
+        other => panic!("expected Decl, got {other:?}"),
+    }
+    server.set_track(Kind::Buffer, "buffer#0", true, Some(64), None);
+    let first = reader.next_line().await.unwrap().unwrap();
+    assert_eq!(serde_json::from_str::<Value>(&first).unwrap()["name"], "buffer#0");
+
+    // Probe renames itself via setLabel. Streaming must not go dark: the
+    // migrated enabled state is re-broadcast under the NEW name.
+    client
+        .write_all(
+            b"{\"type\":\"decl\",\"kind\":\"buffer\",\"name\":\"model.weights\",\"meta\":{\"renamedFrom\":\"buffer#0\"}}\n",
+        )
+        .await
+        .unwrap();
+    let retrack = timeout(Duration::from_secs(2), reader.next_line())
+        .await
+        .expect("expected a re-broadcast track after rename")
+        .unwrap()
+        .unwrap();
+    let v: Value = serde_json::from_str(&retrack).unwrap();
+    assert_eq!(v["name"], "model.weights");
+    assert_eq!(v["enabled"], true);
+    assert_eq!(v["maxDim"], 64);
+
+    server.stop();
+}
+
+#[tokio::test]
 async fn stop_removes_socket_file() {
     let path = test_socket("stop");
     let (server, _events) = TelemetryServer::start(path.clone()).unwrap();

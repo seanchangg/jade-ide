@@ -12,11 +12,14 @@
 //! - `track` messages sent to clients use the client's own (probe) name for
 //!   aliased buffers
 //!
-//! Not yet ported: automatic buffer alias resolution via `atos` symbolication
-//! (`resolveBufferAlias`). The rename mechanics it feeds are here; the
-//! symbolication hook lands with the build-runner integration.
+//! Buffer alias resolution via `atos` symbolication (`resolveBufferAlias`) is
+//! wired through the [`Symbolicator`] hook: `forge-build` installs an
+//! implementation (atos + source-line variable-name extraction) via
+//! [`TelemetryServer::set_symbolicator`]; this module owns the alias maps, the
+//! `aliasPending` re-entrancy guard, the collision-resolution / rename step, and
+//! the `knownAlias` re-declaration short-circuit (telemetry-server.ts:186-289).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -27,6 +30,22 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 
 use crate::protocol::*;
+
+/// Symbolication hook: given allocation-site return addresses, the target
+/// executable, and its ASLR slide (`load` address), return candidate variable
+/// names for the buffer's allocation site, **innermost frame first**.
+///
+/// This is the `atos` + source-line-regex half of `telemetry-server.ts`'s
+/// `resolveBufferAlias` / `extractVarName` (`:239-319`). It is toolchain
+/// business, so `forge-build` provides the implementation; the server keeps the
+/// alias bookkeeping (collision resolution, `probeOf`/`aliasOf` maps, rename).
+///
+/// `exe` is `None` when the probe did not report `meta.exe`; the implementation
+/// is expected to fall back to the executable it was configured with in
+/// `run()`.
+pub trait Symbolicator: Send + Sync {
+    fn variable_names(&self, addrs: &[String], exe: Option<&str>, load: &str) -> Vec<String>;
+}
 
 /// Events surfaced to the UI layer (the Rust analogue of the renderer IPC
 /// channels `telemetry:decl` / `telemetry:tensor` / the legacy scalar/timing
@@ -88,6 +107,11 @@ struct State {
     display_names: HashMap<String, String>,
     clients: HashMap<u64, mpsc::UnboundedSender<String>>,
     events: mpsc::UnboundedSender<Event>,
+    /// Probe names whose atos symbolication is in flight (telemetry-server.ts
+    /// `aliasPending`), so a re-declare mid-resolve doesn't spawn a duplicate.
+    alias_pending: HashSet<String>,
+    /// Installed by `forge-build` before a run; see [`Symbolicator`].
+    symbolicator: Option<Arc<dyn Symbolicator>>,
 }
 
 impl State {
@@ -184,6 +208,42 @@ impl State {
         });
     }
 
+    /// Turn symbolicated variable-name parts (innermost first) into a unique
+    /// buffer alias and migrate the probe's entry onto it, recording the
+    /// two-way alias so `track` messages translate back to the probe's name.
+    /// Port of `resolveBufferAlias`'s tail (telemetry-server.ts:267-289): take
+    /// the innermost name, prepend outer scopes until unique ("buf" →
+    /// "attn.buf"), then disambiguate with `#2`, `#3`… suffixes. Always clears
+    /// the `aliasPending` guard (the TS `finally`).
+    fn apply_symbolicated_alias(&mut self, kind: Kind, probe_name: &str, parts: Vec<String>) {
+        if !parts.is_empty() {
+            let mut alias = parts[0].clone();
+            let mut i = 1;
+            while i < parts.len() && self.probe_names.contains_key(&key_of(kind, &alias)) {
+                alias = format!("{}.{}", parts[i], alias);
+                i += 1;
+            }
+            if self.probe_names.contains_key(&key_of(kind, &alias)) {
+                let mut k = 2;
+                while self
+                    .probe_names
+                    .contains_key(&key_of(kind, &format!("{}#{}", alias, k)))
+                {
+                    k += 1;
+                }
+                alias = format!("{}#{}", alias, k);
+            }
+            if alias != probe_name {
+                self.probe_names
+                    .insert(key_of(kind, &alias), probe_name.to_string());
+                self.display_names
+                    .insert(key_of(kind, probe_name), alias.clone());
+                self.rename(kind, probe_name, &alias, None);
+            }
+        }
+        self.alias_pending.remove(probe_name);
+    }
+
     fn track_line(&self, kind: Kind, display_name: &str, item: &Item) -> String {
         let track = Track {
             msg_type: "track",
@@ -234,6 +294,8 @@ impl TelemetryServer {
             display_names: HashMap::new(),
             clients: HashMap::new(),
             events: events_tx,
+            alias_pending: HashSet::new(),
+            symbolicator: None,
         }));
 
         let accept_state = state.clone();
@@ -262,6 +324,13 @@ impl TelemetryServer {
 
     pub fn socket_path(&self) -> &PathBuf {
         &self.socket_path
+    }
+
+    /// Install the `atos` symbolication hook. `forge-build` calls this before a
+    /// run so probe-discovered buffers get their allocation-site variable names
+    /// (telemetry-server.ts:196-205). Replaces any previously-installed hook.
+    pub fn set_symbolicator(&self, symbolicator: Arc<dyn Symbolicator>) {
+        self.state.lock().unwrap().symbolicator = Some(symbolicator);
     }
 
     /// UI → server: enable/disable an item and broadcast the `track` to every
@@ -417,14 +486,14 @@ async fn handle_client(stream: UnixStream, client_id: u64, state: Arc<Mutex<Stat
     writer_task.abort();
 }
 
-fn handle_line(line: &str, state: &Arc<Mutex<State>>) {
+fn handle_line(line: &str, state_arc: &Arc<Mutex<State>>) {
     if line.is_empty() {
         return;
     }
     let Some(message) = ClientMessage::parse(line) else {
         return; // malformed or unrecognized: skip silently
     };
-    let mut state = state.lock().unwrap();
+    let mut state = state_arc.lock().unwrap();
     match message {
         ClientMessage::Decl(decl) => {
             let renamed_from = decl
@@ -444,8 +513,39 @@ fn handle_line(line: &str, state: &Arc<Mutex<State>>) {
                     }
                     let from_name = old_alias.unwrap_or(from);
                     state.rename(decl.kind, &from_name, &decl.name, decl.meta.as_ref());
+                    // The client keys its own gating by its CURRENT name: a
+                    // buffer enabled under the placeholder stops streaming
+                    // after setLabel unless we re-broadcast the track under
+                    // the new name. The Electron renderer only re-pushed when
+                    // a stored pref applied (telemetry-panel.ts:154-158) —
+                    // enabled-before-rename silently went dark there; fixed
+                    // deliberately here (see jade-feature-inventory.md §11).
+                    let key = key_of(decl.kind, &decl.name);
+                    if let Some(item) = state.items.get(&key).cloned() {
+                        if item.enabled {
+                            let line = state.track_line(decl.kind, &decl.name, &item);
+                            state.broadcast(&line);
+                        }
+                    }
                 }
-                _ => state.declare(decl.kind, &decl.name, decl.meta.as_ref()),
+                _ => {
+                    // A buffer re-declared on a later run (deterministic probe
+                    // name) that we already aliased: declare under the alias so
+                    // we don't resurrect the row the rename removed
+                    // (telemetry-server.ts:186-194).
+                    if decl.kind == Kind::Buffer {
+                        if let Some(alias) = state
+                            .display_names
+                            .get(&key_of(Kind::Buffer, &decl.name))
+                            .cloned()
+                        {
+                            state.declare(Kind::Buffer, &alias, decl.meta.as_ref());
+                            return;
+                        }
+                    }
+                    state.declare(decl.kind, &decl.name, decl.meta.as_ref());
+                    maybe_symbolicate(&mut state, state_arc, &decl);
+                }
             }
         }
         ClientMessage::Scalar(mut scalar) => {
@@ -493,4 +593,55 @@ fn handle_line(line: &str, state: &Arc<Mutex<State>>) {
             });
         }
     }
+}
+
+/// Kick off async variable-name resolution for a probe-discovered buffer whose
+/// meta carries allocation-site addresses (telemetry-server.ts:196-205). The
+/// blocking `atos`/source work runs off the runtime; the result is applied back
+/// under the state lock. No-op unless a [`Symbolicator`] is installed and the
+/// meta has an `addrs` array + a `load` address (atos needs `-l`).
+fn maybe_symbolicate(state: &mut State, state_arc: &Arc<Mutex<State>>, decl: &Decl) {
+    if decl.kind != Kind::Buffer {
+        return;
+    }
+    let Some(symbolicator) = state.symbolicator.clone() else {
+        return;
+    };
+    let Some(meta) = decl.meta.as_ref() else {
+        return;
+    };
+    let addrs: Vec<String> = match meta.get("addrs").and_then(Value::as_array) {
+        Some(arr) => arr
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+        None => return,
+    };
+    if addrs.is_empty() {
+        return;
+    }
+    // atos requires the ASLR load address; the exe may be supplied by the probe
+    // or fall back to the run()-configured executable inside the symbolicator.
+    let Some(load) = meta.get("load").and_then(Value::as_str).map(str::to_string) else {
+        return;
+    };
+    let exe = meta.get("exe").and_then(Value::as_str).map(str::to_string);
+
+    let probe_name = decl.name.clone();
+    if !state.alias_pending.insert(probe_name.clone()) {
+        return; // already resolving this probe name
+    }
+
+    let state_arc = state_arc.clone();
+    tokio::spawn(async move {
+        let names = tokio::task::spawn_blocking(move || {
+            symbolicator.variable_names(&addrs, exe.as_deref(), &load)
+        })
+        .await
+        .unwrap_or_default();
+        state_arc
+            .lock()
+            .unwrap()
+            .apply_symbolicated_alias(Kind::Buffer, &probe_name, names);
+    });
 }
