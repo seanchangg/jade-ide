@@ -1,6 +1,13 @@
 [workspace]
 resolver = "2"
-members = ["crates/forge-telemetry", "crates/jade"]
+members = [
+    "crates/forge-telemetry",
+    "crates/forge-build",
+    "crates/forge-debug",
+    "crates/forge-ai",
+    "crates/forge-sysmon",
+    "crates/jade",
+]
 
 [workspace.package]
 version = "0.1.0"
