@@ -165,6 +165,7 @@ app.on('window-all-closed', () => {
 });
 
 app.on('will-quit', () => {
+  aiBackend?.shutdown();
   shutdownTelemetry();
 });
 

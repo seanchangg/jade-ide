@@ -9,5 +9,8 @@ description = "Jade — memory-aware C++/Metal IDE with live GPU training visual
 # Zed's GPU-accelerated UI framework, used as a library — Jade borrows the
 # engine, not the editor shell. Pinned by rev once the spike stabilizes.
 gpui = { git = "https://github.com/zed-industries/zed" }
+# font-kit is off by default and without it gpui_macos has no font provider —
+# no text renders at all (bites every standalone GPUI consumer).
+gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit"] }
 forge-telemetry = { path = "../forge-telemetry" }
 tokio = { workspace = true }

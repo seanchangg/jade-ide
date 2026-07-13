@@ -8,10 +8,13 @@ import { IPC, AiStatus, AiModelId, InfillRequest, InfillResult } from '../shared
 // (fill-in-the-middle) API. Resolution order:
 //   1. JADE_FIM_ENDPOINT env var (user-managed server, any host)
 //   2. http://127.0.0.1:8012 (llama.vscode convention — reuse if already running)
-//   3. Spawn our own llama-server with a small FIM model (downloads on first run)
+//   3. Our managed port — adopts a server orphaned by a crashed previous run,
+//      which would otherwise hold the port and make the spawn below fail
+//   4. Spawn our own llama-server with a small FIM model (downloads on first run)
 
 const DEFAULT_ENDPOINT = 'http://127.0.0.1:8012';
 const MANAGED_PORT = 8630;
+const MANAGED_ENDPOINT = `http://127.0.0.1:${MANAGED_PORT}`;
 
 export const AI_MODELS: Record<AiModelId, { hf: string; label: string }> = {
   fast:     { hf: 'ggml-org/Qwen2.5-Coder-1.5B-Q8_0-GGUF', label: 'Qwen2.5-Coder 1.5B' },
@@ -34,12 +37,19 @@ export class InlineCompletionBackend {
   private stopped = false;
   private modelId: AiModelId = 'fast';
 
+  constructor() {
+    // Last-resort orphan guard: Electron's quit events don't fire on
+    // process.exit() or fatal errors, and a leaked llama-server keeps the
+    // managed port (and GPU memory) until killed by hand.
+    process.on('exit', () => this.proc?.kill());
+  }
+
   async start(): Promise<void> {
     // Idempotent — a second call while running or mid-startup is a no-op
     if (this.proc || this.status.state === 'ready' || this.status.state === 'starting') return;
     this.stopped = false;
 
-    const candidates = [process.env.JADE_FIM_ENDPOINT, DEFAULT_ENDPOINT]
+    const candidates = [process.env.JADE_FIM_ENDPOINT, DEFAULT_ENDPOINT, MANAGED_ENDPOINT]
       .filter((e): e is string => !!e);
 
     this.setStatus({ state: 'starting', detail: 'Looking for a completion server…' });
@@ -80,14 +90,14 @@ export class InlineCompletionBackend {
     this.setStatus({ state: 'disabled', detail });
   }
 
-  // Switch the managed model tier. Restarts the server if it's running our
-  // model; external endpoints (JADE_FIM_ENDPOINT / 8012) pick their own model.
+  // Switch the managed model tier. Restarts the server if it's a child we
+  // spawned; endpoints we merely connected to (JADE_FIM_ENDPOINT / 8012 /
+  // an adopted orphan on the managed port) pick their own model.
   async setModel(id: AiModelId): Promise<void> {
     if (!AI_MODELS[id] || id === this.modelId) return;
     this.modelId = id;
 
-    const usingManaged = !!this.proc ||
-      (this.endpoint !== null && this.endpoint.endsWith(`:${MANAGED_PORT}`));
+    const usingManaged = !!this.proc;
     const running = this.status.state === 'ready' || this.status.state === 'starting';
     if (!running) return;               // off/errored — new tier applies on next start
     if (!usingManaged && this.status.state === 'ready') return;
@@ -181,7 +191,7 @@ export class InlineCompletionBackend {
   }
 
   private spawnManaged(bin: string): void {
-    const endpoint = `http://127.0.0.1:${MANAGED_PORT}`;
+    const endpoint = MANAGED_ENDPOINT;
     const model = AI_MODELS[this.modelId];
     this.setStatus({
       state: 'starting',
