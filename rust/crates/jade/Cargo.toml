@@ -1,0 +1,13 @@
+[package]
+name = "jade"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Jade — memory-aware C++/Metal IDE with live GPU training visualization"
+
+[dependencies]
+# Zed's GPU-accelerated UI framework, used as a library — Jade borrows the
+# engine, not the editor shell. Pinned by rev once the spike stabilizes.
+gpui = { git = "https://github.com/zed-industries/zed" }
+forge-telemetry = { path = "../forge-telemetry" }
+tokio = { workspace = true }

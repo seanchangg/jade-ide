@@ -1,0 +1,496 @@
+//! The telemetry server: accepts Unix-socket clients, maintains the item
+//! registry, gates/forwards data to the UI, and broadcasts `track` control
+//! messages. Port of `src/main/telemetry-server.ts`.
+//!
+//! Semantics preserved from the TS implementation:
+//! - stale socket file deleted on start, socket file removed on stop
+//! - multiple concurrent clients; enabled `track`s replayed to new clients
+//! - registry defaults `enabled: false`, `maxDim: 128`; late `meta` merged and
+//!   the decl re-emitted
+//! - `meta.renamedFrom` migrates an existing entry, carrying enabled state
+//! - tensor frames for disabled buffers are dropped
+//! - `track` messages sent to clients use the client's own (probe) name for
+//!   aliased buffers
+//!
+//! Not yet ported: automatic buffer alias resolution via `atos` symbolication
+//! (`resolveBufferAlias`). The rename mechanics it feeds are here; the
+//! symbolication hook lands with the build-runner integration.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde_json::{Map, Value};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::mpsc;
+
+use crate::protocol::*;
+
+/// Events surfaced to the UI layer (the Rust analogue of the renderer IPC
+/// channels `telemetry:decl` / `telemetry:tensor` / the legacy scalar/timing
+/// build channels).
+#[derive(Debug, Clone)]
+pub enum Event {
+    Decl {
+        kind: Kind,
+        name: String,
+        meta: Option<Map<String, Value>>,
+        renamed_from: Option<String>,
+    },
+    Scalar(Scalar),
+    Timing(Timing),
+    /// Frame for an enabled buffer, base64 already decoded (decode-once, as the
+    /// TS renderer did in telemetry-panel.ts).
+    Tensor {
+        name: String,
+        step: i64,
+        rows: u32,
+        cols: u32,
+        src_rows: Option<u32>,
+        src_cols: Option<u32>,
+        dtype: String,
+        data: Vec<f32>,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct Item {
+    enabled: bool,
+    max_dim: u32,
+    meta: Option<Map<String, Value>>,
+    shape_rows: Option<u32>,
+    shape_cols: Option<u32>,
+}
+
+impl Default for Item {
+    fn default() -> Self {
+        Item {
+            enabled: false,
+            max_dim: DEFAULT_MAX_DIM,
+            meta: None,
+            shape_rows: None,
+            shape_cols: None,
+        }
+    }
+}
+
+fn key_of(kind: Kind, name: &str) -> String {
+    format!("{} {}", kind.as_str(), name)
+}
+
+struct State {
+    items: HashMap<String, Item>,
+    /// display key -> probe (client-side) name, for aliased buffers
+    probe_names: HashMap<String, String>,
+    /// probe key -> display name
+    display_names: HashMap<String, String>,
+    clients: HashMap<u64, mpsc::UnboundedSender<String>>,
+    events: mpsc::UnboundedSender<Event>,
+}
+
+impl State {
+    fn display_name(&self, kind: Kind, probe_name: &str) -> String {
+        self.display_names
+            .get(&key_of(kind, probe_name))
+            .cloned()
+            .unwrap_or_else(|| probe_name.to_string())
+    }
+
+    fn probe_name(&self, kind: Kind, display_name: &str) -> String {
+        self.probe_names
+            .get(&key_of(kind, display_name))
+            .cloned()
+            .unwrap_or_else(|| display_name.to_string())
+    }
+
+    /// Register `name` if new (emitting a decl), or merge late-arriving meta
+    /// into an existing entry and re-emit the decl — matching TS `declare()`.
+    fn declare(&mut self, kind: Kind, name: &str, meta: Option<&Map<String, Value>>) {
+        let key = key_of(kind, name);
+        match self.items.get_mut(&key) {
+            None => {
+                self.items.insert(
+                    key,
+                    Item {
+                        meta: meta.cloned(),
+                        ..Item::default()
+                    },
+                );
+                let _ = self.events.send(Event::Decl {
+                    kind,
+                    name: name.to_string(),
+                    meta: meta.cloned(),
+                    renamed_from: None,
+                });
+            }
+            Some(item) => {
+                if let Some(new_meta) = meta {
+                    let merged_meta = match item.meta.take() {
+                        Some(mut existing) => {
+                            for (k, v) in new_meta {
+                                existing.insert(k.clone(), v.clone());
+                            }
+                            existing
+                        }
+                        None => new_meta.clone(),
+                    };
+                    item.meta = Some(merged_meta.clone());
+                    let _ = self.events.send(Event::Decl {
+                        kind,
+                        name: name.to_string(),
+                        meta: Some(merged_meta),
+                        renamed_from: None,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Migrate an item to a new name, preserving enabled state. If the
+    /// destination already exists, the old placeholder is simply dropped.
+    /// Pure registry migration — alias maps are managed by the callers, since
+    /// probe-initiated and server-initiated renames differ (see handle_line
+    /// and TelemetryServer::rename).
+    fn rename(&mut self, kind: Kind, from: &str, to: &str, meta: Option<&Map<String, Value>>) {
+        let from_key = key_of(kind, from);
+        let to_key = key_of(kind, to);
+        if let Some(mut item) = self.items.remove(&from_key) {
+            if !self.items.contains_key(&to_key) {
+                if let Some(new_meta) = meta {
+                    let mut merged = item.meta.take().unwrap_or_default();
+                    for (k, v) in new_meta {
+                        merged.insert(k.clone(), v.clone());
+                    }
+                    item.meta = Some(merged);
+                }
+                self.items.insert(to_key.clone(), item);
+            }
+        } else if !self.items.contains_key(&to_key) {
+            self.items.insert(
+                to_key,
+                Item {
+                    meta: meta.cloned(),
+                    ..Item::default()
+                },
+            );
+        }
+        let _ = self.events.send(Event::Decl {
+            kind,
+            name: to.to_string(),
+            meta: meta.cloned(),
+            renamed_from: Some(from.to_string()),
+        });
+    }
+
+    fn track_line(&self, kind: Kind, display_name: &str, item: &Item) -> String {
+        let track = Track {
+            msg_type: "track",
+            kind,
+            name: self.probe_name(kind, display_name),
+            enabled: item.enabled,
+            max_dim: item.max_dim,
+            rows: item.shape_rows,
+            cols: item.shape_cols,
+        };
+        let mut line = serde_json::to_string(&track).expect("track serializes");
+        line.push('\n');
+        line
+    }
+
+    fn broadcast(&mut self, line: &str) {
+        self.clients
+            .retain(|_, tx| tx.send(line.to_string()).is_ok());
+    }
+}
+
+/// A running telemetry server. Dropping the handle does not stop the server;
+/// call [`TelemetryServer::stop`].
+pub struct TelemetryServer {
+    socket_path: PathBuf,
+    state: Arc<Mutex<State>>,
+    accept_task: tokio::task::JoinHandle<()>,
+}
+
+impl TelemetryServer {
+    /// Default PID-scoped socket path, matching the TS server:
+    /// `<tmpdir>/forge-telemetry-<pid>.sock`.
+    pub fn default_socket_path() -> PathBuf {
+        std::env::temp_dir().join(format!("forge-telemetry-{}.sock", std::process::id()))
+    }
+
+    /// Bind and start accepting clients. Returns the server handle and the
+    /// event stream for the UI layer.
+    pub fn start(socket_path: PathBuf) -> std::io::Result<(Self, mpsc::UnboundedReceiver<Event>)> {
+        // Crash recovery: remove a stale socket file from a previous run.
+        let _ = std::fs::remove_file(&socket_path);
+        let listener = UnixListener::bind(&socket_path)?;
+
+        let (events_tx, events_rx) = mpsc::unbounded_channel();
+        let state = Arc::new(Mutex::new(State {
+            items: HashMap::new(),
+            probe_names: HashMap::new(),
+            display_names: HashMap::new(),
+            clients: HashMap::new(),
+            events: events_tx,
+        }));
+
+        let accept_state = state.clone();
+        let accept_task = tokio::spawn(async move {
+            let mut next_client_id: u64 = 0;
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _)) => {
+                        next_client_id += 1;
+                        tokio::spawn(handle_client(stream, next_client_id, accept_state.clone()));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Ok((
+            TelemetryServer {
+                socket_path,
+                state,
+                accept_task,
+            },
+            events_rx,
+        ))
+    }
+
+    pub fn socket_path(&self) -> &PathBuf {
+        &self.socket_path
+    }
+
+    /// UI → server: enable/disable an item and broadcast the `track` to every
+    /// connected client. Port of TS `setTrack`.
+    pub fn set_track(
+        &self,
+        kind: Kind,
+        name: &str,
+        enabled: bool,
+        max_dim: Option<u32>,
+        shape: Option<(u32, u32)>,
+    ) {
+        let mut state = self.state.lock().unwrap();
+        state.declare(kind, name, None);
+        let key = key_of(kind, name);
+        let line = {
+            let item = state.items.get_mut(&key).expect("declared above");
+            item.enabled = enabled;
+            item.max_dim = match max_dim {
+                Some(d) if d > 0 => d,
+                _ => DEFAULT_MAX_DIM,
+            };
+            if let Some((rows, cols)) = shape {
+                if rows > 0 && cols > 0 {
+                    item.shape_rows = Some(rows);
+                    item.shape_cols = Some(cols);
+                }
+            }
+            let item = item.clone();
+            state.track_line(kind, name, &item)
+        };
+        state.broadcast(&line);
+    }
+
+    /// Server-initiated rename (e.g. after symbolicating a buffer's allocation
+    /// site with atos). The client still speaks its own name, so the alias is
+    /// recorded in both directions and `track` messages are translated back.
+    pub fn rename(&self, kind: Kind, from: &str, to: &str) {
+        let mut state = self.state.lock().unwrap();
+        state
+            .probe_names
+            .insert(key_of(kind, to), from.to_string());
+        state
+            .display_names
+            .insert(key_of(kind, from), to.to_string());
+        state.rename(kind, from, to, None);
+    }
+
+    /// Legacy `__FORGE_SCALAR` stdout path: auto-registers like a socket decl
+    /// and forwards to the UI. Port of TS `ingestScalar`.
+    pub fn ingest_scalar(&self, mut scalar: Scalar) {
+        if scalar.t.is_none() {
+            scalar.t = Some(now_unix_seconds());
+        }
+        let mut state = self.state.lock().unwrap();
+        state.declare(Kind::Scalar, &scalar.name.clone(), None);
+        let _ = state.events.send(Event::Scalar(scalar));
+    }
+
+    /// Legacy `__FORGE_TIMING` stdout path. Port of TS `ingestTiming`.
+    pub fn ingest_timing(&self, timing: Timing) {
+        let mut state = self.state.lock().unwrap();
+        state.declare(Kind::Timer, &timing.name.clone(), None);
+        let _ = state.events.send(Event::Timing(timing));
+    }
+
+    /// Whether an item is currently enabled (used by tests and the UI).
+    pub fn is_enabled(&self, kind: Kind, name: &str) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .items
+            .get(&key_of(kind, name))
+            .map(|i| i.enabled)
+            .unwrap_or(false)
+    }
+
+    /// Stop accepting, disconnect clients, remove the socket file.
+    pub fn stop(self) {
+        self.accept_task.abort();
+        let mut state = self.state.lock().unwrap();
+        state.clients.clear(); // writer tasks end when their channels close
+        let _ = std::fs::remove_file(&self.socket_path);
+    }
+}
+
+fn now_unix_seconds() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+async fn handle_client(stream: UnixStream, client_id: u64, state: Arc<Mutex<State>>) {
+    let (mut reader, mut writer) = stream.into_split();
+
+    // Writer half: control messages queued for this client.
+    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+
+    // Replay current selections so a late-joining probe learns what to stream.
+    // Per the spec, only enabled:true tracks are replayed on connect.
+    {
+        let mut state = state.lock().unwrap();
+        let replays: Vec<String> = state
+            .items
+            .iter()
+            .filter(|(_, item)| item.enabled)
+            .map(|(key, item)| {
+                let (kind_str, name) = key.split_once(' ').expect("key format");
+                let kind = match kind_str {
+                    "scalar" => Kind::Scalar,
+                    "timer" => Kind::Timer,
+                    _ => Kind::Buffer,
+                };
+                state.track_line(kind, name, item)
+            })
+            .collect();
+        for line in replays {
+            let _ = tx.send(line);
+        }
+        state.clients.insert(client_id, tx);
+    }
+
+    let writer_task = tokio::spawn(async move {
+        while let Some(line) = rx.recv().await {
+            if writer.write_all(line.as_bytes()).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // Reader half: NDJSON framing with partial-line reassembly and the 8 MB
+    // runaway-line guard.
+    let mut buffer = String::new();
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        match reader.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                buffer.push_str(&String::from_utf8_lossy(&chunk[..n]));
+                while let Some(newline) = buffer.find('\n') {
+                    let line: String = buffer.drain(..=newline).collect();
+                    handle_line(line.trim(), &state);
+                }
+                if buffer.len() > MAX_PARTIAL_LINE {
+                    buffer.clear();
+                }
+            }
+        }
+    }
+
+    state.lock().unwrap().clients.remove(&client_id);
+    writer_task.abort();
+}
+
+fn handle_line(line: &str, state: &Arc<Mutex<State>>) {
+    if line.is_empty() {
+        return;
+    }
+    let Some(message) = ClientMessage::parse(line) else {
+        return; // malformed or unrecognized: skip silently
+    };
+    let mut state = state.lock().unwrap();
+    match message {
+        ClientMessage::Decl(decl) => {
+            let renamed_from = decl
+                .meta
+                .as_ref()
+                .and_then(|m| m.get("renamedFrom"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            match renamed_from {
+                // Probe-initiated rename: the client now speaks the NEW name,
+                // so any server-side alias for the old name is dropped and no
+                // reverse translation is recorded (telemetry-server.ts:169-184).
+                Some(from) if from != decl.name => {
+                    let old_alias = state.display_names.remove(&key_of(decl.kind, &from));
+                    if let Some(alias) = &old_alias {
+                        state.probe_names.remove(&key_of(decl.kind, alias));
+                    }
+                    let from_name = old_alias.unwrap_or(from);
+                    state.rename(decl.kind, &from_name, &decl.name, decl.meta.as_ref());
+                }
+                _ => state.declare(decl.kind, &decl.name, decl.meta.as_ref()),
+            }
+        }
+        ClientMessage::Scalar(mut scalar) => {
+            if scalar.t.is_none() {
+                scalar.t = Some(now_unix_seconds());
+            }
+            scalar.name = state.display_name(Kind::Scalar, &scalar.name);
+            state.declare(Kind::Scalar, &scalar.name.clone(), None);
+            let _ = state.events.send(Event::Scalar(scalar));
+        }
+        ClientMessage::Timing(mut timing) => {
+            timing.name = state.display_name(Kind::Timer, &timing.name);
+            state.declare(Kind::Timer, &timing.name.clone(), None);
+            let _ = state.events.send(Event::Timing(timing));
+        }
+        ClientMessage::Tensor(tensor) => {
+            let display = state.display_name(Kind::Buffer, &tensor.name);
+            let mut meta = Map::new();
+            meta.insert("rows".into(), tensor.rows.into());
+            meta.insert("cols".into(), tensor.cols.into());
+            meta.insert("dtype".into(), tensor.dtype.clone().into());
+            state.declare(Kind::Buffer, &display, Some(&meta));
+            // Gate: drop frames for buffers the UI hasn't enabled, even if the
+            // client sends them anyway.
+            let enabled = state
+                .items
+                .get(&key_of(Kind::Buffer, &display))
+                .map(|i| i.enabled)
+                .unwrap_or(false);
+            if !enabled {
+                return;
+            }
+            let Some(data) = tensor.decode() else {
+                return; // bad payload: skip silently like any malformed line
+            };
+            let _ = state.events.send(Event::Tensor {
+                name: display,
+                step: tensor.step,
+                rows: tensor.rows,
+                cols: tensor.cols,
+                src_rows: tensor.src_rows,
+                src_cols: tensor.src_cols,
+                dtype: tensor.dtype,
+                data,
+            });
+        }
+    }
+}

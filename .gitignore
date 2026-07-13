@@ -1,0 +1,21 @@
+# Node / Electron
+node_modules/
+dist/
+release/
+
+# Rust
+rust/target/
+
+# Probe build artifacts (built by probe/Makefile)
+probe/*.dylib
+probe/test_train
+probe/probe.log
+
+# CMake build dirs created by the IDE itself
+cmake-build-forge/
+
+# macOS
+.DS_Store
+
+# Local agent settings
+.claude/settings.local.json
