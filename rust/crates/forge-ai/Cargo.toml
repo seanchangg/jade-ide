@@ -3,5 +3,17 @@ name = "forge-ai"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Jade AI inline-completion backend: llama.cpp llama-server manager + /infill client (port of src/main/inline-completion.ts)"
 
 [dependencies]
+# `process` is additive to the workspace tokio feature set (rt-multi-thread,
+# net, io-util, sync, time, macros) — needed to spawn/monitor llama-server.
+tokio = { workspace = true, features = ["process"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# rustls keeps us off OpenSSL; all managed traffic is plain HTTP to 127.0.0.1,
+# but JADE_FIM_ENDPOINT may point at any (possibly https) host — see TS :52.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
