@@ -53,7 +53,7 @@ pub fn overlay(app: &JadeApp, cx: &mut Context<JadeApp>) -> gpui::AnyElement {
                         .flex()
                         .items_center()
                         .text_color(rgb(theme.accent))
-                        .child(crate::assets::ui_icon("code", 13.)),
+                        .child(crate::assets::ui_icon("code", 13., theme.accent)),
                 )
                 .child(div().text_color(rgb(theme.accent)).text_xs().child("ASM"))
                 .child(div().text_color(rgb(theme.muted)).text_xs().child(file)),

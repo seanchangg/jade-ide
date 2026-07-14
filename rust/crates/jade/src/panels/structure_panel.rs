@@ -38,7 +38,7 @@ pub fn tab_switcher(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> 
                 a.set_sidebar_tab(which);
                 cx.notify();
             }))
-            .child(crate::assets::ui_icon(icon, 13.))
+            .child(crate::assets::ui_icon(icon, 13., color))
             .child(label);
         if active {
             el = el.border_b_2().border_color(rgb(theme.accent));

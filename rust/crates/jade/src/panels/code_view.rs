@@ -26,7 +26,7 @@ use crate::theme::Theme;
 /// Editor metrics (§4.1 "editor look").
 const FONT_PX: f32 = 13.0;
 pub const LINE_H: f32 = 20.0;
-const PAD_TOP: f32 = 16.0;
+pub const PAD_TOP: f32 = 16.0;
 const GUTTER_W: f32 = 52.0;
 /// Width of the flow glyph margin column (shown only when Flow is toggled on).
 const GLYPH_W: f32 = 16.0;
@@ -258,12 +258,8 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> gpui::AnyElement {
                     row = row.child(cell);
                 }
 
+                // (Structure-based whole-block row tints removed — deprecated.)
                 row = row.border_l_2().border_color(border_col);
-                if row_bg.is_none() {
-                    if let Some(idx) = crate::structure::line_tint(&tab.symbols, line_no) {
-                        row_bg = Some(rgba_a(theme.series[idx % theme.series.len()], 0.047));
-                    }
-                }
                 if let Some(bg) = row_bg {
                     row = row.bg(bg);
                 }
@@ -315,7 +311,11 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> gpui::AnyElement {
                         )
                         .child(dot),
                 );
-                // Line-number: click creates a sticky note anchored here (§4.9).
+                // Line-number: plain click puts the caret at the line start
+                // (standard editor margin behavior); ⌥-click creates a sticky
+                // note anchored here (§4.9 — moved off plain click, which made
+                // "click left of the code" spawn notes instead of moving).
+                let ln_handle = row_handle.clone();
                 gutter = gutter.child(
                     div()
                         .id(("gutter-line", i))
@@ -325,12 +325,19 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> gpui::AnyElement {
                         .cursor_pointer()
                         .on_mouse_down(
                             MouseButton::Left,
-                            cx.listener(move |app: &mut JadeApp, ev: &MouseDownEvent, _w, cx| {
-                                app.create_note(
-                                    line_no,
-                                    f32::from(ev.position.x),
-                                    f32::from(ev.position.y),
-                                );
+                            cx.listener(move |app: &mut JadeApp, ev: &MouseDownEvent, window, cx| {
+                                if ev.modifiers.alt {
+                                    app.create_note(
+                                        line_no,
+                                        f32::from(ev.position.x),
+                                        f32::from(ev.position.y),
+                                    );
+                                } else {
+                                    if let Some(h) = &ln_handle {
+                                        window.focus(h, cx);
+                                    }
+                                    app.editor_caret_to_line_start(i, ev.modifiers.shift);
+                                }
                                 cx.notify();
                             }),
                         )
@@ -893,6 +900,6 @@ fn tab_chip(
                 app.schedule_ui_save(cx);
                 cx.notify();
             }))
-            .child(crate::assets::ui_icon("x", 12.)),
+            .child(crate::assets::ui_icon("x", 12., theme.muted)),
     )
 }

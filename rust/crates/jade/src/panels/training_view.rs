@@ -114,7 +114,7 @@ fn training_header(app: &JadeApp, theme: &Theme, cx: &mut Context<JadeApp>) -> i
                 .gap_1()
                 .text_color(rgb(theme.accent))
                 .text_xs()
-                .child(crate::assets::ui_icon("box", 13.))
+                .child(crate::assets::ui_icon("box", 13., theme.accent))
                 .child("TRAINING"),
         )
         .child(

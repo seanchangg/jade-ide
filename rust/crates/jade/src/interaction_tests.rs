@@ -284,3 +284,116 @@ async fn typing_inserts_through_input_pipeline(cx: &mut TestAppContext) {
         assert_eq!(app.editor.active_tab().unwrap().line(2), "z    int beta = 2;");
     });
 }
+
+/// Regression: a plain click (down + the tiny pressed-button move macOS sends
+/// before up) on a VISIBLE row must never scroll the list. This was the
+/// "editor constantly jumps around when I click" bug.
+#[gpui::test]
+async fn click_on_visible_row_does_not_scroll(cx: &mut TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("jade-noscroll-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("main.cpp");
+    let body: String = (0..300)
+        .map(|i| format!("static int line_{i} = {i};\n"))
+        .collect();
+    std::fs::write(&file, body).unwrap();
+    let (deps, app_rx) = test_deps(dir);
+
+    let (app, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps, app_rx));
+    app.update_in(cx, |app, _window, cx| {
+        app.open_file(file.clone());
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    let (top0, rows) = app.update_in(cx, |app, _w, _cx| {
+        (
+            app.editor_scroll_top(),
+            app.editor_rows.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    });
+    println!("top0={top0} rows={rows}");
+
+    // Click a row in the middle of the viewport, with the drag-move a real
+    // click generates.
+    let probe = top0 + (rows as usize) / 2;
+    let cell = cx
+        .debug_bounds(match probe {
+            _ => Box::leak(format!("code-cell-{probe}").into_boxed_str()) as &'static str,
+        })
+        .expect("probe row visible");
+    let pos = gpui::point(
+        cell.origin.x + px(30.),
+        cell.origin.y + px(crate::panels::code_view::LINE_H / 2.0),
+    );
+    cx.simulate_mouse_down(pos, gpui::MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_move(pos, gpui::MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_up(pos, gpui::MouseButton::Left, Modifiers::default());
+    cx.run_until_parked();
+
+    let top1 = app.update_in(cx, |app, _w, _cx| app.editor_scroll_top());
+    assert_eq!(
+        top1, top0,
+        "clicking a visible row must not scroll (top {top0} -> {top1})"
+    );
+}
+
+/// Same as above but with the list scrolled deep into the file — exercises
+/// `editor_scroll_top()` (top_item) accuracy, including the PAD_TOP offset.
+#[gpui::test]
+async fn click_on_visible_row_when_scrolled_does_not_scroll(cx: &mut TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("jade-noscroll2-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("main.cpp");
+    let body: String = (0..300)
+        .map(|i| format!("static int line_{i} = {i};\n"))
+        .collect();
+    std::fs::write(&file, body).unwrap();
+    let (deps, app_rx) = test_deps(dir);
+
+    let (app, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps, app_rx));
+    app.update_in(cx, |app, _window, cx| {
+        app.open_file(file.clone());
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    // Scroll deep, then re-read where the viewport actually is.
+    app.update_in(cx, |app, _w, cx| {
+        app.code_scroll
+            .scroll_to_item(150, gpui::ScrollStrategy::Top);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let (top0, rows) = app.update_in(cx, |app, _w, _cx| {
+        (
+            app.editor_scroll_top(),
+            app.editor_rows.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    });
+    println!("scrolled: top0={top0} rows={rows}");
+
+    for offset in [1usize, (rows as usize) / 2, rows as usize - 2] {
+        let probe = top0 + offset;
+        let sel: &'static str = Box::leak(format!("code-cell-{probe}").into_boxed_str());
+        let Some(cell) = cx.debug_bounds(sel) else {
+            println!("row {probe} not painted; skipping");
+            continue;
+        };
+        let pos = gpui::point(
+            cell.origin.x + px(30.),
+            cell.origin.y + px(crate::panels::code_view::LINE_H / 2.0),
+        );
+        cx.simulate_mouse_down(pos, gpui::MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(pos, gpui::MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_up(pos, gpui::MouseButton::Left, Modifiers::default());
+        cx.run_until_parked();
+        let top1 = app.update_in(cx, |app, _w, _cx| app.editor_scroll_top());
+        assert_eq!(
+            top1, top0,
+            "clicking visible row {probe} (offset {offset}) scrolled {top0} -> {top1}"
+        );
+    }
+}

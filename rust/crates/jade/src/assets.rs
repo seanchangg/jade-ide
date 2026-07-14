@@ -79,14 +79,18 @@ impl AssetSource for Assets {
     }
 }
 
-/// A themed UI icon: the bundled lucide SVG `name`, sized `size`×`size` px and
-/// tinted with the inherited text color (so hover/active color logic keeps
-/// working). Call sites pass 14–16 to match the surrounding text. `name` is the
-/// bare glyph name (e.g. `"play"`), not the asset path.
-pub fn ui_icon(name: &str, size: f32) -> Svg {
+/// A themed UI icon: the bundled lucide SVG `name`, sized `size`×`size` px,
+/// tinted `color` (`0xRRGGBB`). The color MUST be set on the svg element
+/// itself: gpui's Svg paints only when its OWN style has a text color
+/// (`svg.rs: self.path.zip(style.text.color)`) — parent `.text_color(..)`
+/// does NOT cascade into it, which is why icons rendered as blank space
+/// before this took an explicit color. `name` is the bare glyph name
+/// (e.g. `"play"`), not the asset path.
+pub fn ui_icon(name: &str, size: f32, color: u32) -> Svg {
     svg()
         .path(format!("icons/{name}.svg"))
         .size(px(size))
+        .text_color(gpui::rgb(color))
         .flex_none()
 }
 

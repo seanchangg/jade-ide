@@ -90,7 +90,7 @@ fn header(app: &JadeApp, theme: &Theme, cx: &mut Context<JadeApp>) -> impl IntoE
                 action(a, cx);
                 cx.notify();
             }))
-            .child(crate::assets::ui_icon(icon, 13.))
+            .child(crate::assets::ui_icon(icon, 13., theme.text))
     };
 
     div()
@@ -114,7 +114,7 @@ fn header(app: &JadeApp, theme: &Theme, cx: &mut Context<JadeApp>) -> impl IntoE
                         .flex()
                         .items_center()
                         .text_color(rgb(theme.accent))
-                        .child(crate::assets::ui_icon("bug", 13.)),
+                        .child(crate::assets::ui_icon("bug", 13., theme.accent)),
                 )
                 .child(div().text_color(rgb(theme.accent)).text_xs().child("DEBUG"))
                 .child(status),
@@ -142,7 +142,7 @@ fn header(app: &JadeApp, theme: &Theme, cx: &mut Context<JadeApp>) -> impl IntoE
                             a.hide_debug();
                             cx.notify();
                         }))
-                        .child(crate::assets::ui_icon("x", 12.)),
+                        .child(crate::assets::ui_icon("x", 12., theme.muted)),
                 ),
         )
 }

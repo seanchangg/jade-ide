@@ -2010,7 +2010,15 @@ impl JadeApp {
 
     /// The topmost visible editor row (from the uniform-list scroll handle).
     pub fn editor_scroll_top(&self) -> usize {
-        self.code_scroll.0.borrow().base_handle.top_item()
+        // NOT base_handle.top_item(): that walks `child_bounds`, which a
+        // virtualized uniform_list never populates, so it always returned 0.
+        // With the viewport scrolled, every click then looked "out of view"
+        // to scroll_caret_into_view and snapped the list — the "editor jumps
+        // around when I click" bug. Rows are fixed LINE_H by construction, so
+        // derive the first FULLY visible row from the scroll offset (the
+        // handle's last_item_size.item is the viewport, not a row — measured).
+        let scrolled = -f32::from(self.code_scroll.0.borrow().base_handle.offset().y);
+        (((scrolled - crate::panels::code_view::PAD_TOP) / LINE_H).ceil().max(0.0)) as usize
     }
 
     /// Minimal follow-scroll: bring the caret row into the visible window only
@@ -2239,6 +2247,25 @@ impl JadeApp {
     /// End a drag-select.
     pub fn editor_mouse_up(&mut self) {
         self.editor_selecting = false;
+    }
+
+    /// Gutter line-number click: caret to the start of row `row` (shift extends
+    /// the selection there, like a plain in-text click at column 0).
+    pub fn editor_caret_to_line_start(&mut self, row: usize, shift: bool) {
+        self.dismiss_popups();
+        self.note_editing = None;
+        let Some(tab) = self.editor.active_tab_mut() else {
+            return;
+        };
+        let row = row.min(tab.line_count().saturating_sub(1));
+        let byte = tab.buffer.point_to_offset(Point::new(row, 0));
+        if shift {
+            let anchor = tab.buffer.selection().anchor;
+            tab.buffer.set_selection(Selection::new(anchor, byte));
+        } else {
+            tab.buffer.set_caret(byte);
+        }
+        self.sync_asm_selection();
     }
 
     // ── Completion ────────────────────────────────────────────────────────────
@@ -3746,7 +3773,7 @@ fn action_bar(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl I
                     .items_center()
                     .gap_1()
                     .text_color(rgb(theme.red))
-                    .child(crate::assets::ui_icon("circle-x", 13.))
+                    .child(crate::assets::ui_icon("circle-x", 13., theme.red))
                     .child(format!("{errs}")),
             )
         })
@@ -3757,7 +3784,7 @@ fn action_bar(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl I
                     .items_center()
                     .gap_1()
                     .text_color(rgb(theme.amber))
-                    .child(crate::assets::ui_icon("triangle-alert", 13.))
+                    .child(crate::assets::ui_icon("triangle-alert", 13., theme.amber))
                     .child(format!("{warns}")),
             )
         })
@@ -3768,7 +3795,7 @@ fn action_bar(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl I
                     .items_center()
                     .gap_1()
                     .text_color(rgb(theme.periwinkle))
-                    .child(crate::assets::ui_icon("info", 13.))
+                    .child(crate::assets::ui_icon("info", 13., theme.periwinkle))
                     .child(format!("{infos}")),
             )
         });
@@ -3884,7 +3911,7 @@ fn action_bar(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl I
                 .on_click(cx.listener(|a: &mut JadeApp, _ev, _win, cx| {
                     a.prompt_open_project(cx);
                 }))
-                .child(crate::assets::ui_icon("folder-open", 14.)),
+                .child(crate::assets::ui_icon("folder-open", 14., theme.text)),
         );
 
     div()
@@ -3953,7 +3980,7 @@ fn action_chip(
         .text_xs()
         .bg(rgb(theme.bg))
         .text_color(rgb(color))
-        .child(crate::assets::ui_icon(icon, 14.))
+        .child(crate::assets::ui_icon(icon, 14., color))
         .child(label);
     if disabled {
         el
@@ -4115,7 +4142,7 @@ fn welcome_overlay(cx: &mut Context<JadeApp>, theme: &Theme) -> impl IntoElement
                         .on_click(cx.listener(|a: &mut JadeApp, _ev, _win, cx| {
                             a.prompt_open_project(cx);
                         }))
-                        .child(crate::assets::ui_icon("folder-open", 14.))
+                        .child(crate::assets::ui_icon("folder-open", 14., theme.text))
                         .child("Open Folder"),
                 )
                 // welcome-shortcuts hint row.
@@ -4206,7 +4233,7 @@ fn bottom_panel(
                         .flex()
                         .items_center()
                         .text_color(rgb(theme.muted))
-                        .child(crate::assets::ui_icon("terminal", 13.)),
+                        .child(crate::assets::ui_icon("terminal", 13., theme.muted)),
                 )
                 .child(view_tab("bv-terminal", "TERMINAL", is_term, BottomView::Terminal))
                 .child(view_tab("bv-output", "OUTPUT", !is_term, BottomView::Output)),
@@ -4229,7 +4256,7 @@ fn bottom_panel(
                             a.action_new_terminal();
                             cx.notify();
                         }))
-                        .child(crate::assets::ui_icon("plus", 14.)),
+                        .child(crate::assets::ui_icon("plus", 14., theme.muted)),
                 )
                 // Minimize (hide the strip).
                 .child(
@@ -4243,7 +4270,7 @@ fn bottom_panel(
                             a.action_toggle_output();
                             cx.notify();
                         }))
-                        .child(crate::assets::ui_icon("minus", 14.)),
+                        .child(crate::assets::ui_icon("minus", 14., theme.muted)),
                 ),
         );
 

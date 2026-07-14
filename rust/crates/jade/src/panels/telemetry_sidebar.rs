@@ -32,7 +32,7 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> impl IntoElement {
                 .gap_1()
                 .text_color(rgb(theme.accent))
                 .text_xs()
-                .child(crate::assets::ui_icon("activity", 13.))
+                .child(crate::assets::ui_icon("activity", 13., theme.accent))
                 .child("TELEMETRY"),
         );
 

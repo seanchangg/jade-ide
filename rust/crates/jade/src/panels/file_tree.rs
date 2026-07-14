@@ -33,7 +33,7 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> impl IntoElement {
                 .flex()
                 .items_center()
                 .text_color(rgb(theme.muted))
-                .child(crate::assets::ui_icon("minus", 14.)),
+                .child(crate::assets::ui_icon("minus", 14., theme.muted)),
         );
 
     let mut list = div().flex().flex_col().w_full();
@@ -139,7 +139,7 @@ fn tree_row(
             .flex()
             .items_center()
             .text_color(rgb(glyph_color))
-            .child(crate::assets::ui_icon(icon_name, 14.)),
+            .child(crate::assets::ui_icon(icon_name, 14., glyph_color)),
     )
     .child(div().text_color(rgb(label_color)).child(row.name))
 }
