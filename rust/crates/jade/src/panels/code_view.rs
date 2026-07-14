@@ -116,6 +116,18 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> gpui::AnyElement {
             let error_line = this.error_line;
             let has_run = !this.last_executed.is_empty();
             let theme = this.theme.clone();
+            // Ghost text (§4.11): shown on the caret row only. Multi-line ghosts
+            // render their first line inline with a `⏎…` continuation marker; Tab
+            // still inserts the full suggestion.
+            let ghost_render: Option<(usize, String)> = this.ghost.as_ref().map(|g| {
+                let first = g.text.lines().next().unwrap_or("").to_string();
+                let shown = if g.text.contains('\n') {
+                    format!("{first} ⏎…")
+                } else {
+                    first
+                };
+                (g.anchor.0, shown)
+            });
             let focused = this
                 .editor_focus
                 .as_ref()
@@ -288,11 +300,25 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> gpui::AnyElement {
                             None => div().into_any_element(),
                         }),
                 );
+                // Line-number: click creates a sticky note anchored here (§4.9).
                 gutter = gutter.child(
                     div()
+                        .id(("gutter-line", i))
                         .flex_1()
                         .text_right()
                         .text_color(rgb(GUTTER_FG))
+                        .cursor_pointer()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |app: &mut JadeApp, ev: &MouseDownEvent, _w, cx| {
+                                app.create_note(
+                                    line_no,
+                                    f32::from(ev.position.x),
+                                    f32::from(ev.position.y),
+                                );
+                                cx.notify();
+                            }),
+                        )
                         .child(line_no.to_string()),
                 );
                 row = row.child(gutter);
@@ -329,6 +355,21 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> gpui::AnyElement {
                         .text_color(rgb(default_color))
                         .child(styled),
                 );
+                // Ghost text run (§4.11): faded (~40% muted) at the caret row,
+                // appended right after the line text (before the EOL annotation).
+                if focused {
+                    if let Some((grow, gtext)) = &ghost_render {
+                        if *grow == i {
+                            cell = cell.child(
+                                div()
+                                    .flex_none()
+                                    .whitespace_nowrap()
+                                    .text_color(rgba_a(theme.muted, 0.4))
+                                    .child(gtext.clone()),
+                            );
+                        }
+                    }
+                }
                 if let Some(ann) = annotation {
                     cell = cell.child(
                         div()
@@ -692,7 +733,67 @@ pub fn tab_strip(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> imp
         let active = app.editor.active == Some(i);
         strip = strip.child(tab_chip(i, &tab.name, active, tab.buffer.is_dirty(), theme, cx));
     }
+    // XP bar in the tab-bar right slot (§4.10): flex spacer pushes it to the edge.
     strip
+        .child(div().flex_1())
+        .child(xp_bar(app, theme))
+}
+
+/// The XP bar (§4.10): `L{n}` label · progress track · `×{streak}` badge (shown
+/// only when the streak is live). Mounted in the tab-bar right slot.
+fn xp_bar(app: &JadeApp, theme: &Theme) -> impl IntoElement {
+    let info = crate::xp::level_from_xp(app.xp.total());
+    let streak = app.xp.effective_streak(app.now_ms());
+    let pct = if info.needed > 0 {
+        (info.progress as f32 / info.needed as f32 * 100.0).clamp(0.0, 100.0)
+    } else {
+        0.0
+    };
+
+    let mut bar = div()
+        .id("xp-bar")
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .px(px(6.))
+        // Tooltip parity with the TS: progress / needed to next level · total.
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(theme.accent))
+                .child(format!("L{}", info.level)),
+        )
+        .child(
+            // Progress track + fill.
+            div()
+                .w(px(60.))
+                .h(px(6.))
+                .rounded_full()
+                .bg(rgb(theme.border))
+                .overflow_hidden()
+                .child(
+                    div()
+                        .h_full()
+                        .w(gpui::relative(pct / 100.0))
+                        .bg(rgb(theme.accent)),
+                ),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(theme.muted))
+                .child(format!("{}/{}", info.progress, info.needed)),
+        );
+    if streak > 1 {
+        bar = bar.child(
+            div()
+                .text_xs()
+                .text_color(rgb(theme.amber))
+                .child(format!("×{streak}")),
+        );
+    }
+    bar
 }
 
 fn tab_chip(

@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use forge_ai::{AiState, AiStatus, InlineCompletionBackend};
+use forge_ai::{AiState, AiStatus, InfillRequest, InlineCompletionBackend};
 use forge_build::{
     BuildEngine, BuildResult, CompileRequest, RunConfig, RunEvent, RunResult, PROBE_DYLIB,
 };
@@ -124,6 +124,19 @@ pub enum AppEvent {
     },
     /// A go-to-definition target resolved from a ⌘-click (E2): open + reveal.
     Definition { path: PathBuf, line: usize },
+    /// An AI ghost-text (`/infill`) response for request `generation` (§4.11).
+    /// Carries the raw model `content` (`None` on any failure/abort) plus the
+    /// `(prefix, suffix, line_suffix, anchor, max_lines)` the request was made
+    /// with, so the app can cache the raw output and post-process it on arrival.
+    Ghost {
+        generation: u64,
+        content: Option<String>,
+        prefix: String,
+        suffix: String,
+        line_suffix: String,
+        anchor: (usize, usize),
+        max_lines: usize,
+    },
 }
 
 /// Everything [`JadeApp`] needs from `main` to be constructed — kept as one
@@ -178,6 +191,31 @@ pub struct HoverState {
     pub text: String,
     pub row: usize,
     pub col: usize,
+}
+
+/// The current AI ghost-text suggestion (§4.11): the (possibly multi-line)
+/// completion text and the caret `(row, col)` it is anchored at.
+pub struct GhostState {
+    pub text: String,
+    pub anchor: (usize, usize),
+}
+
+/// An in-flight sticky-note header drag (§4.9). Offsets are window px.
+pub struct NoteDrag {
+    pub id: String,
+    pub start_x: f32,
+    pub start_y: f32,
+    pub orig_x: f32,
+    pub orig_y: f32,
+}
+
+/// An in-flight sticky-note resize (§4.9).
+pub struct NoteResize {
+    pub id: String,
+    pub start_x: f32,
+    pub start_y: f32,
+    pub orig_w: f32,
+    pub orig_h: f32,
 }
 
 pub struct JadeApp {
@@ -264,6 +302,38 @@ pub struct JadeApp {
     /// The (row,col) the last hover request targeted, so mouse-move doesn't
     /// re-request while the pointer sits on the same cell.
     hover_target: Option<(usize, usize)>,
+
+    // ── AI ghost text / editor extras (Phase-3b E3) ───────────────────────────
+    /// Whether ghost text is offered (workspace UI toggle `aiCompletionEnabled`,
+    /// §4.11). Distinct from the backend being Ready — both must hold.
+    pub ai_completion_enabled: bool,
+    /// Multiline ghost mode (`aiMultiline`, §4.11): 6-line vs single-line.
+    pub ai_multiline: bool,
+    /// The current ghost suggestion, if any.
+    pub ghost: Option<GhostState>,
+    /// Monotonic ghost-request generation (supersede stale `/infill` responses).
+    ghost_gen: u64,
+    /// 48-entry raw-suggestion cache with typed-through hits (§4.11).
+    ghost_cache: crate::ghost::GhostCache,
+
+    // ── XP bar (§4.10) ────────────────────────────────────────────────────────
+    pub xp: crate::xp::XpState,
+    /// Global `xpTotal` persistence (`~/.config/jade/`, Electron-migrating).
+    xp_store: crate::xp::XpStore,
+
+    // ── Sticky notes (§4.9) ───────────────────────────────────────────────────
+    /// All notes across files; only the active file's are shown.
+    pub notes: Vec<crate::notes::StickyNote>,
+    /// In-flight header drag.
+    pub note_drag: Option<NoteDrag>,
+    /// In-flight resize.
+    pub note_resize: Option<NoteResize>,
+    /// Id of the note whose content is being edited (captured-keystroke buffer).
+    pub note_editing: Option<String>,
+    /// Focus handle for the editing note (created lazily; None headless).
+    note_focus: Option<FocusHandle>,
+    /// Monotonic note-save generation (500ms content-save debounce).
+    note_save_gen: u64,
 
     // ── Structure panel + Quick Open (Phase-4 wave 3, §5.5/§5.7) ──────────────
     /// Which view the left sidebar shows (FILES tree vs STRUCTURE outline).
@@ -381,6 +451,11 @@ impl JadeApp {
             let inc = deps.repo_root.join("include");
             inc.is_dir().then_some(inc)
         };
+        // Editor extras (Phase-3b E3): load per-workspace sticky notes (migrating
+        // any existing Electron notes) and the global xpTotal.
+        let notes = crate::notes::load(&deps.workspace_root);
+        let (xp_store, xp_total) = crate::xp::XpStore::load();
+
         let mut editor = EditorState::new(TokenPalette::forge_dark());
         // Preserve the --file/--project seeding as the initially open tab: open it
         // through the real tab/highlight path so `active_file` follows the tab.
@@ -437,6 +512,22 @@ impl JadeApp {
             hover: None,
             hover_gen: 0,
             hover_target: None,
+
+            ai_completion_enabled: true,
+            ai_multiline: false,
+            ghost: None,
+            ghost_gen: 0,
+            ghost_cache: crate::ghost::GhostCache::new(),
+
+            xp: crate::xp::XpState::new(xp_total),
+            xp_store,
+
+            notes,
+            note_drag: None,
+            note_resize: None,
+            note_editing: None,
+            note_focus: None,
+            note_save_gen: 0,
 
             sidebar_tab: SidebarTab::Files,
             quick_open: None,
@@ -531,6 +622,15 @@ impl JadeApp {
                 self.open_file(path);
                 self.reveal_line(line);
             }
+            AppEvent::Ghost {
+                generation,
+                content,
+                prefix,
+                suffix,
+                line_suffix,
+                anchor,
+                max_lines,
+            } => self.on_ghost(generation, content, prefix, suffix, line_suffix, anchor, max_lines),
         }
     }
 
@@ -1238,18 +1338,35 @@ fn lsp_eligible(path: &Path) -> bool {
     )
 }
 
+/// Files that get AI ghost text (§4.11 `LANGUAGES`): cpp/c/metal/objective-c plus
+/// python/js/ts/shell. Broader than [`lsp_eligible`] (which is clangd-only).
+fn ghost_eligible(path: &Path) -> bool {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    matches!(
+        ext.as_deref(),
+        Some(
+            "c" | "cc" | "cpp" | "cxx" | "c++" | "h" | "hpp" | "hxx" | "hh" | "inl" | "m" | "mm"
+                | "metal" | "py" | "js" | "jsx" | "ts" | "tsx" | "sh" | "bash" | "zsh"
+        )
+    )
+}
+
 // ── Editable-editor + LSP behavior (E2) ───────────────────────────────────────
 impl JadeApp {
     /// Monotonic milliseconds since app construction (decoration debounces).
-    fn now_ms(&self) -> u64 {
+    pub fn now_ms(&self) -> u64 {
         self.epoch.elapsed().as_millis() as u64
     }
 
-    /// Close the autocomplete + hover popups.
+    /// Close the autocomplete + hover popups and dismiss any ghost text.
     pub fn dismiss_popups(&mut self) {
         self.completion = None;
         self.hover = None;
         self.hover_target = None;
+        self.ghost = None;
     }
 
     /// Dispatch one editor keystroke; returns true when consumed (the caller then
@@ -1259,6 +1376,22 @@ impl JadeApp {
         let m = ks.modifiers;
         let key = ks.key.as_str();
         let shift = m.shift;
+
+        // Ghost text gates BEFORE the completion popup (seam): a plain Tab accepts
+        // the ghost, Esc dismisses it. Only when no chord modifiers are held.
+        if self.ghost.is_some() && !m.platform && !m.control && !m.alt {
+            match key {
+                "tab" => {
+                    self.ghost_accept(cx);
+                    return true;
+                }
+                "escape" => {
+                    self.ghost = None;
+                    return true;
+                }
+                _ => {}
+            }
+        }
 
         // Popup-first interception.
         if self.completion.is_some() {
@@ -1374,6 +1507,7 @@ impl JadeApp {
         self.completion = None;
         self.hover = None;
         self.hover_target = None;
+        self.ghost = None; // any caret move dismisses ghost text (§4.11)
         self.scroll_caret_into_view();
     }
 
@@ -1390,6 +1524,7 @@ impl JadeApp {
             }
         }
         self.completion = None;
+        self.ghost = None;
         self.scroll_caret_into_view();
     }
 
@@ -1426,8 +1561,38 @@ impl JadeApp {
                 self.lsp_did_change(&path, edits, text, version);
             }
         }
+        // XP credit for newline-completing edits (§4.10), then (re)request ghost
+        // text at the new caret (§4.11). Both hang off this single choke point.
+        self.credit_xp(&record, now);
         self.scroll_caret_into_view();
+        self.schedule_ghost(cx);
         self.ensure_decoration_wake(cx);
+    }
+
+    /// Award XP for edits whose change inserted a newline and whose completed line
+    /// (comments stripped) ends with `;`, ≤300 chars (§4.10). The streak scales
+    /// the award and persists globally.
+    fn credit_xp(&mut self, record: &forge_buffer::EditRecord, now_ms: u64) {
+        let mut credits = 0u64;
+        if let Some(tab) = self.editor.active_tab() {
+            for ch in &record.changes {
+                if !ch.new_text.contains('\n') || ch.new_text.chars().count() > 300 {
+                    continue;
+                }
+                let row = ch.start.line;
+                if row >= tab.line_count() {
+                    continue;
+                }
+                let line = tab.buffer.line(row);
+                if crate::xp::edit_earns_credit(&ch.new_text, &line) {
+                    credits += 1;
+                }
+            }
+        }
+        if credits > 0 {
+            self.xp.credit(credits, now_ms);
+            self.xp_store.save(self.xp.total());
+        }
     }
 
     /// The topmost visible editor row (from the uniform-list scroll handle).
@@ -1592,6 +1757,7 @@ impl JadeApp {
         clicks: usize,
     ) {
         self.dismiss_popups();
+        self.note_editing = None; // clicking into the editor blurs any note
         let text_left = f32::from_bits(self.editor_text_left.load(Ordering::Relaxed));
         let selecting = {
             let Some(tab) = self.editor.active_tab_mut() else {
@@ -1673,6 +1839,74 @@ impl JadeApp {
         }
         self.refresh_completion_filter();
         self.schedule_completion(cx);
+        // Frequency completion (§4.12) is local + instant — merge it now so the
+        // popup shows even before (or without) an LSP response.
+        self.refresh_frequency_completion();
+    }
+
+    /// Frequency-completion items for the identifier being typed at the caret
+    /// (§4.12). Empty when there is no in-progress word or no eligible tab.
+    fn frequency_items_for_caret(&self) -> Vec<CompletionItem> {
+        let Some(tab) = self.editor.active_tab() else {
+            return Vec::new();
+        };
+        if !tab.is_code() {
+            return Vec::new();
+        }
+        let caret = tab.buffer.selection().caret();
+        let ident = editor_view::ident_range_before(&tab.buffer, caret);
+        let text = tab.buffer.to_string();
+        let current_word = text[ident].to_string();
+        // Mirror the TS `getWordUntilPosition` gate: only suggest mid-word.
+        if current_word.is_empty() {
+            return Vec::new();
+        }
+        crate::frequency::completion_items(&text, &current_word)
+    }
+
+    /// Merge frequency suggestions into the popup (creating it if the LSP hasn't
+    /// answered yet). Dedupe by label — LSP items win (§4.12 merge rule).
+    fn refresh_frequency_completion(&mut self) {
+        let freq = self.frequency_items_for_caret();
+        let (prefix, anchor) = match self.editor.active_tab() {
+            Some(tab) => {
+                let caret = tab.buffer.selection().caret();
+                let ident = editor_view::ident_range_before(&tab.buffer, caret);
+                let p = tab.buffer.to_string()[ident].to_string();
+                let pt = tab.caret_point();
+                (p, (pt.row, pt.col))
+            }
+            None => return,
+        };
+        match &mut self.completion {
+            Some(c) => {
+                for f in freq {
+                    if !c.items.iter().any(|it| it.label == f.label) {
+                        c.items.push(f);
+                    }
+                }
+                c.filtered = editor_view::completion_filter(&c.items, &prefix);
+                if c.filtered.is_empty() {
+                    self.completion = None;
+                } else {
+                    c.selected = c.selected.min(c.filtered.len() - 1);
+                }
+            }
+            None => {
+                if freq.is_empty() {
+                    return;
+                }
+                let filtered = editor_view::completion_filter(&freq, &prefix);
+                if !filtered.is_empty() {
+                    self.completion = Some(CompletionState {
+                        items: freq,
+                        filtered,
+                        selected: 0,
+                        anchor,
+                    });
+                }
+            }
+        }
     }
 
     /// Re-narrow an open popup against the currently-typed prefix.
@@ -1731,10 +1965,6 @@ impl JadeApp {
         if generation != self.completion_gen {
             return; // superseded
         }
-        if items.is_empty() {
-            self.completion = None;
-            return;
-        }
         let prefix = match self.editor.active_tab() {
             Some(tab) => {
                 let caret = tab.buffer.selection().caret();
@@ -1743,13 +1973,26 @@ impl JadeApp {
             }
             None => return,
         };
-        let filtered = editor_view::completion_filter(&items, &prefix);
+        // Merge frequency completion (§4.12) into the LSP results — dedupe by
+        // label, LSP wins (LSP items keep their server order first, then the
+        // frequency words ranked by count).
+        let mut merged = items;
+        for f in self.frequency_items_for_caret() {
+            if !merged.iter().any(|it| it.label == f.label) {
+                merged.push(f);
+            }
+        }
+        if merged.is_empty() {
+            self.completion = None;
+            return;
+        }
+        let filtered = editor_view::completion_filter(&merged, &prefix);
         if filtered.is_empty() {
             self.completion = None;
             return;
         }
         self.completion = Some(CompletionState {
-            items,
+            items: merged,
             filtered,
             selected: 0,
             anchor,
@@ -1786,6 +2029,129 @@ impl JadeApp {
         if let Some(record) = record {
             self.after_edit(record, cx);
         }
+    }
+
+    // ── AI ghost text (§4.11) ─────────────────────────────────────────────────
+
+    /// Toggle whether ghost text is offered (`aiCompletionEnabled`). Disabling
+    /// immediately clears any visible suggestion.
+    pub fn action_toggle_ai_completion(&mut self) {
+        self.ai_completion_enabled = !self.ai_completion_enabled;
+        if !self.ai_completion_enabled {
+            self.ghost = None;
+        }
+    }
+
+    /// Toggle multiline ghost mode (`aiMultiline`). Cached output was generated
+    /// for the old mode, so the cache is cleared (§4.11).
+    pub fn action_toggle_ai_multiline(&mut self) {
+        self.ai_multiline = !self.ai_multiline;
+        self.ghost_cache.clear();
+        self.ghost = None;
+    }
+
+    /// (Re)compute ghost text at the caret (§4.11): serve a cache hit instantly
+    /// (exact or typed-through), else debounce 120ms and request `/infill`
+    /// (forge-ai's single-flight aborts any older request). Only fires when
+    /// `aiCompletionEnabled` and the backend is `Ready` at a collapsed caret.
+    fn schedule_ghost(&mut self, _cx: &mut Context<Self>) {
+        if !self.ai_completion_enabled || self.ai_status.state != AiState::Ready {
+            self.ghost = None;
+            return;
+        }
+        let Some(tab) = self.editor.active_tab() else {
+            self.ghost = None;
+            return;
+        };
+        if !ghost_eligible(&tab.path) || !tab.buffer.selection().is_empty() {
+            self.ghost = None;
+            return;
+        }
+        let caret = tab.buffer.selection().caret();
+        let full = tab.buffer.to_string();
+        let prefix = crate::ghost::cap_prefix(&full[..caret], crate::ghost::MAX_PREFIX_CHARS);
+        let suffix = crate::ghost::cap_suffix(&full[caret..], crate::ghost::MAX_SUFFIX_CHARS);
+        let point = tab.caret_point();
+        let line = tab.buffer.line(point.row).into_owned();
+        let line_suffix: String = line.chars().skip(point.col).collect();
+        let anchor = (point.row, point.col);
+        let path = tab.path.clone();
+        let max_lines = if self.ai_multiline { crate::ghost::MAX_LINES } else { 1 };
+
+        // Cache hit → serve immediately, no request.
+        if let Some(cached) = self.ghost_cache.lookup(&prefix, &suffix) {
+            self.ghost = crate::ghost::post_process(&cached, &line_suffix, max_lines)
+                .map(|text| GhostState { text, anchor });
+            return;
+        }
+
+        // Cache miss: clear the stale suggestion and issue a debounced request.
+        self.ghost = None;
+        self.ghost_gen += 1;
+        let generation = self.ghost_gen;
+        let ai = self.ai.clone();
+        let tx = self.app_tx.clone();
+        let single_line = !self.ai_multiline;
+        let filename = Some(path.display().to_string());
+        self.runtime.spawn(async move {
+            tokio::time::sleep(Duration::from_millis(crate::ghost::DEBOUNCE_MS)).await;
+            let result = ai
+                .infill(&InfillRequest {
+                    prefix: prefix.clone(),
+                    suffix: suffix.clone(),
+                    filename,
+                    single_line,
+                })
+                .await;
+            let content = result.map(|r| r.content);
+            let _ = tx.send(AppEvent::Ghost {
+                generation,
+                content,
+                prefix,
+                suffix,
+                line_suffix,
+                anchor,
+                max_lines,
+            });
+        });
+    }
+
+    /// Handle a `/infill` response: cache the raw output and post-process it into
+    /// the ghost run (or suppress it). Stale generations are dropped.
+    #[allow(clippy::too_many_arguments)]
+    fn on_ghost(
+        &mut self,
+        generation: u64,
+        content: Option<String>,
+        prefix: String,
+        suffix: String,
+        line_suffix: String,
+        anchor: (usize, usize),
+        max_lines: usize,
+    ) {
+        if generation != self.ghost_gen {
+            return; // superseded
+        }
+        let Some(raw) = content else {
+            self.ghost = None;
+            return;
+        };
+        if raw.is_empty() {
+            self.ghost = None;
+            return;
+        }
+        self.ghost_cache.put(prefix, suffix, raw.clone());
+        self.ghost = crate::ghost::post_process(&raw, &line_suffix, max_lines)
+            .map(|text| GhostState { text, anchor });
+    }
+
+    /// Accept the ghost text (Tab): insert it at the caret.
+    fn ghost_accept(&mut self, cx: &mut Context<Self>) {
+        let Some(g) = self.ghost.take() else {
+            return;
+        };
+        let record = self.with_edit(|b| b.insert_text(&g.text));
+        self.after_edit(record, cx);
     }
 
     // ── Hover ─────────────────────────────────────────────────────────────────
@@ -2008,6 +2374,188 @@ impl JadeApp {
             .active_tab()
             .map(|t| editor_view::diagnostic_counts(&t.diagnostics))
             .unwrap_or((0, 0, 0))
+    }
+
+    // ── Sticky notes (§4.9) ───────────────────────────────────────────────────
+
+    /// Notes for the active file (the only ones shown; others `display:none`).
+    pub fn active_notes(&self) -> Vec<crate::notes::StickyNote> {
+        let Some(path) = &self.active_file else {
+            return Vec::new();
+        };
+        let fp = path.display().to_string();
+        self.notes
+            .iter()
+            .filter(|n| n.file_path == fp)
+            .cloned()
+            .collect()
+    }
+
+    /// Create a note on `line` (1-based) at mouse `(x, y)` (window px), unless one
+    /// already exists on this file+line. The new note enters edit mode.
+    pub fn create_note(&mut self, line: usize, x: f32, y: f32) {
+        let Some(path) = self.active_file.clone() else {
+            return;
+        };
+        let fp = path.display().to_string();
+        if self
+            .notes
+            .iter()
+            .any(|n| n.file_path == fp && n.anchor_line == line)
+        {
+            return; // one note per file+line
+        }
+        let note = crate::notes::StickyNote::new(fp, line, x, y);
+        self.note_editing = Some(note.id.clone());
+        self.notes.push(note);
+        self.save_notes();
+    }
+
+    /// Delete a note (× button).
+    pub fn delete_note(&mut self, id: &str) {
+        self.notes.retain(|n| n.id != id);
+        if self.note_editing.as_deref() == Some(id) {
+            self.note_editing = None;
+        }
+        self.save_notes();
+    }
+
+    /// Toggle the `index`-th checkbox in a note's content (click-to-toggle).
+    pub fn toggle_note_checkbox(&mut self, id: &str, index: usize) {
+        if let Some(n) = self.notes.iter_mut().find(|n| n.id == id) {
+            n.content = crate::notes::toggle_checkbox(&n.content, index);
+            n.touch();
+        }
+        self.save_notes();
+    }
+
+    /// Focus a note for content editing (click on its body).
+    pub fn edit_note(&mut self, id: &str) {
+        self.note_editing = Some(id.to_string());
+    }
+
+    /// Begin dragging a note by its header.
+    pub fn note_drag_start(&mut self, id: &str, mx: f32, my: f32) {
+        if let Some(n) = self.notes.iter().find(|n| n.id == id) {
+            self.note_drag = Some(NoteDrag {
+                id: id.to_string(),
+                start_x: mx,
+                start_y: my,
+                orig_x: n.x,
+                orig_y: n.y,
+            });
+        }
+    }
+
+    /// Begin resizing a note by its corner handle.
+    pub fn note_resize_start(&mut self, id: &str, mx: f32, my: f32) {
+        if let Some(n) = self.notes.iter().find(|n| n.id == id) {
+            self.note_resize = Some(NoteResize {
+                id: id.to_string(),
+                start_x: mx,
+                start_y: my,
+                orig_w: n.width,
+                orig_h: n.height,
+            });
+        }
+    }
+
+    /// Update the active drag/resize as the pointer moves (window px).
+    pub fn note_pointer_move(&mut self, mx: f32, my: f32) {
+        if let Some(d) = &self.note_drag {
+            let (id, nx, ny) = (d.id.clone(), d.orig_x + (mx - d.start_x), d.orig_y + (my - d.start_y));
+            if let Some(n) = self.notes.iter_mut().find(|n| n.id == id) {
+                n.x = nx;
+                n.y = ny;
+            }
+        } else if let Some(r) = &self.note_resize {
+            let id = r.id.clone();
+            let w = (r.orig_w + (mx - r.start_x)).max(crate::notes::MIN_W);
+            let h = (r.orig_h + (my - r.start_y)).max(crate::notes::MIN_H);
+            if let Some(n) = self.notes.iter_mut().find(|n| n.id == id) {
+                n.width = w;
+                n.height = h;
+            }
+        }
+    }
+
+    /// End any drag/resize, persisting the note's new position/size on mouseup.
+    pub fn note_pointer_up(&mut self) {
+        let ended = self.note_drag.take().map(|d| d.id).or_else(|| self.note_resize.take().map(|r| r.id));
+        if let Some(id) = ended {
+            if let Some(n) = self.notes.iter_mut().find(|n| n.id == id) {
+                n.touch();
+            }
+            self.save_notes();
+        }
+    }
+
+    /// True while a note drag or resize is in flight (drives the capture overlay).
+    pub fn note_pointer_active(&self) -> bool {
+        self.note_drag.is_some() || self.note_resize.is_some()
+    }
+
+    /// Apply one captured keystroke to the note being edited (§4.9): printable
+    /// chars append, Backspace pops a char, Enter inserts a newline, Esc blurs.
+    /// Content saves are debounced 500ms. Returns true when consumed.
+    pub fn note_key(&mut self, ks: &gpui::Keystroke, cx: &mut Context<Self>) -> bool {
+        let Some(id) = self.note_editing.clone() else {
+            return false;
+        };
+        let m = ks.modifiers;
+        match ks.key.as_str() {
+            "escape" => {
+                self.note_editing = None;
+                self.save_notes();
+                return true;
+            }
+            "backspace" => {
+                self.note_edit(&id, |c| {
+                    c.pop();
+                });
+            }
+            "enter" => self.note_edit(&id, |c| c.push('\n')),
+            _ => {
+                let printable =
+                    ks.key_char.is_some() && !m.platform && !m.control && !m.alt && !m.function;
+                if printable {
+                    let ch = ks.key_char.clone().unwrap();
+                    self.note_edit(&id, |c| c.push_str(&ch));
+                } else {
+                    return false;
+                }
+            }
+        }
+        self.schedule_note_save(cx);
+        true
+    }
+
+    fn note_edit(&mut self, id: &str, f: impl FnOnce(&mut String)) {
+        if let Some(n) = self.notes.iter_mut().find(|n| n.id == id) {
+            f(&mut n.content);
+            n.touch();
+        }
+    }
+
+    fn save_notes(&self) {
+        crate::notes::save(&self.workspace_root, &self.notes);
+    }
+
+    /// Persist note content after a 500ms quiet period (§4.9 content-save debounce).
+    fn schedule_note_save(&mut self, cx: &mut Context<Self>) {
+        self.note_save_gen += 1;
+        let generation = self.note_save_gen;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(crate::notes::SAVE_DEBOUNCE_MS))
+                .await;
+            let _ = this.update(cx, |app, _| {
+                if app.note_save_gen == generation {
+                    app.save_notes();
+                }
+            });
+        })
+        .detach();
     }
 }
 
@@ -2301,6 +2849,22 @@ impl Render for JadeApp {
             root = root.child(overlay);
         }
 
+        // §4.9 Sticky-note overlay: absolute cards over the whole window. Focus
+        // the note handle while a note is being edited so its captured-keystroke
+        // buffer receives input.
+        {
+            let focus = self
+                .note_focus
+                .get_or_insert_with(|| cx.focus_handle())
+                .clone();
+            if self.note_editing.is_some() && !focus.is_focused(window) {
+                focus.focus(window, cx);
+            }
+            if let Some(overlay) = crate::panels::sticky_notes::overlay(self, focus, cx) {
+                root = root.child(overlay);
+            }
+        }
+
         // §5.7 Quick Open overlay: centered over the editor area, focused so its
         // captured-keystroke buffer receives input.
         if self.quick_open.is_some() {
@@ -2454,6 +3018,25 @@ fn action_bar(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl I
         ))
         .child(action_chip(
             "btn-ai", ai_label, theme, ai_active, false, cx, |a, _| a.action_ai(),
+        ))
+        // AI ghost-text section (§4.11): toggle ghost suggestions + multiline mode.
+        .child(action_chip(
+            "btn-ai-ghost",
+            "Ghost".to_string(),
+            theme,
+            app.ai_completion_enabled,
+            false,
+            cx,
+            |a, _| a.action_toggle_ai_completion(),
+        ))
+        .child(action_chip(
+            "btn-ai-multi",
+            if app.ai_multiline { "Multi ✓" } else { "Multi" }.to_string(),
+            theme,
+            app.ai_multiline,
+            false,
+            cx,
+            |a, _| a.action_toggle_ai_multiline(),
         ))
         .child(action_chip(
             "btn-theme",

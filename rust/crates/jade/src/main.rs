@@ -39,8 +39,11 @@ mod app;
 mod decorations;
 mod editor_view;
 mod format;
+mod frequency;
+mod ghost;
 mod highlight;
 mod memory_bar;
+mod notes;
 mod output;
 mod panels;
 mod prefs;
@@ -51,6 +54,7 @@ mod theme;
 mod training;
 mod wg3d;
 mod workspace_tree;
+mod xp;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -167,6 +171,8 @@ fn main() {
                 .map(PathBuf::from)
                 .or_else(|| deps.active_file.clone());
             run_smoke_edit(deps, target);
+        } else if mode == "ghost" {
+            run_smoke_ghost();
         } else if mode == "lsp" {
             let target = arg_value(&args, "lsp").map(PathBuf::from);
             run_smoke_lsp(runtime, deps, target);
@@ -663,6 +669,43 @@ fn run_smoke_edit(deps: AppDeps, target: Option<PathBuf>) {
         caret.col,
         lsp_changes
     );
+}
+
+/// `--smoke ghost` (E3): drive the AI ghost-text cache + post-processing path
+/// with a **canned** model response (no llama-server — the string below stands in
+/// for the `/infill` result the real backend would return). Exercises a fresh
+/// cache miss, then a typed-through hit served from the cache, printing a
+/// machine-readable `[smoke] ghost cached=<bool> text="…"` line for each.
+fn run_smoke_ghost() {
+    use ghost::{post_process, GhostCache, MAX_LINES};
+
+    // The scripted context: caret just after `for (int i = 0`, with a `)` already
+    // sitting after the cursor on the line.
+    let prefix1 = "int main() {\n    for (int i = 0";
+    let suffix = ")";
+    let line_suffix = ")";
+    // Canned model output (what `/infill` would return). Note the trailing `)`
+    // that duplicates what already follows the cursor — post-processing drops it,
+    // and the blank line beyond is truncated.
+    let canned = "; i < n; i++)\n\n    // loop body here";
+
+    let mut cache = GhostCache::new();
+
+    // 1) Cache miss: fresh response → post-process → cache the RAW output.
+    let cached_hit = cache.lookup(prefix1, suffix).is_some();
+    let text1 = post_process(canned, line_suffix, MAX_LINES).unwrap_or_default();
+    cache.put(prefix1, suffix, canned);
+    println!("[smoke] ghost cached={cached_hit} text={text1:?}");
+
+    // 2) Typed-through hit: the user typed `; i < n` through the suggestion, so the
+    //    remainder is served instantly from the cache (no request).
+    let prefix2 = "int main() {\n    for (int i = 0; i < n";
+    let served = cache.lookup(prefix2, suffix);
+    let cached_hit2 = served.is_some();
+    let text2 = served
+        .and_then(|raw| post_process(&raw, line_suffix, MAX_LINES))
+        .unwrap_or_default();
+    println!("[smoke] ghost cached={cached_hit2} text={text2:?}");
 }
 
 /// `--smoke lsp <dir>` (E2, best-effort): initialize clangd on a temp project,
