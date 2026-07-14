@@ -311,6 +311,7 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> gpui::AnyElement {
                     div()
                         .id(("bp-margin", i))
                         .w(px(8.))
+                        .ml(px(5.)) // breathing room off the row's left border
                         .flex_none()
                         .flex()
                         .items_center()
