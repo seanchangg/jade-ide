@@ -54,8 +54,13 @@ pub fn render(app: &JadeApp, bench_handle: FocusHandle, cx: &mut Context<JadeApp
         .gap_2()
         .child(
             div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
                 .text_color(rgb(theme.accent))
                 .text_xs()
+                .child(crate::assets::ui_icon("gauge", 13.))
                 .child("RUNTIME"),
         )
         .child(speed_section(app, &theme))

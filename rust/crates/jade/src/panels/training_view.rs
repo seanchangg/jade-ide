@@ -106,7 +106,17 @@ fn training_header(app: &JadeApp, theme: &Theme, cx: &mut Context<JadeApp>) -> i
         .flex_row()
         .items_center()
         .justify_between()
-        .child(section_header("TRAINING", theme))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .text_color(rgb(theme.accent))
+                .text_xs()
+                .child(crate::assets::ui_icon("box", 13.))
+                .child("TRAINING"),
+        )
         .child(
             div()
                 .id("wg3d-open")

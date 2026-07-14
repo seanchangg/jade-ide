@@ -17,10 +17,18 @@ use crate::theme::Theme;
 /// FILES | STRUCTURE switcher shown at the top of the left sidebar. Clicking a
 /// tab flips `JadeApp::sidebar_tab`.
 pub fn tab_switcher(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl IntoElement {
-    let tab = |id: &'static str, label: &'static str, which: SidebarTab, active: bool| {
+    let tab = |id: &'static str,
+               icon: &'static str,
+               label: &'static str,
+               which: SidebarTab,
+               active: bool| {
         let color = if active { theme.text } else { theme.muted };
         let mut el = div()
             .id(id)
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_1()
             .px_2()
             .py_1()
             .text_xs()
@@ -30,6 +38,7 @@ pub fn tab_switcher(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> 
                 a.set_sidebar_tab(which);
                 cx.notify();
             }))
+            .child(crate::assets::ui_icon(icon, 13.))
             .child(label);
         if active {
             el = el.border_b_2().border_color(rgb(theme.accent));
@@ -42,9 +51,16 @@ pub fn tab_switcher(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> 
         .flex_row()
         .items_center()
         .gap_2()
-        .child(tab("sb-files", "FILES", SidebarTab::Files, app.sidebar_tab == SidebarTab::Files))
+        .child(tab(
+            "sb-files",
+            "folder",
+            "FILES",
+            SidebarTab::Files,
+            app.sidebar_tab == SidebarTab::Files,
+        ))
         .child(tab(
             "sb-structure",
+            "list-tree",
             "STRUCTURE",
             SidebarTab::Structure,
             app.sidebar_tab == SidebarTab::Structure,

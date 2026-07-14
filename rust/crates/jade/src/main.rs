@@ -37,6 +37,7 @@
 
 mod app;
 mod asm;
+mod assets;
 mod benchmark;
 mod debug;
 mod decorations;
@@ -46,6 +47,8 @@ mod format;
 mod frequency;
 mod ghost;
 mod highlight;
+#[cfg(test)]
+mod interaction_tests;
 mod memory_bar;
 mod notes;
 mod output;
@@ -77,8 +80,43 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use app::{AppDeps, AppEvent, JadeApp};
 use workspace_tree::{is_watch_relevant, WatchDebounce};
 
+/// GUI apps launched from Finder/Dock inherit launchd's minimal PATH
+/// (`/usr/bin:/bin:/usr/sbin:/sbin`) — no `/opt/homebrew/bin` — so `cmake`,
+/// `clangd`, and `llama-server` fail to resolve and every Build/Run/Debug
+/// action dies with "command not found". Merge the user's login-shell PATH
+/// once at startup (the fix-path trick the Electron app relied on); if the
+/// shell probe fails, fall back to appending the standard tool dirs.
+/// Terminal launches already carry a rich PATH and return early.
+fn fix_gui_path() {
+    let current = std::env::var("PATH").unwrap_or_default();
+    if current
+        .split(':')
+        .any(|d| d == "/opt/homebrew/bin" || d == "/usr/local/bin")
+    {
+        return;
+    }
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+    let probed = std::process::Command::new(&shell)
+        .args(["-lc", "printf %s \"$PATH\""])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty());
+    let merged = match probed {
+        Some(p) => format!("{p}:{current}"),
+        None => format!("{current}:/opt/homebrew/bin:/usr/local/bin"),
+    };
+    std::env::set_var("PATH", merged);
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+
+    // Must run before any engine/runtime spawns so every child process
+    // (cmake, clangd, lldb, llama-server) inherits the repaired PATH.
+    fix_gui_path();
 
     // Telemetry server on a dedicated tokio runtime; the Handle is kept so
     // button handlers (and the smoke hook) can spawn engine futures.
@@ -196,7 +234,11 @@ fn main() {
     // Optionally launch the probe's test training program against ourselves.
     maybe_launch_train(&args, &socket);
 
-    application().run(move |cx: &mut App| {
+    // Register the bundled-icon asset source (lucide SVGs) so `gpui::svg()` can
+    // resolve `icons/<name>.svg`; `with_assets` also rebuilds the SvgRenderer over
+    // it. Chained onto the platform Application before the first window opens; the
+    // font registration below is unaffected (it runs against the same `App`).
+    application().with_assets(assets::Assets).run(move |cx: &mut App| {
         fonts::register_bundled_fonts(cx);
         let bounds = Bounds::centered(None, size(px(1400.), px(900.)), cx);
         cx.open_window(
@@ -549,10 +591,17 @@ fn run_smoke(
             .map(|b| b.success && b.executable.is_some())
             .unwrap_or(false);
         if !ok {
+            // Headline the first real *error* — clang emits warnings first, and
+            // leading with one (e.g. -Wsign-compare) hides the actual failure.
             let reason = app
                 .last_build
                 .as_ref()
-                .and_then(|b| b.errors.first())
+                .and_then(|b| {
+                    b.errors
+                        .iter()
+                        .find(|e| e.severity == forge_build::Severity::Error)
+                        .or_else(|| b.errors.first())
+                })
                 .map(|e| e.message.clone())
                 .unwrap_or_else(|| "compile produced no executable".to_string());
             println!("[smoke] FAIL build: {reason}");

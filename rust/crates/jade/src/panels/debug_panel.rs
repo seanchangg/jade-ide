@@ -70,12 +70,15 @@ fn header(app: &JadeApp, theme: &Theme, cx: &mut Context<JadeApp>) -> impl IntoE
         status = status.italic();
     }
 
+    // Icon-only control button; `icon` is a bundled lucide glyph name.
     let btn = |id: &'static str,
-               label: &'static str,
+               icon: &'static str,
                action: fn(&mut JadeApp, &mut Context<JadeApp>),
                cx: &mut Context<JadeApp>| {
         div()
             .id(id)
+            .flex()
+            .items_center()
             .px_2()
             .py(px(2.))
             .rounded_md()
@@ -87,7 +90,7 @@ fn header(app: &JadeApp, theme: &Theme, cx: &mut Context<JadeApp>) -> impl IntoE
                 action(a, cx);
                 cx.notify();
             }))
-            .child(label)
+            .child(crate::assets::ui_icon(icon, 13.))
     };
 
     div()
@@ -106,6 +109,13 @@ fn header(app: &JadeApp, theme: &Theme, cx: &mut Context<JadeApp>) -> impl IntoE
                 .flex_row()
                 .items_center()
                 .gap_2()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .text_color(rgb(theme.accent))
+                        .child(crate::assets::ui_icon("bug", 13.)),
+                )
                 .child(div().text_color(rgb(theme.accent)).text_xs().child("DEBUG"))
                 .child(status),
         )
@@ -115,23 +125,24 @@ fn header(app: &JadeApp, theme: &Theme, cx: &mut Context<JadeApp>) -> impl IntoE
                 .flex_row()
                 .items_center()
                 .gap_1()
-                .child(btn("dbg-cont", "▶", |a, _| a.debug_continue(), cx))
-                .child(btn("dbg-over", "⤼", |a, _| a.debug_step_over(), cx))
-                .child(btn("dbg-into", "⤓", |a, _| a.debug_step_into(), cx))
-                .child(btn("dbg-out", "⤒", |a, _| a.debug_step_out(), cx))
-                .child(btn("dbg-stop", "■", |a, _| a.action_stop(), cx))
+                .child(btn("dbg-cont", "play", |a, _| a.debug_continue(), cx))
+                .child(btn("dbg-over", "arrow-down", |a, _| a.debug_step_over(), cx))
+                .child(btn("dbg-into", "arrow-down-to-line", |a, _| a.debug_step_into(), cx))
+                .child(btn("dbg-out", "arrow-up-from-line", |a, _| a.debug_step_out(), cx))
+                .child(btn("dbg-stop", "square", |a, _| a.action_stop(), cx))
                 .child(
                     div()
                         .id("dbg-close")
+                        .flex()
+                        .items_center()
                         .px_1()
-                        .text_xs()
                         .text_color(rgb(theme.muted))
                         .cursor_pointer()
                         .on_click(cx.listener(|a: &mut JadeApp, _e, _w, cx| {
                             a.hide_debug();
                             cx.notify();
                         }))
-                        .child("×"),
+                        .child(crate::assets::ui_icon("x", 12.)),
                 ),
         )
 }

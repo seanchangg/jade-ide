@@ -288,9 +288,20 @@ pub struct JadeApp {
     pub editor_focus: Option<FocusHandle>,
     /// True while a left-drag is extending the selection.
     pub editor_selecting: bool,
+    /// Set by [`open_file`](Self::open_file); the next render focuses the editor
+    /// surface (open sites don't have a `Window`, render does). Without this the
+    /// editor starts life unfocused — no caret, dead arrow keys — until the user
+    /// happens to click inside the code area.
+    pub pending_editor_focus: bool,
     /// The code-text left edge in window px (f32 bits), captured each frame by a
     /// canvas underlay, so mouse handlers can map click-x → char column.
     pub editor_text_left: Arc<AtomicU32>,
+    /// The mono font's real char advance at the editor size (f32 bits), measured
+    /// from the text system each frame by the same canvas. Falls back to the
+    /// Menlo-13 constant until first paint. Keeping this measured (not hardcoded)
+    /// means caret placement and click→column mapping survive a font swap
+    /// (bundled JetBrains Mono vs Menlo).
+    pub editor_char_w: Arc<AtomicU32>,
     /// Visible editor row count (viewport height / line height), captured each
     /// frame, so `scroll_caret_into_view` does minimal follow-scroll.
     pub editor_rows: Arc<AtomicU32>,
@@ -540,6 +551,7 @@ impl JadeApp {
             }
         }
         active_file = editor.active_path().or(active_file);
+        let editor_has_tab = editor.active.is_some();
 
         Self {
             server: deps.server,
@@ -573,7 +585,13 @@ impl JadeApp {
 
             editor_focus: None,
             editor_selecting: false,
+            // Seeded/restored tabs open before the first render — ask it to
+            // focus the editor so the caret + keyboard are live from frame one.
+            pending_editor_focus: editor_has_tab,
             editor_text_left: Arc::new(AtomicU32::new(0)),
+            editor_char_w: Arc::new(AtomicU32::new(
+                crate::panels::code_view::CHAR_W.to_bits(),
+            )),
             editor_rows: Arc::new(AtomicU32::new(30)),
             epoch: Instant::now(),
             decoration_wake_running: false,
@@ -824,16 +842,24 @@ impl JadeApp {
         if res.success {
             self.status_line(&format!("[forge] Build succeeded ({ms}ms)"));
         } else {
-            self.status_line(&format!(
-                "[forge] Build failed ({} error(s), {ms}ms)",
-                res.errors.len()
-            ));
-            // No editor exists yet, so jump-to-error is N/A — list them instead.
+            // Count only real errors — clang's warnings ride along in `errors`
+            // with their own severity, and leading with them buries the failure.
+            let nerr = res
+                .errors
+                .iter()
+                .filter(|e| e.severity == forge_build::Severity::Error)
+                .count();
+            self.status_line(&format!("[forge] Build failed ({nerr} error(s), {ms}ms)"));
             for e in &res.errors {
+                let tag = match e.severity {
+                    forge_build::Severity::Error => "error",
+                    forge_build::Severity::Warning => "warning",
+                    forge_build::Severity::Note => "note",
+                };
                 push_output(
                     &mut self.output,
                     &format!(
-                        "  {}:{}:{}: {}",
+                        "  {}:{}:{}: {tag}: {}",
                         e.file.display(),
                         e.line,
                         e.column,
@@ -1281,6 +1307,7 @@ impl JadeApp {
             Ok(_) => {
                 self.active_file = self.editor.active_path();
                 self.dismiss_popups();
+                self.pending_editor_focus = true; // caret + keys live immediately
                 self.ensure_lsp();
                 self.lsp_did_open(&path);
             }
@@ -1526,7 +1553,7 @@ impl JadeApp {
 
 /// Char advance of Menlo at the editor font size (mouse↔column mapping). See the
 /// note on `panels::code_view::CHAR_W`.
-use crate::panels::code_view::{CHAR_W, LINE_H};
+use crate::panels::code_view::LINE_H;
 
 /// clangd handles the C/C++ families; `.metal` is Metal (never clangd) and other
 /// extensions are plain text. This is the §4.4 gating with the inventory's
@@ -1565,6 +1592,11 @@ impl JadeApp {
     /// Monotonic milliseconds since app construction (decoration debounces).
     pub fn now_ms(&self) -> u64 {
         self.epoch.elapsed().as_millis() as u64
+    }
+
+    /// The measured mono char advance (px) for caret/click column math.
+    pub fn char_w(&self) -> f32 {
+        f32::from_bits(self.editor_char_w.load(Ordering::Relaxed)).max(1.0)
     }
 
     /// Close the autocomplete + hover popups and dismiss any ghost text.
@@ -1975,6 +2007,7 @@ impl JadeApp {
         self.dismiss_popups();
         self.note_editing = None; // clicking into the editor blurs any note
         let text_left = f32::from_bits(self.editor_text_left.load(Ordering::Relaxed));
+        let cw = self.char_w();
         let selecting = {
             let Some(tab) = self.editor.active_tab_mut() else {
                 return;
@@ -1982,7 +2015,7 @@ impl JadeApp {
             let row = row.min(tab.line_count().saturating_sub(1));
             let line = tab.buffer.line(row).into_owned();
             let maxcol = line.chars().count();
-            let col = editor_view::px_to_col(x - text_left, CHAR_W, maxcol);
+            let col = editor_view::px_to_col(x - text_left, cw, maxcol);
             let byte = tab.buffer.point_to_offset(Point::new(row, col));
             match clicks {
                 n if n >= 3 => {
@@ -2023,13 +2056,14 @@ impl JadeApp {
             return;
         }
         let text_left = f32::from_bits(self.editor_text_left.load(Ordering::Relaxed));
+        let cw = self.char_w();
         {
             let Some(tab) = self.editor.active_tab_mut() else {
                 return;
             };
             let row = row.min(tab.line_count().saturating_sub(1));
             let maxcol = tab.buffer.line(row).chars().count();
-            let col = editor_view::px_to_col(x - text_left, CHAR_W, maxcol);
+            let col = editor_view::px_to_col(x - text_left, cw, maxcol);
             let byte = tab.buffer.point_to_offset(Point::new(row, col));
             let anchor = tab.buffer.selection().anchor;
             tab.buffer.set_selection(Selection::new(anchor, byte));
@@ -2380,6 +2414,7 @@ impl JadeApp {
             return;
         }
         let text_left = f32::from_bits(self.editor_text_left.load(Ordering::Relaxed));
+        let cw = self.char_w();
         let (path, pos, cell) = {
             let Some(tab) = self.editor.active_tab() else {
                 return;
@@ -2389,7 +2424,7 @@ impl JadeApp {
             }
             let row = row.min(tab.line_count().saturating_sub(1));
             let maxcol = tab.buffer.line(row).chars().count();
-            let col = editor_view::px_to_col(x - text_left, CHAR_W, maxcol);
+            let col = editor_view::px_to_col(x - text_left, cw, maxcol);
             let byte = tab.buffer.point_to_offset(Point::new(row, col));
             (tab.path.clone(), tab.buffer.offset_to_lsp(byte), (row, col))
         };
@@ -2436,6 +2471,7 @@ impl JadeApp {
     /// ⌘-click: request the definition at row `row`, window x `x`, and open it.
     pub fn editor_goto_definition(&mut self, row: usize, x: f32) {
         let text_left = f32::from_bits(self.editor_text_left.load(Ordering::Relaxed));
+        let cw = self.char_w();
         let (path, pos) = {
             let Some(tab) = self.editor.active_tab() else {
                 return;
@@ -2445,7 +2481,7 @@ impl JadeApp {
             }
             let row = row.min(tab.line_count().saturating_sub(1));
             let maxcol = tab.buffer.line(row).chars().count();
-            let col = editor_view::px_to_col(x - text_left, CHAR_W, maxcol);
+            let col = editor_view::px_to_col(x - text_left, cw, maxcol);
             let byte = tab.buffer.point_to_offset(Point::new(row, col));
             (tab.path.clone(), tab.buffer.offset_to_lsp(byte))
         };
@@ -3240,9 +3276,10 @@ impl EntityInputHandler for JadeApp {
         let p = tab.buffer.offset_to_point(byte);
         let top = self.editor_scroll_top();
         let text_left = f32::from_bits(self.editor_text_left.load(Ordering::Relaxed));
+        let cw = self.char_w();
         // Anchor at the caret cell, using the captured text-left and the row's
         // offset from the current scroll top (best-effort IME candidate position).
-        let x = px(text_left + editor_view::col_to_px(p.col, CHAR_W));
+        let x = px(text_left + editor_view::col_to_px(p.col, cw));
         let y = element_bounds.origin.y + px((p.row.saturating_sub(top)) as f32 * LINE_H);
         Some(Bounds::new(
             gpui::point(x, y),
@@ -3298,6 +3335,16 @@ impl Render for JadeApp {
         // keyboard + IME input (created lazily like the terminal's).
         if self.editor_focus.is_none() {
             self.editor_focus = Some(cx.focus_handle());
+        }
+        // A file was just opened: hand the editor keyboard focus (open sites have
+        // no Window; this render does). Skipped while an overlay owns input.
+        if self.pending_editor_focus {
+            self.pending_editor_focus = false;
+            if self.quick_open.is_none() && self.note_editing.is_none() {
+                if let Some(h) = &self.editor_focus {
+                    h.focus(window, cx);
+                }
+            }
         }
 
         // Benchmark-name input focus (§5.4): focus it while naming so keystrokes
@@ -3456,9 +3503,10 @@ fn action_bar(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl I
         .flex()
         .items_center()
         .gap_2()
-        .child(chip("Files", theme, false))
+        .child(chip("panel-left", "Files", theme, false))
         .child(action_chip(
             "tgl-terminal",
+            "terminal",
             "Terminal".to_string(),
             theme,
             terminal_active,
@@ -3477,6 +3525,7 @@ fn action_bar(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl I
         ))
         .child(action_chip(
             "tgl-flow",
+            "corner-down-right",
             "Flow".to_string(),
             theme,
             app.flow_visible,
@@ -3486,6 +3535,7 @@ fn action_bar(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl I
         ))
         .child(action_chip(
             "tgl-runtime",
+            "gauge",
             "Runtime".to_string(),
             theme,
             app.runtime_visible,
@@ -3503,22 +3553,34 @@ fn action_bar(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl I
         .when(errs > 0, |d| {
             d.child(
                 div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
                     .text_color(rgb(theme.red))
-                    .child(format!("⊘ {errs}")),
+                    .child(crate::assets::ui_icon("circle-x", 13.))
+                    .child(format!("{errs}")),
             )
         })
         .when(warns > 0, |d| {
             d.child(
                 div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
                     .text_color(rgb(theme.amber))
-                    .child(format!("△ {warns}")),
+                    .child(crate::assets::ui_icon("triangle-alert", 13.))
+                    .child(format!("{warns}")),
             )
         })
         .when(infos > 0, |d| {
             d.child(
                 div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
                     .text_color(rgb(theme.periwinkle))
-                    .child(format!("ⓘ {infos}")),
+                    .child(crate::assets::ui_icon("info", 13.))
+                    .child(format!("{infos}")),
             )
         });
 
@@ -3530,6 +3592,7 @@ fn action_bar(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl I
         // ASM viewer (§6, ⌘⇧A): right-half overlay of the active file's assembly.
         .child(action_chip(
             "chip-asm",
+            "code",
             "ASM".to_string(),
             theme,
             app.asm_visible,
@@ -3539,6 +3602,7 @@ fn action_bar(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl I
         ))
         .child(action_chip(
             "btn-build",
+            "hammer",
             build_label,
             theme,
             app.building,
@@ -3548,6 +3612,7 @@ fn action_bar(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl I
         ))
         .child(action_chip(
             "btn-run",
+            "play",
             run_label,
             theme,
             app.running,
@@ -3557,6 +3622,7 @@ fn action_bar(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl I
         ))
         .child(action_chip(
             "btn-debug",
+            "bug",
             "Debug".to_string(),
             theme,
             app.debugging,
@@ -3566,6 +3632,7 @@ fn action_bar(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl I
         ))
         .child(action_chip(
             "btn-stop",
+            "square",
             "Stop".to_string(),
             theme,
             false,
@@ -3574,11 +3641,13 @@ fn action_bar(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl I
             |a, _| a.action_stop(),
         ))
         .child(action_chip(
-            "btn-ai", ai_label, theme, ai_active, false, cx, |a, _| a.action_ai(),
+            "btn-ai", "sparkles", ai_label, theme, ai_active, false, cx, |a, _| a.action_ai(),
         ))
         // AI ghost-text section (§4.11): toggle ghost suggestions + multiline mode.
+        // The eye/eye-off icon mirrors the Electron visibility toggle.
         .child(action_chip(
             "btn-ai-ghost",
+            if app.ai_completion_enabled { "eye" } else { "eye-off" },
             "Ghost".to_string(),
             theme,
             app.ai_completion_enabled,
@@ -3591,6 +3660,7 @@ fn action_bar(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl I
         ))
         .child(action_chip(
             "btn-ai-multi",
+            "layers",
             if app.ai_multiline { "Multi ✓" } else { "Multi" }.to_string(),
             theme,
             app.ai_multiline,
@@ -3598,8 +3668,10 @@ fn action_bar(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl I
             cx,
             |a, _| a.action_toggle_ai_multiline(),
         ))
+        // Theme toggle: sun in light mode, moon in dark (matches the TS btn-theme).
         .child(action_chip(
             "btn-theme",
+            if theme.is_light { "sun" } else { "moon" },
             "Theme".to_string(),
             theme,
             false,
@@ -3636,25 +3708,32 @@ fn action_bar(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl I
         .child(right_group)
 }
 
-fn chip(label: &str, theme: &Theme, accent: bool) -> impl IntoElement {
-    let mut el = div()
+/// A static (non-clickable) action-bar chip: a leading lucide icon + label.
+fn chip(icon: &'static str, label: &str, theme: &Theme, accent: bool) -> impl IntoElement {
+    let color = if accent { theme.accent } else { theme.muted };
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_1()
         .px_2()
         .py_1()
         .rounded_md()
         .text_xs()
         .bg(rgb(theme.bg))
-        .text_color(rgb(theme.muted));
-    if accent {
-        el = el.text_color(rgb(theme.accent));
-    }
-    el.child(label.to_string())
+        .text_color(rgb(color))
+        .child(crate::assets::ui_icon(icon, 14.))
+        .child(label.to_string())
 }
 
-/// A clickable action-bar chip. `active` accents the label; `disabled` mutes it
-/// and drops the click handler. `f` is the same `action_*` method the smoke hook
-/// calls, so buttons and headless verification exercise one code path.
+/// A clickable action-bar chip: a leading lucide `icon` + `label`. `active`
+/// accents the chip; `disabled` mutes it and drops the click handler. `f` is the
+/// same `action_*` method the smoke hook calls, so buttons and headless
+/// verification exercise one code path. The icon inherits the chip's text_color,
+/// so it re-tints with the active/disabled state and the current theme.
 fn action_chip(
     id: &'static str,
+    icon: &'static str,
     label: String,
     theme: &Theme,
     active: bool,
@@ -3671,12 +3750,17 @@ fn action_chip(
     };
     let el = div()
         .id(id)
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_1()
         .px_2()
         .py_1()
         .rounded_md()
         .text_xs()
         .bg(rgb(theme.bg))
         .text_color(rgb(color))
+        .child(crate::assets::ui_icon(icon, 14.))
         .child(label);
     if disabled {
         el
@@ -3799,6 +3883,13 @@ fn bottom_panel(
                 .flex_row()
                 .items_center()
                 .gap_2()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .text_color(rgb(theme.muted))
+                        .child(crate::assets::ui_icon("terminal", 13.)),
+                )
                 .child(view_tab("bv-terminal", "TERMINAL", is_term, BottomView::Terminal))
                 .child(view_tab("bv-output", "OUTPUT", !is_term, BottomView::Output)),
         )
@@ -3812,27 +3903,29 @@ fn bottom_panel(
                 .child(
                     div()
                         .id("term-new")
+                        .flex()
+                        .items_center()
                         .text_color(rgb(theme.muted))
-                        .text_xs()
                         .cursor_pointer()
                         .on_click(cx.listener(|a: &mut JadeApp, _ev, _win, cx| {
                             a.action_new_terminal();
                             cx.notify();
                         }))
-                        .child("+"),
+                        .child(crate::assets::ui_icon("plus", 14.)),
                 )
                 // Minimize (hide the strip).
                 .child(
                     div()
                         .id("term-min")
+                        .flex()
+                        .items_center()
                         .text_color(rgb(theme.muted))
-                        .text_xs()
                         .cursor_pointer()
                         .on_click(cx.listener(|a: &mut JadeApp, _ev, _win, cx| {
                             a.action_toggle_output();
                             cx.notify();
                         }))
-                        .child("—"),
+                        .child(crate::assets::ui_icon("minus", 14.)),
                 ),
         );
 

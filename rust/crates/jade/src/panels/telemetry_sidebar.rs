@@ -26,8 +26,13 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> impl IntoElement {
         .gap_2()
         .child(
             div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
                 .text_color(rgb(theme.accent))
                 .text_xs()
+                .child(crate::assets::ui_icon("activity", 13.))
                 .child("TELEMETRY"),
         );
 

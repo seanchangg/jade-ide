@@ -1,8 +1,8 @@
 //! File-tree panel (feature inventory §5.1, deliverable §2).
 //!
-//! Header "FILES" + a minimize placeholder; one row per visible tree node with an
-//! expand arrow (▸/▾) for directories, the extension glyph map from §5.1
-//! (`◆ ◇ ◈ {} ≡ ¶ ◎ $ ⚙ ▣ ·`), indentation `12 + depth*16` px, source files
+//! Header "FILES" + a minimize placeholder; one row per visible tree node with a
+//! leading lucide icon (folder/folder-open for directories, file-code/file for
+//! files — see `crate::assets`), indentation `12 + depth*16` px, source files
 //! accent-colored / headers accent2, and the active file's row highlighted.
 //! Clicking a directory toggles expansion (lazy-loading its children); clicking a
 //! file opens it in the editor.
@@ -30,9 +30,10 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> impl IntoElement {
         .child(
             div()
                 .id("files-minimize")
+                .flex()
+                .items_center()
                 .text_color(rgb(theme.muted))
-                .text_xs()
-                .child("—"),
+                .child(crate::assets::ui_icon("minus", 14.)),
         );
 
     let mut list = div().flex().flex_col().w_full();
@@ -72,17 +73,23 @@ fn tree_row(
     let is_active = active == Some(row.path.as_path());
     let path = row.path.clone();
 
-    // Leading glyph: expand arrow for dirs, extension glyph for files.
-    let (glyph, glyph_color) = if row.is_dir {
-        let arrow = if row.expanded { "▾" } else { "▸" };
-        (arrow.to_string(), theme.muted)
+    // Leading icon: a folder (open when expanded) for dirs; for files, file-code
+    // for source/header, else the plain file glyph. Color still encodes the ext
+    // class and inherits into the icon via text_color.
+    let (icon_name, glyph_color) = if row.is_dir {
+        let name = if row.expanded { "folder-open" } else { "folder" };
+        (name, theme.muted)
     } else {
         let color = match row.ext_class {
             ExtClass::Source => theme.accent,
             ExtClass::Header => theme.blue_gray,
             ExtClass::Other => theme.muted,
         };
-        (file_glyph(&row.name).to_string(), color)
+        let name = match row.ext_class {
+            ExtClass::Source | ExtClass::Header => "file-code",
+            ExtClass::Other => "file",
+        };
+        (name, color)
     };
 
     // Label color: source accent, header accent2, dirs/others default text.
@@ -127,8 +134,10 @@ fn tree_row(
         div()
             .w(px(14.))
             .flex_none()
+            .flex()
+            .items_center()
             .text_color(rgb(glyph_color))
-            .child(glyph),
+            .child(crate::assets::ui_icon(icon_name, 14.)),
     )
     .child(div().text_color(rgb(label_color)).child(row.name))
 }
@@ -141,21 +150,3 @@ fn row_id(path: &std::path::Path) -> u64 {
     h.finish()
 }
 
-/// Extension → glyph, mirroring `file-tree.ts:504-522`. Files with no dot use the
-/// whole (lowercased) name as the "extension" (so `Makefile` → ⚙).
-fn file_glyph(name: &str) -> &'static str {
-    let ext = name.rsplit('.').next().unwrap_or(name).to_ascii_lowercase();
-    match ext.as_str() {
-        "cpp" | "cc" | "cxx" => "◆",
-        "c" => "◇",
-        "h" | "hpp" | "hxx" => "◈",
-        "json" => "{}",
-        "txt" => "≡",
-        "md" => "¶",
-        "py" => "◎",
-        "sh" | "zsh" => "$",
-        "makefile" | "cmake" => "⚙",
-        "cu" | "metal" => "▣",
-        _ => "·",
-    }
-}

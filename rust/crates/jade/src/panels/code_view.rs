@@ -124,6 +124,7 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> gpui::AnyElement {
                 .map(|f| f.is_focused(window))
                 .unwrap_or(false);
             let row_handle = this.editor_focus.clone();
+            let char_w = this.char_w();
 
             let Some(tab) = this.editor.active_tab() else {
                 return rows;
@@ -342,6 +343,7 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> gpui::AnyElement {
                 // the element type consistent.
                 let mut cell = div()
                     .id(("code-cell", i))
+                    .debug_selector(|| format!("code-cell-{i}"))
                     .flex_1()
                     .relative()
                     .overflow_hidden()
@@ -349,16 +351,19 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> gpui::AnyElement {
                     .flex_row()
                     .items_center();
 
-                // Caret bar (2px accent, no blink) on the caret row when focused.
-                if focused && caret_point.row == i {
+                // Caret bar (2px accent, no blink) on the caret row — always
+                // visible on the active tab so the cursor is findable; dimmed
+                // when the editor doesn't own keyboard focus.
+                if caret_point.row == i {
                     cell = cell.child(
                         div()
                             .absolute()
                             .top_0()
-                            .left(px(editor_view::col_to_px(caret_point.col, CHAR_W)))
+                            .left(px(editor_view::col_to_px(caret_point.col, char_w)))
                             .w(px(2.))
                             .h(px(LINE_H))
-                            .bg(rgb(theme.accent)),
+                            .bg(rgba_a(theme.accent, if focused { 1.0 } else { 0.35 }))
+                            .debug_selector(|| "editor-caret".into()),
                     );
                 }
 
@@ -466,6 +471,7 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> gpui::AnyElement {
             flow_visible_now,
             app.editor_text_left.clone(),
             app.editor_rows.clone(),
+            app.editor_char_w.clone(),
             handle.clone(),
             entity,
         ));
@@ -539,6 +545,7 @@ fn ime_geometry_canvas(
     flow_visible: bool,
     text_left: std::sync::Arc<std::sync::atomic::AtomicU32>,
     rows_store: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    char_w_store: std::sync::Arc<std::sync::atomic::AtomicU32>,
     handle: FocusHandle,
     entity: Entity<JadeApp>,
 ) -> impl IntoElement {
@@ -549,6 +556,16 @@ fn ime_geometry_canvas(
             let glyph = if flow_visible { GLYPH_W } else { 0.0 };
             let left = f32::from(bounds.origin.x) + 8.0 + GUTTER_W + glyph;
             text_left.store(left.to_bits(), Ordering::Relaxed);
+            // Measure the mono font's real advance so caret placement and
+            // click→column mapping stay correct if the bundled font changes.
+            let font = gpui::font(crate::fonts::mono_family());
+            let font_id = window.text_system().resolve_font(&font);
+            if let Ok(adv) = window.text_system().advance(font_id, px(FONT_PX), 'M') {
+                let w = f32::from(adv.width);
+                if w > 0.0 {
+                    char_w_store.store(w.to_bits(), Ordering::Relaxed);
+                }
+            }
             let h = f32::from(bounds.size.height);
             rows_store.store(((h / LINE_H).floor() as u32).max(1), Ordering::Relaxed);
             let region = Bounds::new(
@@ -566,9 +583,9 @@ fn ime_geometry_canvas(
 
 /// The x pixel of the code column `col`, including the gutter + optional flow
 /// margin, for anchoring the floating popups inside the editor container.
-fn popup_x(col: usize, flow_visible: bool) -> f32 {
+fn popup_x(col: usize, flow_visible: bool, char_w: f32) -> f32 {
     let glyph = if flow_visible { GLYPH_W } else { 0.0 };
-    8.0 + GUTTER_W + glyph + editor_view::col_to_px(col, CHAR_W)
+    8.0 + GUTTER_W + glyph + editor_view::col_to_px(col, char_w)
 }
 
 /// The y pixel (top) of the row below `row`, given the current scroll top.
@@ -590,7 +607,7 @@ fn completion_popup(
     }
     let theme = app.theme.clone();
     let (row, col) = c.anchor;
-    let left = popup_x(col, flow_visible);
+    let left = popup_x(col, flow_visible, app.char_w());
     let top = popup_y(row, scroll_top);
 
     // Window of up to 8 items centered on the selection.
@@ -660,7 +677,7 @@ fn completion_popup(
 fn hover_popup(app: &JadeApp, flow_visible: bool, scroll_top: usize) -> Option<gpui::AnyElement> {
     let h: &HoverState = app.hover.as_ref()?;
     let theme = app.theme.clone();
-    let left = popup_x(h.col, flow_visible);
+    let left = popup_x(h.col, flow_visible, app.char_w());
     let top = popup_y(h.row, scroll_top);
     Some(
         div()
@@ -726,7 +743,7 @@ fn runtime_allocs_for(app: &JadeApp, tab: &crate::editor_view::OpenTab) -> HashM
 }
 
 /// The tab strip above the viewer (deliverable §3): one chip per open tab with a
-/// close `×`, the active tab underlined. Middle-click also closes (GPUI exposes
+/// an `x` close icon, the active tab underlined. Middle-click also closes (GPUI exposes
 /// the mouse button on the down event).
 pub fn tab_strip(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl IntoElement {
     let mut strip = div()
@@ -864,6 +881,8 @@ fn tab_chip(
     chip.child(
         div()
             .id(("tab-close", index))
+            .flex()
+            .items_center()
             .px_1()
             .text_color(rgb(theme.muted))
             .cursor_pointer()
@@ -872,6 +891,6 @@ fn tab_chip(
                 app.schedule_ui_save(cx);
                 cx.notify();
             }))
-            .child("×"),
+            .child(crate::assets::ui_icon("x", 12.)),
     )
 }

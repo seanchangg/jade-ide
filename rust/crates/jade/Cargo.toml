@@ -45,3 +45,12 @@ tree-sitter-cpp = "0.23"
 # size annotations, §4.8 execution flow). Mirrors the TS regex/brace-count
 # approach (no AST); already present transitively in the lockfile.
 regex = "1"
+# Error context for the bundled-icon AssetSource (assets.rs); gpui's AssetSource
+# trait speaks anyhow::Result, so we surface a missing asset with .context().
+anyhow = "1"
+
+[dev-dependencies]
+# test-support turns on gpui's TestAppContext/VisualTestContext so interaction
+# tests can drive real clicks/keystrokes through the full window dispatch path
+# (hitboxes, focus, IME) headlessly — the same harness Zed's own tests use.
+gpui = { git = "https://github.com/zed-industries/zed", features = ["test-support"] }
