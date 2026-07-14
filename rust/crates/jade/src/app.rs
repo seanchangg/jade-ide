@@ -3794,20 +3794,20 @@ fn action_bar(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl I
         .items_center()
         .gap_2()
         // ASM viewer (§6, ⌘⇧A): plain icon+label, no box.
-        .child(flat_btn("chip-asm", "code", "ASM", theme, app.asm_visible, false, cx, |a, cx| {
+        .child(flat_btn("chip-asm", "code", "ASM", theme.muted, theme, app.asm_visible, false, cx, |a, cx| {
             a.toggle_asm(cx)
         }))
         // Build / Run: outlined accent pills (screenshot ref).
         .child(pill_btn("btn-build", "hammer", build_label, theme.accent, theme, app.building, cx, |a, _| {
             a.action_build()
         }))
-        .child(pill_btn("btn-run", "play", run_label, theme.text, theme, app.running || !can_run, cx, |a, _| {
+        .child(pill_btn("btn-run", "play", run_label, theme.periwinkle, theme, app.running || !can_run, cx, |a, _| {
             a.action_run()
         }))
-        .child(flat_btn("btn-debug", "bug", "Debug", theme, app.debugging, app.building, cx, |a, _| {
+        .child(flat_btn("btn-debug", "bug", "Debug", theme.amber, theme, app.debugging, app.building, cx, |a, _| {
             a.action_debug()
         }))
-        .child(flat_btn("btn-stop", "square", "Stop", theme, false, false, cx, |a, _| {
+        .child(flat_btn("btn-stop", "square", "Stop", theme.red, theme, false, false, cx, |a, _| {
             a.action_stop()
         }))
         // Trailing icon-only cluster: AI backend · ghost text · multiline ·
@@ -3888,12 +3888,14 @@ fn icon_btn(
         .child(crate::assets::ui_icon(icon, 15., color))
 }
 
-/// A flat icon+label button (no border/fill): text-colored, hover wash.
+/// A flat icon+label button (no border/fill): drawn in `base` color (per the
+/// TS bar: Debug amber, Stop red, ASM muted), accent when active, hover wash.
 #[allow(clippy::too_many_arguments)]
 fn flat_btn(
     id: &'static str,
     icon: &'static str,
     label: &'static str,
+    base: u32,
     theme: &Theme,
     active: bool,
     disabled: bool,
@@ -3905,7 +3907,7 @@ fn flat_btn(
     } else if active {
         theme.accent
     } else {
-        theme.text
+        base
     };
     let hover_bg = theme.border;
     let el = div()
@@ -3953,10 +3955,11 @@ fn pill_btn(
         .items_center()
         .gap_1()
         .px_3()
-        .py_1()
+        .py(px(3.))
         .rounded_md()
         .border_1()
-        .border_color(rgb(color))
+        // Thin hue-tinted ring (TS bar look), not a full-strength border.
+        .border_color(gpui::rgba((color << 8) | 0x66))
         .text_xs()
         .text_color(rgb(color))
         .child(crate::assets::ui_icon(icon, 14., color))
@@ -3981,16 +3984,13 @@ fn diag_pill(icon: &'static str, count: usize, color: u32) -> impl IntoElement {
         .items_center()
         .gap_1()
         .px_2()
-        .py(px(2.))
+        .py(px(1.))
         .rounded_full()
-        .bg(gpui::Rgba {
-            r: ((color >> 16) & 0xff) as f32 / 255. * 0.15,
-            g: ((color >> 8) & 0xff) as f32 / 255. * 0.15,
-            b: (color & 0xff) as f32 / 255. * 0.15,
-            a: 1.0,
-        })
+        .border_1()
+        .border_color(gpui::rgba((color << 8) | 0x4d)) // thin hue ring
+        .bg(gpui::rgba((color << 8) | 0x1a)) // faint hue wash
         .text_color(rgb(color))
-        .child(crate::assets::ui_icon(icon, 13., color))
+        .child(crate::assets::ui_icon(icon, 12., color))
         .child(format!("{count}"))
 }
 

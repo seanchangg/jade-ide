@@ -82,6 +82,44 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use app::{AppDeps, AppEvent, JadeApp};
 use workspace_tree::{is_watch_relevant, WatchDebounce};
 
+/// Match the Electron app's crisp text (`-webkit-font-smoothing: antialiased`,
+/// main.css:145): set this app's `AppleFontSmoothing` default to 0 so gpui's
+/// mac text system skips CoreGraphics' glyph dilation (stem darkening). Uses
+/// the app-scoped preference — the same `defaults write <app> …` people apply
+/// to VS Code — and respects an explicit value the user already set. Runs
+/// before any text rasterizes because gpui caches the lookup in a OnceLock.
+#[cfg(target_os = "macos")]
+fn disable_font_smoothing() {
+    use core_foundation::base::TCFType;
+    use core_foundation::number::CFNumber;
+    use core_foundation::string::CFString;
+    use core_foundation_sys::preferences::{
+        kCFPreferencesCurrentApplication, CFPreferencesAppSynchronize,
+        CFPreferencesCopyAppValue, CFPreferencesSetAppValue,
+    };
+
+    let key = CFString::new("AppleFontSmoothing");
+    unsafe {
+        // Respect an existing explicit choice (e.g. user re-enabled smoothing).
+        let existing =
+            CFPreferencesCopyAppValue(key.as_concrete_TypeRef(), kCFPreferencesCurrentApplication);
+        if !existing.is_null() {
+            core_foundation::base::CFRelease(existing as _);
+            return;
+        }
+        let zero = CFNumber::from(0i64);
+        CFPreferencesSetAppValue(
+            key.as_concrete_TypeRef(),
+            zero.as_concrete_TypeRef() as _,
+            kCFPreferencesCurrentApplication,
+        );
+        CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn disable_font_smoothing() {}
+
 // Native menu-bar actions (File → Open Folder…, Jade → Quit). Dispatched by
 // the OS menu; handlers are registered in `main`'s run closure.
 gpui::actions!(jade, [OpenFolder, Quit]);
@@ -123,6 +161,8 @@ fn main() {
     // Must run before any engine/runtime spawns so every child process
     // (cmake, clangd, lldb, llama-server) inherits the repaired PATH.
     fix_gui_path();
+    // Must run before the first glyph is rasterized (gpui caches the check).
+    disable_font_smoothing();
 
     // Telemetry server on a dedicated tokio runtime; the Handle is kept so
     // button handlers (and the smoke hook) can spawn engine futures.

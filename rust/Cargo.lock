@@ -2914,6 +2914,8 @@ name = "jade"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "core-foundation 0.10.0",
+ "core-foundation-sys",
  "forge-ai",
  "forge-buffer",
  "forge-build",

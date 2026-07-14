@@ -48,6 +48,12 @@ regex = "1"
 # Error context for the bundled-icon AssetSource (assets.rs); gpui's AssetSource
 # trait speaks anyhow::Result, so we surface a missing asset with .context().
 anyhow = "1"
+# Setting the app-scoped AppleFontSmoothing=0 default at startup (crisp/thin
+# text, same trick as Chromium's -webkit-font-smoothing: antialiased); gpui's
+# mac text system reads it to skip glyph dilation. Version matches gpui's.
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10"
+core-foundation-sys = "0.8"
 
 [dev-dependencies]
 # test-support turns on gpui's TestAppContext/VisualTestContext so interaction
