@@ -95,8 +95,20 @@ pub struct MemoryBarState {
     pub alloc_count: i64,
     /// Total free events seen (runtime panel MEMORY section, §5.4).
     pub free_count: i64,
-    /// Per `file:line` cumulative allocated bytes (AllocBatch roll-up).
-    pub per_line: std::collections::HashMap<String, i64>,
+    /// Per `file:line` runtime-allocation roll-up (AllocBatch + ASan leak
+    /// locations), feeding the inline `← N calls, X.YKB[, M leaked]` decoration
+    /// (§4.5 system 3; `memory-decorations.ts` `allocationTracker`).
+    pub per_line: std::collections::HashMap<String, LineAlloc>,
+}
+
+/// Cumulative runtime allocation stats for one `file:line`. `bytes` is the
+/// cumulative allocated total (never decremented on free, matching the TS
+/// tracker's `totalBytes`); `leaked` counts ASan leak-location frames.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LineAlloc {
+    pub calls: i64,
+    pub bytes: i64,
+    pub leaked: i64,
 }
 
 impl MemoryBarState {
@@ -122,10 +134,12 @@ impl MemoryBarState {
                         AllocKind::Alloc => {
                             self.heap_used += e.size;
                             self.alloc_count += 1;
-                            *self
+                            let entry = self
                                 .per_line
                                 .entry(format!("{}:{}", e.file, e.line))
-                                .or_insert(0) += e.size;
+                                .or_default();
+                            entry.calls += 1;
+                            entry.bytes += e.size;
                         }
                         AllocKind::Free => {
                             self.heap_used -= e.size;
@@ -162,6 +176,15 @@ impl MemoryBarState {
                 leaked_allocations, ..
             } => {
                 self.leak_count = *leaked_allocations;
+                None
+            }
+            MemoryEvent::AsanLeakLocation { file, line, .. } => {
+                // Per-leak frame → bump the owning line's leaked count for the
+                // inline `← … M leaked` decoration (memory-decorations.ts:110-119).
+                self.per_line
+                    .entry(format!("{file}:{line}"))
+                    .or_default()
+                    .leaked += 1;
                 None
             }
             _ => None,
@@ -315,7 +338,9 @@ mod tests {
         assert_eq!(m.heap_used, 1000);
         assert_eq!(m.peak_allocation, 1500); // peaked at 1500 before the free
         assert_eq!(m.alloc_count, 2);
-        assert_eq!(*m.per_line.get("main.cpp:10").unwrap(), 1500);
+        let line = m.per_line.get("main.cpp:10").unwrap();
+        assert_eq!(line.bytes, 1500); // cumulative, not reduced by the free
+        assert_eq!(line.calls, 2);
         assert_eq!(sample, Some(1000.0));
     }
 

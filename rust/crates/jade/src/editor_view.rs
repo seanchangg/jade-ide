@@ -6,8 +6,11 @@
 //! as `editor-manager.ts:208-241`. The active tab drives `JadeApp::active_file`
 //! so Build/Run target the front tab.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::decorations::flow::{self, FlowAnalysis};
+use crate::decorations::size_annotations;
 use crate::highlight::{self, Span, TokenPalette};
 
 /// One open, highlighted file. Read-only for now: `lines` and `highlights` are
@@ -20,6 +23,12 @@ pub struct OpenTab {
     /// Per-line colored spans (byte ranges relative to the line start). Empty for
     /// non-highlightable files (plain text).
     pub highlights: Vec<Vec<Span>>,
+    /// Static size annotations by 1-based line (§4.5 system 1). Recomputed once
+    /// per open/switch — read-only, so no content-change debounce is needed (the
+    /// TS debounces at `:130-134` only matter once editing lands in step 3b).
+    pub sizes: HashMap<usize, String>,
+    /// Execution-flow analysis (§4.8), likewise cached at open time.
+    pub flow: FlowAnalysis,
 }
 
 impl OpenTab {
@@ -37,6 +46,16 @@ impl OpenTab {
         let highlights = highlight::highlight_file(path, text, palette);
         let lines: Vec<String> = text.split('\n').map(|l| l.to_string()).collect();
         debug_assert_eq!(lines.len(), highlights.len());
+        // Decoration analysis is only meaningful for C-family/Metal sources; for
+        // plain text both scanners simply yield nothing.
+        let (sizes, flow) = if highlight::is_highlightable(path) {
+            (
+                size_annotations::collect_size_annotations(text),
+                flow::analyze(text),
+            )
+        } else {
+            (HashMap::new(), FlowAnalysis::default())
+        };
         OpenTab {
             path: path.to_path_buf(),
             name: path
@@ -45,6 +64,8 @@ impl OpenTab {
                 .unwrap_or_else(|| path.display().to_string()),
             lines,
             highlights,
+            sizes,
+            flow,
         }
     }
 
@@ -155,6 +176,8 @@ mod tests {
             name: name.to_string(),
             lines: vec![String::new()],
             highlights: vec![Vec::new()],
+            sizes: HashMap::new(),
+            flow: FlowAnalysis::default(),
         }
     }
 

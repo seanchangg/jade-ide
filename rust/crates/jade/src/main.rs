@@ -36,6 +36,7 @@
 #![allow(dead_code)]
 
 mod app;
+mod decorations;
 mod editor_view;
 mod format;
 mod highlight;
@@ -148,6 +149,11 @@ fn main() {
             run_smoke_term(runtime, deps);
         } else if mode == "wg3d" {
             run_smoke_wg3d(deps);
+        } else if mode == "decorations" {
+            let target = arg_value(&args, "decorations")
+                .map(PathBuf::from)
+                .or_else(|| deps.active_file.clone());
+            run_smoke_decorations(target);
         } else {
             run_smoke(runtime, deps, app_rx, &mode);
         }
@@ -509,6 +515,32 @@ fn run_smoke(
             }
         }
     });
+}
+
+/// `--smoke decorations <file>` (Phase-4 wave 3): run the static size scanner
+/// and the flow analyzer over a file and print a machine-readable line proving
+/// both pure pipelines work headlessly. No window; no app state needed.
+fn run_smoke_decorations(target: Option<PathBuf>) {
+    let Some(target) = target else {
+        println!("[smoke] FAIL decorations: no file (usage: --smoke decorations <file>)");
+        return;
+    };
+    let text = match std::fs::read(&target) {
+        Ok(raw) => String::from_utf8_lossy(&raw).into_owned(),
+        Err(e) => {
+            println!("[smoke] FAIL decorations {}: {e}", target.display());
+            return;
+        }
+    };
+    let sizes = decorations::size_annotations::collect_size_annotations(&text);
+    let flow = decorations::flow::analyze(&text);
+    println!(
+        "[smoke] decorations {} sizes={} glyphs={} segments={}",
+        target.display(),
+        sizes.len(),
+        flow.glyphs.len(),
+        flow.segments.len(),
+    );
 }
 
 /// `--smoke open <file>` (deliverable §7/§8): assemble the app (which scans the

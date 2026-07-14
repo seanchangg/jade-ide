@@ -185,8 +185,24 @@ pub struct JadeApp {
     pub last_was_best: bool,
     /// Signed delta (ms) of the last run vs the run before it.
     pub last_delta_ms: Option<i128>,
-    /// The last run's per-line execution counts (HOTSPOTS source).
+    /// The last run's per-line execution counts (HOTSPOTS source; also the exec
+    /// annotation counts, §4.5 system 2).
     pub last_executed: HashMap<u32, u32>,
+    /// The *previous* run's per-line counts — the snapshot the exec annotations
+    /// diff against for their ↑/↓ arrows. Rotated in [`Self::on_run_done`]
+    /// (`memory-decorations.ts:142-153`).
+    pub prev_executed: HashMap<u32, u32>,
+    /// Source line (1-based) of the last run's first error, parsed from the
+    /// sanitizer output on a failing run (app.ts:1167-1172). Rendered as the red
+    /// `⊘` error line by the flow decorations.
+    pub error_line: Option<u32>,
+
+    // ── Editor decorations (Phase-4 wave 3, §4.8) ─────────────────────────────
+    /// Whether the execution-flow glyphs + tints are shown (the Flow chip, ⌘E).
+    pub flow_visible: bool,
+    /// Scroll handle for the code viewer's `uniform_list`, so Cmd+Click glyph
+    /// navigation can reveal a target line.
+    pub code_scroll: gpui::UniformListScrollHandle,
 
     // ── Output panel + memory bar ─────────────────────────────────────────────
     pub output: Vec<String>,
@@ -301,6 +317,10 @@ impl JadeApp {
             last_was_best: false,
             last_delta_ms: None,
             last_executed: HashMap::new(),
+            prev_executed: HashMap::new(),
+            error_line: None,
+            flow_visible: false,
+            code_scroll: gpui::UniformListScrollHandle::new(),
 
             output: Vec::new(),
             output_visible: true,
@@ -415,6 +435,20 @@ impl JadeApp {
         self.runtime_visible = !self.runtime_visible;
     }
 
+    /// Toggle the execution-flow decorations (Flow chip / ⌘E, §4.8).
+    pub fn action_toggle_flow(&mut self) {
+        self.flow_visible = !self.flow_visible;
+    }
+
+    /// Cmd+Click glyph navigation (§4.8): reveal a target line in the viewer.
+    /// The flow analysis is single-file, so all targets are in the active tab.
+    pub fn flow_goto(&mut self, line_1based: usize) {
+        if line_1based >= 1 {
+            self.code_scroll
+                .scroll_to_item(line_1based - 1, gpui::ScrollStrategy::Center);
+        }
+    }
+
     /// Switch the bottom panel between the live TERMINAL and the OUTPUT
     /// scrollback fallback.
     pub fn set_bottom_view(&mut self, view: BottomView) {
@@ -491,7 +525,19 @@ impl JadeApp {
             let drop = self.run_history.len() - 50;
             self.run_history.drain(0..drop);
         }
+        // Snapshot rotation for the exec-annotation diff arrows: the run that was
+        // `last_executed` becomes `prev_executed`, then this run becomes the new
+        // `last_executed` (memory-decorations.ts:148-152).
+        self.prev_executed = std::mem::take(&mut self.last_executed);
         self.last_executed = res.executed_lines.clone();
+        // Error line (app.ts:1167-1172): on a failing run, the first
+        // `path:line:col` in the sanitizer output marks the red error line.
+        self.error_line = None;
+        if res.exit_code != 0 {
+            if let Some(san) = &res.sanitizer_output {
+                self.error_line = parse_error_line(san);
+            }
+        }
         if res.exit_code == 0 {
             self.status_line(&format!("[forge] Exited with code 0 ({ms}ms)"));
         } else {
@@ -602,6 +648,7 @@ impl JadeApp {
         }
         self.running = true;
         self.run_started = Some(Instant::now()); // drive the live SPEED tick
+        self.error_line = None; // clear any prior run's error line
         self.training.clear(); // ghost snapshot of the previous run
         self.mem.reset(); // reset run-memory state
         self.output_visible = true;
@@ -916,6 +963,17 @@ impl JadeApp {
     }
 }
 
+/// Parse the first `path:line:col` triple in sanitizer output into a 1-based
+/// error line (app.ts:1169 `/(\S+):(\d+):\d+/`). The `\S+` path segment must be
+/// non-empty and the two numeric groups colon-separated.
+fn parse_error_line(sanitizer_output: &str) -> Option<u32> {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| regex::Regex::new(r"(\S+):(\d+):\d+").unwrap());
+    re.captures(sanitizer_output)
+        .and_then(|c| c.get(2))
+        .and_then(|m| m.as_str().parse::<u32>().ok())
+}
+
 fn meta_dims(meta: Option<&Map<String, Value>>) -> (Option<u32>, Option<u32>) {
     let get = |m: &Map<String, Value>, k: &str| m.get(k).and_then(|v| v.as_u64()).map(|n| n as u32);
     match meta {
@@ -1033,7 +1091,15 @@ fn action_bar(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl I
                 }
             },
         ))
-        .child(chip("Flow", theme, false))
+        .child(action_chip(
+            "tgl-flow",
+            "Flow".to_string(),
+            theme,
+            app.flow_visible,
+            false,
+            cx,
+            |a, _| a.action_toggle_flow(),
+        ))
         .child(action_chip(
             "tgl-runtime",
             "Runtime".to_string(),
