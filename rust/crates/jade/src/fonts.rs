@@ -89,12 +89,25 @@ pub fn register_bundled_fonts(cx: &App) {
 }
 
 /// `.../Jade.app/Contents/MacOS/jade` → `.../Jade.app/Contents/Resources/fonts`.
-/// `None` outside a bundle (the dir won't exist) or if the exe path can't be
-/// resolved.
+/// Dev builds (`target/debug/jade`) fall back to the repo's packaging drop-in
+/// dir `rust/scripts/resources/fonts` (exe → debug → target → rust), so
+/// `cargo run` gets the same bundled family as the shipped .app. `None` when
+/// neither exists or the exe path can't be resolved.
 fn bundle_fonts_dir() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     // exe = Contents/MacOS/jade → parent(MacOS) → parent(Contents)
     let contents = exe.parent()?.parent()?;
     let dir = contents.join("Resources").join("fonts");
-    dir.is_dir().then_some(dir)
+    if dir.is_dir() {
+        return Some(dir);
+    }
+    // target/debug/jade → debug → target → rust → scripts/resources/fonts
+    let dev = exe
+        .parent()?
+        .parent()?
+        .parent()?
+        .join("scripts")
+        .join("resources")
+        .join("fonts");
+    dev.is_dir().then_some(dev)
 }

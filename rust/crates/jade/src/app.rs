@@ -33,7 +33,7 @@ use forge_telemetry::{Event, Kind, TelemetryServer};
 use forge_term::{GridSnapshot, TermEvent, TermId, TermManager};
 use gpui::{
     div, prelude::*, px, rgb, Bounds, ClipboardItem, Context, EntityInputHandler, FocusHandle,
-    KeyDownEvent, Pixels, UTF16Selection, Window,
+    KeyDownEvent, MouseButton, Pixels, UTF16Selection, Window,
 };
 use serde_json::{Map, Value};
 use tokio::runtime::Handle;
@@ -3937,7 +3937,7 @@ fn bottom_panel(
             .child(terminal_panel::render(app, term_handle, cx))
             .into_any_element()
     } else {
-        output_view(app, theme).into_any_element()
+        output_view(app, theme, cx).into_any_element()
     };
 
     div()
@@ -3954,19 +3954,39 @@ fn bottom_panel(
 }
 
 /// The OUTPUT scrollback view (deliverable §4): capped scrollback, monospace,
-/// muted, newest visible. ANSI already stripped on ingest.
-fn output_view(app: &JadeApp, theme: &Theme) -> impl IntoElement {
+/// muted, newest visible. ANSI already stripped on ingest. Diagnostic lines
+/// (`/abs/path:line:col: …`) are clickable — jump to the file + line — and
+/// tinted by severity, so a failed build is navigable like the Electron app's
+/// error list.
+fn output_view(app: &JadeApp, theme: &Theme, cx: &mut Context<JadeApp>) -> impl IntoElement {
     // Render the last ~200 lines — enough to fill the strip without a huge tree.
     let start = app.output.len().saturating_sub(200);
     let mut list = div().flex().flex_col();
-    for line in &app.output[start..] {
+    for (n, line) in app.output[start..].iter().enumerate() {
         let text = if line.is_empty() { " ".to_string() } else { line.clone() };
-        list = list.child(
-            div()
-                .text_color(rgb(theme.muted))
-                .text_xs()
-                .child(text),
-        );
+        let color = if line.contains(" error: ") {
+            theme.red
+        } else if line.contains(" warning: ") {
+            theme.amber
+        } else {
+            theme.muted
+        };
+        let mut row = div()
+            .id(("out-line", n))
+            .text_color(rgb(color))
+            .text_xs()
+            .child(text);
+        if let Some((path, lineno)) = parse_jump_target(line) {
+            row = row.cursor_pointer().on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |app: &mut JadeApp, _ev, _w, cx| {
+                    app.open_file(path.clone());
+                    app.reveal_line(lineno as usize);
+                    cx.notify();
+                }),
+            );
+        }
+        list = list.child(row);
     }
     div()
         .id("output-panel")
@@ -3975,6 +3995,24 @@ fn output_view(app: &JadeApp, theme: &Theme) -> impl IntoElement {
         .p(px(8.))
         .overflow_y_scroll()
         .child(list)
+}
+
+/// Parse a `/abs/path:line:col:` diagnostic prefix from an output line (as
+/// emitted by `on_build_done`), returning the jump target. Lines that don't
+/// look like one (relative paths, missing numbers) return `None`.
+fn parse_jump_target(line: &str) -> Option<(PathBuf, u32)> {
+    let t = line.trim_start();
+    if !t.starts_with('/') {
+        return None;
+    }
+    let mut colons = t.match_indices(':');
+    let (p1, _) = colons.next()?;
+    let (p2, _) = colons.next()?;
+    let (p3, _) = colons.next()?;
+    let lineno: u32 = t[p1 + 1..p2].parse().ok()?;
+    let _col: u32 = t[p2 + 1..p3].parse().ok()?;
+    let path = PathBuf::from(&t[..p1]);
+    (lineno > 0).then_some((path, lineno))
 }
 
 /// Bottom memory-bar strip (deliverable §6): SYS MEM · HEAP · PEAK · PRESSURE ·
@@ -4049,4 +4087,27 @@ fn status_strip(app: &JadeApp, theme: &Theme) -> impl IntoElement {
         .border_t_1()
         .border_color(rgb(theme.border))
         .child(div().text_color(rgb(theme.muted)).text_xs().child(text))
+}
+
+#[cfg(test)]
+mod output_jump_tests {
+    use super::parse_jump_target;
+    use std::path::PathBuf;
+
+    #[test]
+    fn parses_clang_diagnostic_prefix() {
+        let line = "  /Users/x/proj/main.cpp:979:9: error: use of undeclared identifier";
+        assert_eq!(
+            parse_jump_target(line),
+            Some((PathBuf::from("/Users/x/proj/main.cpp"), 979))
+        );
+    }
+
+    #[test]
+    fn rejects_non_diagnostic_lines() {
+        assert_eq!(parse_jump_target("[forge] Build failed (5 error(s))"), None);
+        assert_eq!(parse_jump_target("main.cpp:1:1: error: relative path"), None);
+        assert_eq!(parse_jump_target("/Users/x/notes.txt: no numbers"), None);
+        assert_eq!(parse_jump_target("/Users/x/a.cpp:0:1: zero line"), None);
+    }
 }
