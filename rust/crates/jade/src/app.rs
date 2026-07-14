@@ -393,6 +393,10 @@ pub struct JadeApp {
     pub sidebar_closing: bool,
     /// Bumped on every sidebar toggle so the slide animation restarts.
     pub sidebar_anim_gen: usize,
+    /// True while the bottom strip's slide-out animation plays.
+    pub bottom_closing: bool,
+    /// Bumped on every bottom-strip toggle so its slide restarts.
+    pub bottom_anim_gen: usize,
     /// Wall-clock start of the in-flight run (drives the live SPEED tick).
     pub run_started: Option<Instant>,
     /// 1-based counter of completed runs.
@@ -653,6 +657,8 @@ impl JadeApp {
             runtime_visible: false,
             sidebar_closing: false,
             sidebar_anim_gen: 0,
+            bottom_closing: false,
+            bottom_anim_gen: 0,
             run_started: None,
             run_counter: 0,
             run_history: Vec::new(),
@@ -1334,8 +1340,28 @@ impl JadeApp {
     }
 
     /// Toggle the output panel visibility.
-    pub fn action_toggle_output(&mut self) {
-        self.output_visible = !self.output_visible;
+    pub fn action_toggle_output(&mut self, cx: &mut Context<Self>) {
+        self.bottom_anim_gen += 1;
+        if self.output_visible && !self.bottom_closing {
+            self.bottom_closing = true;
+            let gen = self.bottom_anim_gen;
+            cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(SIDEBAR_SLIDE_MS))
+                    .await;
+                let _ = this.update(cx, |app, cx| {
+                    if app.bottom_closing && app.bottom_anim_gen == gen {
+                        app.bottom_closing = false;
+                        app.output_visible = false;
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+        } else {
+            self.bottom_closing = false;
+            self.output_visible = true;
+        }
     }
 
     // ── Code-viewing vertical (file tree + tabs + viewer) ─────────────────────
@@ -3469,7 +3495,26 @@ impl Render for JadeApp {
         if self.debug_visible {
             root = root.child(debug_panel::render(self, cx));
         } else if self.output_visible {
-            root = root.child(bottom_panel(self, cx, &theme, term_handle));
+            // Vertical drawer slide, mirroring the sidebar: the strip's inner
+            // card keeps its fixed height; the wrapper animates and clips.
+            use gpui::{Animation, AnimationExt as _};
+            let closing = self.bottom_closing;
+            root = root.child(
+                div()
+                    .flex_none()
+                    .overflow_hidden()
+                    .child(bottom_panel(self, cx, &theme, term_handle))
+                    .with_animation(
+                        ("bottom-slide", self.bottom_anim_gen),
+                        Animation::new(std::time::Duration::from_millis(SIDEBAR_SLIDE_MS))
+                            .with_easing(gpui::ease_out_quint()),
+                        move |el, t| {
+                            let full = 220.0 + 6.0; // card h(220) + 6px top gutter
+                            let h = if closing { full * (1.0 - t) } else { full * t };
+                            el.h(px(h))
+                        },
+                    ),
+            );
         }
         let mut root = root
             .child(memory_bar(self, &theme))
@@ -3536,7 +3581,7 @@ fn action_bar(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl I
         }))
         .child(icon_btn("tgl-terminal", "terminal", theme, terminal_active, cx, |a, cx| {
             if a.output_visible && a.bottom_view == BottomView::Terminal {
-                a.action_toggle_output();
+                a.action_toggle_output(cx);
             } else {
                 a.set_bottom_view(BottomView::Terminal);
             }
@@ -4061,7 +4106,7 @@ fn bottom_panel(
                         .text_color(rgb(theme.muted))
                         .cursor_pointer()
                         .on_click(cx.listener(|a: &mut JadeApp, _ev, _win, cx| {
-                            a.action_toggle_output();
+                            a.action_toggle_output(cx);
                             cx.notify();
                         }))
                         .child(crate::assets::ui_icon("minus", 14., theme.muted)),
