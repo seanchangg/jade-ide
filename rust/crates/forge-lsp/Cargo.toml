@@ -3,5 +3,14 @@ name = "forge-lsp"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Jade clangd LSP client: direct thin JSON-RPC client over stdio. Ports src/main/lsp-client.ts; NOT zed's project/LspStore."
 
 [dependencies]
+tokio = { workspace = true, features = ["process", "io-util"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+lsp-types = "0.97"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+tempfile = "3"
