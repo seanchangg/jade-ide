@@ -397,6 +397,8 @@ pub struct JadeApp {
     pub bottom_closing: bool,
     /// Bumped on every bottom-strip toggle so its slide restarts.
     pub bottom_anim_gen: usize,
+    /// Bumped on every left-sidebar collapse toggle so its slide restarts.
+    pub left_anim_gen: usize,
     /// Wall-clock start of the in-flight run (drives the live SPEED tick).
     pub run_started: Option<Instant>,
     /// 1-based counter of completed runs.
@@ -659,6 +661,7 @@ impl JadeApp {
             sidebar_anim_gen: 0,
             bottom_closing: false,
             bottom_anim_gen: 0,
+            left_anim_gen: 0,
             run_started: None,
             run_counter: 0,
             run_history: Vec::new(),
@@ -825,6 +828,7 @@ impl JadeApp {
         self.term_last_size.store(0, std::sync::atomic::Ordering::Relaxed);
         self.bottom_view = BottomView::Terminal;
         self.output_visible = true;
+        self.bottom_closing = false;
         self.ensure_terminal();
     }
 
@@ -877,6 +881,7 @@ impl JadeApp {
     pub fn set_bottom_view(&mut self, view: BottomView) {
         self.bottom_view = view;
         self.output_visible = true;
+        self.bottom_closing = false;
     }
 
     fn status_line(&mut self, s: &str) {
@@ -1122,6 +1127,8 @@ impl JadeApp {
         self.building = true;
         self.mem.reset(); // resetMemoryTracking at build time (app.ts:1024)
         self.output_visible = true;
+        self.bottom_closing = false; // cancel a mid-slide close
+        self.bottom_view = BottomView::Output; // build progress/errors live here
         self.last_sanitize = sanitize;
         self.last_instrument = instrument;
         let name = file
@@ -1177,6 +1184,8 @@ impl JadeApp {
         self.training.clear(); // ghost snapshot of the previous run
         self.mem.reset(); // reset run-memory state
         self.output_visible = true;
+        self.bottom_closing = false;
+        self.bottom_view = BottomView::Output; // run output/exit status lands here
         let name = exe
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -1525,6 +1534,7 @@ impl JadeApp {
     /// Collapse/expand the left sidebar (§2; app.ts:449-459): 260px ⇄ 28px strip.
     pub fn toggle_sidebar(&mut self) {
         self.sidebar_collapsed = !self.sidebar_collapsed;
+        self.left_anim_gen += 1; // restart the width slide (28 ⇄ 260)
     }
 
     /// The active tab's tree-sitter outline (empty when no tab / non-C-family).
@@ -3814,6 +3824,32 @@ fn diag_pill(icon: &'static str, count: usize, color: u32) -> impl IntoElement {
 /// collapsed it shrinks to a 28px clickable strip showing a stacked "FILES" label
 /// that reopens it (app.ts:449-459, main.css:481-495).
 fn left_panel(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl IntoElement {
+    use gpui::{Animation, AnimationExt as _};
+
+    // Width slide between the expanded card (260) and the collapsed strip (28),
+    // same 180ms drawer feel as the other two regions. Content swaps instantly;
+    // only the width animates (clipped by overflow_hidden on both branches).
+    let (from, to) = if app.sidebar_collapsed {
+        (260.0_f32, 28.0_f32)
+    } else {
+        (28.0_f32, 260.0_f32)
+    };
+    let inner = left_panel_inner(app, cx, theme);
+    return div()
+        .flex()
+        .flex_none()
+        .overflow_hidden()
+        .child(inner)
+        .with_animation(
+            ("left-slide", app.left_anim_gen),
+            Animation::new(std::time::Duration::from_millis(SIDEBAR_SLIDE_MS))
+                .with_easing(gpui::ease_out_quint()),
+            move |el, t| el.w(px(from + (to - from) * t)),
+        )
+        .into_any_element();
+}
+
+fn left_panel_inner(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl IntoElement {
     // Collapsed: a 28px strip with a vertical "FILES" label (GPUI has no cheap
     // text-rotation, so the letters are stacked); clicking anywhere reopens it.
     if app.sidebar_collapsed {
@@ -3832,6 +3868,8 @@ fn left_panel(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl I
             .flex_col()
             .items_center()
             .w(px(28.))
+            .h_full()
+            .flex_none()
             .rounded_lg()
             .bg(rgb(theme.panel))
             .border_1()
@@ -3856,8 +3894,10 @@ fn left_panel(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl I
     div()
         .flex()
         .flex_col()
+        .flex_none()
         .gap_2()
         .w(px(260.))
+        .h_full()
         .p(px(10.))
         .rounded_lg()
         .bg(rgb(theme.panel))
@@ -3998,6 +4038,7 @@ fn runtime_sidebar(
         .flex_col()
         .gap_3()
         .w(px(280.))
+        .h_full()
         .p(px(10.))
         .rounded_lg()
         .bg(rgb(theme.panel))
@@ -4011,6 +4052,7 @@ fn runtime_sidebar(
 
     let closing = app.sidebar_closing;
     div()
+        .flex()
         .flex_none()
         .overflow_hidden()
         .child(card)
