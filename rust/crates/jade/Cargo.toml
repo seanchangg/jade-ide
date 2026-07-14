@@ -15,6 +15,15 @@ gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["fo
 forge-telemetry = { path = "../forge-telemetry" }
 forge-build = { path = "../forge-build" }
 forge-debug = { path = "../forge-debug" }
+# Editor text core (E2): rope-backed Buffer, cursors, grouped undo/redo,
+# LSP-shaped incremental EditRecords, dirty tracking. Backs each OpenTab.
+forge-buffer = { path = "../forge-buffer" }
+# clangd LSP client (E2): diagnostics/completion/hover/definition over stdio.
+forge-lsp = { path = "../forge-lsp" }
+# The LSP domain vocabulary forge-lsp is built on. jade needs a few types
+# forge-lsp doesn't re-export (CompletionTextEdit/TextEdit for applying
+# completions); pinned to the exact version forge-lsp uses so the types unify.
+lsp-types = "0.97"
 forge-sysmon = { path = "../forge-sysmon" }
 forge-ai = { path = "../forge-ai" }
 # Headless terminal engine (PTY + alacritty grid state machine); Jade renders

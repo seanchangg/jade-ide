@@ -10,20 +10,31 @@
 
 use std::collections::HashMap;
 
-use gpui::{div, prelude::*, px, rgb, rgba, uniform_list, ClickEvent, Context, HighlightStyle, Rgba};
+use forge_buffer::Point;
+use gpui::{
+    canvas, div, point, prelude::*, px, rgb, rgba, size, uniform_list, Bounds, ClickEvent, Context,
+    ElementInputHandler, Entity, FocusHandle, HighlightStyle, KeyDownEvent, MouseButton,
+    MouseDownEvent, MouseMoveEvent, Rgba, UnderlineStyle,
+};
 
-use crate::app::JadeApp;
+use crate::app::{CompletionState, HoverState, JadeApp};
 use crate::decorations::flow::GlyphKind;
 use crate::decorations::{self, RuntimeAlloc};
+use crate::editor_view::{self, CellStyle};
 use crate::theme::Theme;
 
 /// Editor metrics (§4.1 "editor look").
 const FONT_PX: f32 = 13.0;
-const LINE_H: f32 = 20.0;
+pub const LINE_H: f32 = 20.0;
 const PAD_TOP: f32 = 16.0;
 const GUTTER_W: f32 = 52.0;
 /// Width of the flow glyph margin column (shown only when Flow is toggled on).
 const GLYPH_W: f32 = 16.0;
+/// Menlo's char advance at [`FONT_PX`] (Menlo is monospace, ~0.602 em → 7.83px
+/// at 13px). Used for caret/selection/popup placement and click→column mapping;
+/// the two share this constant so hit-testing stays self-consistent. Wide glyphs
+/// (CJK/emoji) count as one column — an accepted, documented approximation.
+pub const CHAR_W: f32 = 7.83;
 /// End-of-line annotation text size (§4.5: 11px emerald @0.7 opacity).
 const ANN_PX: f32 = 11.0;
 
@@ -63,9 +74,11 @@ fn flow_tint(kind: GlyphKind) -> (f32, f32) {
     }
 }
 
-/// Render the viewer for the active tab, or a centered placeholder when none is
-/// open.
-pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> impl IntoElement {
+/// Render the editable editor for the active tab, or a centered placeholder when
+/// none is open. The surface is focusable (keys → [`JadeApp::editor_key`], text →
+/// IME `replace_text_in_range`), mouse-selectable, and overlays the autocomplete
+/// + hover popups.
+pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> gpui::AnyElement {
     let theme = app.theme.clone();
 
     let Some(tab) = app.editor.active_tab() else {
@@ -79,207 +92,542 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> impl IntoElement {
                 div()
                     .text_color(rgb(theme.muted))
                     .child("No file open — pick one from the tree"),
-            );
+            )
+            .into_any_element();
     };
 
-    let line_count = tab.lines.len();
+    let line_count = tab.line_count();
     let default_color = theme.text;
+    let flow_visible_now = app.flow_visible;
 
-    div().flex().flex_1().size_full().child(
-        uniform_list(
-            "code-lines",
-            line_count,
-            cx.processor(move |this, range: std::ops::Range<usize>, _window, cx| {
-                let mut rows = Vec::with_capacity(range.len());
+    // The focus handle backing keyboard + IME input (created lazily in the shell).
+    let handle = app
+        .editor_focus
+        .clone()
+        .unwrap_or_else(|| cx.focus_handle());
 
-                // Dynamic state read once per range render (all disjoint fields).
-                let flow_visible = this.flow_visible;
-                let error_line = this.error_line;
-                let has_run = !this.last_executed.is_empty();
+    let list = uniform_list(
+        "code-lines",
+        line_count,
+        cx.processor(move |this, range: std::ops::Range<usize>, window, cx| {
+            let mut rows = Vec::with_capacity(range.len());
 
-                let Some(tab) = this.editor.active_tab() else {
-                    return rows;
-                };
+            let flow_visible = this.flow_visible;
+            let error_line = this.error_line;
+            let has_run = !this.last_executed.is_empty();
+            let theme = this.theme.clone();
+            let focused = this
+                .editor_focus
+                .as_ref()
+                .map(|f| f.is_focused(window))
+                .unwrap_or(false);
+            let row_handle = this.editor_focus.clone();
 
-                // Build the runtime-allocation map for the active file once,
-                // matching per_line keys by full path or basename (the alloc
-                // event's `file` form isn't guaranteed).
-                let runtime = runtime_allocs_for(this, tab);
+            let Some(tab) = this.editor.active_tab() else {
+                return rows;
+            };
 
-                for i in range {
-                    let line_no = i + 1;
-                    let text = tab.lines.get(i).cloned().unwrap_or_default();
-                    let spans = tab.highlights.get(i);
+            let runtime = runtime_allocs_for(this, tab);
+            let Some(tab) = this.editor.active_tab() else {
+                return rows;
+            };
 
-                    // Per-token color runs; gaps inherit the default text color.
-                    let highlights: Vec<(std::ops::Range<usize>, HighlightStyle)> = spans
-                        .map(|ss| {
-                            ss.iter()
-                                .filter(|s| s.end <= text.len())
-                                .map(|s| {
-                                    (
-                                        s.start..s.end,
-                                        HighlightStyle {
-                                            color: Some(rgb(s.color).into()),
-                                            ..Default::default()
-                                        },
-                                    )
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    let styled = gpui::StyledText::new(text).with_highlights(highlights);
+            // Caret + selection (buffer byte coordinates).
+            let sel = tab.buffer.selection();
+            let caret_point = tab.caret_point();
 
-                    // ── Merged end-of-line annotation (§4.5) ──────────────────
-                    let size = tab.sizes.get(&line_no).map(String::as_str);
-                    let exec = this
-                        .last_executed
-                        .get(&(line_no as u32))
-                        .and_then(|&c| {
-                            let prev = this
-                                .prev_executed
-                                .get(&(line_no as u32))
-                                .copied()
-                                .unwrap_or(0);
-                            decorations::exec_annotations::annotate_line(c, prev)
-                        });
-                    let rt: Option<RuntimeAlloc> = runtime.get(&(line_no as u32)).copied();
-                    let annotation =
-                        decorations::merge_annotation(size, exec.as_deref(), rt.as_ref());
+            for i in range {
+                let line_no = i + 1;
+                let text = tab.line(i);
+                let line_bytes = text.len();
+                let line_start = tab.buffer.point_to_offset(Point::new(i, 0));
+                let line_end = line_start + line_bytes;
 
-                    // ── Flow glyph + whole-line tint (§4.8) ───────────────────
-                    let mut row_bg: Option<Rgba> = None;
-                    let mut border_col = rgba_a(0, 0.0); // transparent, keeps 2px width
-                    let mut glyph: Option<(char, Rgba)> = None;
-                    let mut nav_target: Option<usize> = None;
+                // Style layers → flattened runs (syntax · selection · diagnostics
+                // · IME marked), see editor_view::merge_line_styles.
+                let syntax = tab.highlights.get(i).map(Vec::as_slice).unwrap_or(&[]);
+                let selection = editor_view::selection_on_line(sel, line_start, line_end);
+                let underlines = editor_view::diagnostic_underlines_for_row(
+                    &tab.diagnostics,
+                    i,
+                    &tab.buffer,
+                    theme.red,
+                    theme.amber,
+                    theme.periwinkle,
+                );
+                let marked = tab.marked.as_ref().and_then(|m| {
+                    editor_view::selection_on_line(
+                        forge_buffer::Selection::new(m.start, m.end),
+                        line_start,
+                        line_end,
+                    )
+                });
+                let cells =
+                    editor_view::merge_line_styles(line_bytes, syntax, selection, &underlines, marked);
+                let highlights = cells
+                    .into_iter()
+                    .map(|(r, s)| (r, cell_to_style(&s, &theme)))
+                    .collect::<Vec<_>>();
+                let styled = gpui::StyledText::new(text).with_highlights(highlights);
 
-                    if flow_visible {
-                        let executed = has_run && this.last_executed.contains_key(&(line_no as u32));
-                        if let Some(fg) = tab.flow.glyphs.get(&line_no) {
-                            nav_target = fg.targets.first().copied();
-                            let color = flow_color(fg.kind);
-                            let (ba, bo) = flow_tint(fg.kind);
-                            let mut gcolor = rgba_a(color, 1.0);
-                            if has_run {
-                                if executed {
-                                    row_bg = Some(rgba_a(FLOW_SEQ, 0.08)); // executed green
-                                    border_col = rgba_a(color, bo);
-                                } else {
-                                    gcolor = rgba_a(color, 0.25); // dim off-path glyph
-                                }
-                            } else {
-                                row_bg = Some(rgba_a(color, ba));
+                // Merged end-of-line annotation (§4.5).
+                let size = tab.sizes.get(&line_no).map(String::as_str);
+                let exec = this
+                    .last_executed
+                    .get(&(line_no as u32))
+                    .and_then(|&c| {
+                        let prev = this
+                            .prev_executed
+                            .get(&(line_no as u32))
+                            .copied()
+                            .unwrap_or(0);
+                        decorations::exec_annotations::annotate_line(c, prev)
+                    });
+                let rt: Option<RuntimeAlloc> = runtime.get(&(line_no as u32)).copied();
+                let annotation = decorations::merge_annotation(size, exec.as_deref(), rt.as_ref());
+
+                // Flow glyph + whole-line tint (§4.8).
+                let mut row_bg: Option<Rgba> = None;
+                let mut border_col = rgba_a(0, 0.0);
+                let mut glyph: Option<(char, Rgba)> = None;
+                let mut nav_target: Option<usize> = None;
+
+                if flow_visible {
+                    let executed = has_run && this.last_executed.contains_key(&(line_no as u32));
+                    if let Some(fg) = tab.flow.glyphs.get(&line_no) {
+                        nav_target = fg.targets.first().copied();
+                        let color = flow_color(fg.kind);
+                        let (ba, bo) = flow_tint(fg.kind);
+                        let mut gcolor = rgba_a(color, 1.0);
+                        if has_run {
+                            if executed {
+                                row_bg = Some(rgba_a(FLOW_SEQ, 0.08));
                                 border_col = rgba_a(color, bo);
+                            } else {
+                                gcolor = rgba_a(color, 0.25);
                             }
-                            glyph = Some((fg.kind.glyph(), gcolor));
-                        } else if executed {
-                            row_bg = Some(rgba_a(FLOW_SEQ, 0.04)); // executed, non-flow line
+                        } else {
+                            row_bg = Some(rgba_a(color, ba));
+                            border_col = rgba_a(color, bo);
                         }
-
-                        // Error line overrides everything.
-                        if error_line == Some(line_no as u32) {
-                            row_bg = Some(rgba_a(FLOW_ERROR, 0.12));
-                            border_col = rgba_a(FLOW_ERROR, 0.5);
-                            glyph = Some((GlyphKind::Error.glyph(), rgba_a(FLOW_ERROR, 1.0)));
-                            nav_target = None;
-                        }
+                        glyph = Some((fg.kind.glyph(), gcolor));
+                    } else if executed {
+                        row_bg = Some(rgba_a(FLOW_SEQ, 0.04));
                     }
-
-                    // ── Row assembly ──────────────────────────────────────────
-                    let mut row = div().flex().flex_row().h(px(LINE_H)).items_center();
-
-                    if flow_visible {
-                        let mut cell = div()
-                            .id(("flow-glyph", i))
-                            .w(px(GLYPH_W))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_size(px(12.));
-                        if let Some((ch, col)) = glyph {
-                            cell = cell.text_color(col).child(ch.to_string());
-                        }
-                        // Cmd/Ctrl+Click a glyph line navigates to its target.
-                        if let Some(target) = nav_target {
-                            cell = cell.cursor_pointer().on_click(cx.listener(
-                                move |app: &mut JadeApp, ev: &ClickEvent, _win, cx| {
-                                    let m = ev.modifiers();
-                                    if m.platform || m.control {
-                                        app.flow_goto(target);
-                                        cx.notify();
-                                    }
-                                },
-                            ));
-                        }
-                        row = row.child(cell);
+                    if error_line == Some(line_no as u32) {
+                        row_bg = Some(rgba_a(FLOW_ERROR, 0.12));
+                        border_col = rgba_a(FLOW_ERROR, 0.5);
+                        glyph = Some((GlyphKind::Error.glyph(), rgba_a(FLOW_ERROR, 1.0)));
+                        nav_target = None;
                     }
-
-                    // Always reserve a 2px left border so tinted lines don't shift.
-                    row = row.border_l_2().border_color(border_col);
-                    // §4.7 structure tint is the subtle base layer; flow/exec/
-                    // error tints (stronger, semantic) take precedence when set.
-                    if row_bg.is_none() {
-                        if let Some(color) = crate::structure::line_tint(&tab.symbols, line_no) {
-                            row_bg = Some(rgba_a(color, 0.047));
-                        }
-                    }
-                    if let Some(bg) = row_bg {
-                        row = row.bg(bg);
-                    }
-
-                    row = row
-                        .child(
-                            // Gutter: right-aligned line number.
-                            div()
-                                .w(px(GUTTER_W))
-                                .flex_none()
-                                .pr(px(8.))
-                                .text_right()
-                                .text_color(rgb(GUTTER_FG))
-                                .child(line_no.to_string()),
-                        )
-                        .child({
-                            // Code cell: code text, then the trailing annotation.
-                            let mut cell = div()
-                                .flex_1()
-                                .overflow_hidden()
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .child(
-                                    div()
-                                        .whitespace_nowrap()
-                                        .flex_none()
-                                        .text_color(rgb(default_color))
-                                        .child(styled),
-                                );
-                            if let Some(ann) = annotation {
-                                cell = cell.child(
-                                    div()
-                                        .flex_none()
-                                        .whitespace_nowrap()
-                                        .text_size(px(ANN_PX))
-                                        .text_color(rgba_a(ANN_EMERALD, 0.7))
-                                        .child(ann),
-                                );
-                            }
-                            cell
-                        });
-
-                    rows.push(row);
                 }
-                rows
-            }),
-        )
-        .track_scroll(&app.code_scroll)
+
+                // Gutter diagnostic dot (max severity starting on this row).
+                let diag_dot = diag_dot_color(&tab.diagnostics, i, &theme);
+
+                let mut row = div().flex().flex_row().h(px(LINE_H)).items_center();
+
+                if flow_visible {
+                    let mut cell = div()
+                        .id(("flow-glyph", i))
+                        .w(px(GLYPH_W))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(12.));
+                    if let Some((ch, col)) = glyph {
+                        cell = cell.text_color(col).child(ch.to_string());
+                    }
+                    if let Some(target) = nav_target {
+                        cell = cell.cursor_pointer().on_click(cx.listener(
+                            move |app: &mut JadeApp, ev: &ClickEvent, _win, cx| {
+                                let m = ev.modifiers();
+                                if m.platform || m.control {
+                                    app.flow_goto(target);
+                                    cx.notify();
+                                }
+                            },
+                        ));
+                    }
+                    row = row.child(cell);
+                }
+
+                row = row.border_l_2().border_color(border_col);
+                if row_bg.is_none() {
+                    if let Some(color) = crate::structure::line_tint(&tab.symbols, line_no) {
+                        row_bg = Some(rgba_a(color, 0.047));
+                    }
+                }
+                if let Some(bg) = row_bg {
+                    row = row.bg(bg);
+                }
+
+                // Gutter: diagnostic dot + right-aligned line number.
+                let mut gutter = div()
+                    .w(px(GUTTER_W))
+                    .flex_none()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .pr(px(8.));
+                gutter = gutter.child(
+                    div()
+                        .w(px(8.))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(match diag_dot {
+                            Some(c) => div()
+                                .w(px(5.))
+                                .h(px(5.))
+                                .rounded_full()
+                                .bg(rgb(c))
+                                .into_any_element(),
+                            None => div().into_any_element(),
+                        }),
+                );
+                gutter = gutter.child(
+                    div()
+                        .flex_1()
+                        .text_right()
+                        .text_color(rgb(GUTTER_FG))
+                        .child(line_no.to_string()),
+                );
+                row = row.child(gutter);
+
+                // Code cell: relative so the caret bar can be absolutely placed.
+                // Stateful (`.id`) from the start so the mouse handlers below keep
+                // the element type consistent.
+                let mut cell = div()
+                    .id(("code-cell", i))
+                    .flex_1()
+                    .relative()
+                    .overflow_hidden()
+                    .flex()
+                    .flex_row()
+                    .items_center();
+
+                // Caret bar (2px accent, no blink) on the caret row when focused.
+                if focused && caret_point.row == i {
+                    cell = cell.child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left(px(editor_view::col_to_px(caret_point.col, CHAR_W)))
+                            .w(px(2.))
+                            .h(px(LINE_H))
+                            .bg(rgb(theme.accent)),
+                    );
+                }
+
+                cell = cell.child(
+                    div()
+                        .whitespace_nowrap()
+                        .flex_none()
+                        .text_color(rgb(default_color))
+                        .child(styled),
+                );
+                if let Some(ann) = annotation {
+                    cell = cell.child(
+                        div()
+                            .flex_none()
+                            .whitespace_nowrap()
+                            .text_size(px(ANN_PX))
+                            .text_color(rgba_a(ANN_EMERALD, 0.7))
+                            .child(ann),
+                    );
+                }
+
+                // Mouse: click sets caret / word / line; drag selects; ⌘-click →
+                // definition; plain move → hover dwell.
+                let mh = row_handle.clone();
+                cell = cell
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |app: &mut JadeApp, ev: &MouseDownEvent, window, cx| {
+                            if let Some(h) = &mh {
+                                window.focus(h, cx);
+                            }
+                            let x = f32::from(ev.position.x);
+                            if ev.modifiers.platform || ev.modifiers.control {
+                                app.editor_goto_definition(i, x);
+                            } else {
+                                app.editor_mouse_down(i, x, ev.modifiers.shift, ev.click_count);
+                            }
+                            cx.notify();
+                        }),
+                    )
+                    .on_mouse_move(cx.listener(
+                        move |app: &mut JadeApp, ev: &MouseMoveEvent, _w, cx| {
+                            let x = f32::from(ev.position.x);
+                            if ev.pressed_button == Some(MouseButton::Left) {
+                                app.editor_mouse_drag(i, x);
+                                cx.notify();
+                            } else {
+                                app.editor_hover_move(i, x);
+                            }
+                        },
+                    ));
+
+                row = row.child(cell);
+                rows.push(row);
+            }
+            rows
+        }),
+    )
+    .track_scroll(&app.code_scroll)
+    .flex_1()
+    .size_full()
+    .pt(px(PAD_TOP))
+    .px(px(8.))
+    .text_size(px(FONT_PX))
+    .line_height(px(LINE_H))
+    .font_family("Menlo");
+
+    let entity = cx.entity();
+    let mut container = div()
+        .relative()
+        .flex()
         .flex_1()
         .size_full()
-        .pt(px(PAD_TOP))
-        .px(px(8.))
-        .text_size(px(FONT_PX))
-        .line_height(px(LINE_H))
-        .font_family("Menlo"),
+        .track_focus(&handle)
+        .on_key_down(cx.listener(|app: &mut JadeApp, ev: &KeyDownEvent, _w, cx| {
+            if app.editor_key(&ev.keystroke, cx) {
+                cx.stop_propagation();
+                cx.notify();
+            }
+        }))
+        .on_mouse_up(
+            MouseButton::Left,
+            cx.listener(|app: &mut JadeApp, _ev, _w, cx| {
+                app.editor_mouse_up();
+                cx.notify();
+            }),
+        )
+        .child(list)
+        .child(ime_geometry_canvas(
+            flow_visible_now,
+            app.editor_text_left.clone(),
+            app.editor_rows.clone(),
+            handle.clone(),
+            entity,
+        ));
+
+    let scroll_top = app.editor_scroll_top();
+    if let Some(popup) = completion_popup(app, flow_visible_now, scroll_top, cx) {
+        container = container.child(popup);
+    }
+    if let Some(popup) = hover_popup(app, flow_visible_now, scroll_top) {
+        container = container.child(popup);
+    }
+    container.into_any_element()
+}
+
+/// Convert a flattened [`CellStyle`] into a gpui [`HighlightStyle`]: syntax color,
+/// a 15%-alpha accent selection wash (§4.2), and a 1px diagnostic/IME underline
+/// (a flat line — wavy squiggles are deferred; documented).
+fn cell_to_style(cell: &CellStyle, theme: &Theme) -> HighlightStyle {
+    let underline = cell
+        .underline
+        .map(|c| UnderlineStyle {
+            thickness: px(1.0),
+            color: Some(rgb(c).into()),
+            wavy: false,
+        })
+        .or_else(|| {
+            cell.marked.then(|| UnderlineStyle {
+                thickness: px(1.0),
+                color: Some(rgb(theme.text).into()),
+                wavy: false,
+            })
+        });
+    HighlightStyle {
+        color: cell.color.map(|c| rgb(c).into()),
+        background_color: cell
+            .selected
+            .then(|| gpui::Hsla::from(rgba_a(theme.accent, 0.15))),
+        underline,
+        ..Default::default()
+    }
+}
+
+/// The gutter dot color for the highest-severity diagnostic **starting** on row
+/// `row` (0-based), or `None`.
+fn diag_dot_color(diagnostics: &[forge_lsp::Diagnostic], row: usize, theme: &Theme) -> Option<u32> {
+    use forge_lsp::DiagnosticSeverity as S;
+    // Rank: lower is more severe (Error most). Track the most-severe on the row.
+    let rank = |s: S| match s {
+        S::ERROR => 0,
+        S::WARNING => 1,
+        S::INFORMATION => 2,
+        _ => 3,
+    };
+    let mut best: Option<S> = None;
+    for d in diagnostics {
+        if d.range.start.line as usize == row {
+            let sev = d.severity.unwrap_or(S::INFORMATION);
+            best = Some(match best {
+                Some(b) if rank(b) <= rank(sev) => b,
+                _ => sev,
+            });
+        }
+    }
+    best.map(|s| editor_view::severity_color(Some(s), theme.red, theme.amber, theme.periwinkle))
+}
+
+/// The IME/geometry underlay: captures the code-text left edge + visible row
+/// count for mouse mapping and follow-scroll, and registers the IME input
+/// handler for the editor focus each frame (`window.handle_input`).
+fn ime_geometry_canvas(
+    flow_visible: bool,
+    text_left: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    rows_store: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    handle: FocusHandle,
+    entity: Entity<JadeApp>,
+) -> impl IntoElement {
+    use std::sync::atomic::Ordering;
+    canvas(
+        move |_bounds, _window, _cx| {},
+        move |bounds: Bounds<gpui::Pixels>, _, window, cx| {
+            let glyph = if flow_visible { GLYPH_W } else { 0.0 };
+            let left = f32::from(bounds.origin.x) + 8.0 + GUTTER_W + glyph;
+            text_left.store(left.to_bits(), Ordering::Relaxed);
+            let h = f32::from(bounds.size.height);
+            rows_store.store(((h / LINE_H).floor() as u32).max(1), Ordering::Relaxed);
+            let region = Bounds::new(
+                point(px(left), bounds.origin.y + px(PAD_TOP)),
+                size(bounds.size.width, bounds.size.height),
+            );
+            window.handle_input(&handle, ElementInputHandler::new(region, entity.clone()), cx);
+        },
+    )
+    .absolute()
+    .top_0()
+    .left_0()
+    .size_full()
+}
+
+/// The x pixel of the code column `col`, including the gutter + optional flow
+/// margin, for anchoring the floating popups inside the editor container.
+fn popup_x(col: usize, flow_visible: bool) -> f32 {
+    let glyph = if flow_visible { GLYPH_W } else { 0.0 };
+    8.0 + GUTTER_W + glyph + editor_view::col_to_px(col, CHAR_W)
+}
+
+/// The y pixel (top) of the row below `row`, given the current scroll top.
+fn popup_y(row: usize, scroll_top: usize) -> f32 {
+    let rel = row.saturating_sub(scroll_top);
+    PAD_TOP + (rel as f32 + 1.0) * LINE_H
+}
+
+/// The autocomplete popup (max ~8 visible), anchored under the caret.
+fn completion_popup(
+    app: &JadeApp,
+    flow_visible: bool,
+    scroll_top: usize,
+    cx: &mut Context<JadeApp>,
+) -> Option<gpui::AnyElement> {
+    let c: &CompletionState = app.completion.as_ref()?;
+    if c.filtered.is_empty() {
+        return None;
+    }
+    let theme = app.theme.clone();
+    let (row, col) = c.anchor;
+    let left = popup_x(col, flow_visible);
+    let top = popup_y(row, scroll_top);
+
+    // Window of up to 8 items centered on the selection.
+    let visible = 8usize;
+    let start = c.selected.saturating_sub(visible - 1).min(
+        c.filtered.len().saturating_sub(visible),
+    );
+    let mut list = div().flex().flex_col().py_1();
+    for slot in start..(start + visible).min(c.filtered.len()) {
+        let item_ix = c.filtered[slot];
+        let item = &c.items[item_ix];
+        let is_sel = slot == c.selected;
+        let label = item.label.clone();
+        let detail = item.detail.clone();
+        let mut rowdiv = div()
+            .id(("cmp", slot))
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .h(px(20.))
+            .px(px(8.))
+            .gap_2()
+            .text_xs()
+            .cursor_pointer()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |app: &mut JadeApp, _ev, _w, cx| {
+                    if let Some(c) = &mut app.completion {
+                        c.selected = slot;
+                    }
+                    app.completion_accept(cx);
+                    cx.notify();
+                }),
+            )
+            .child(div().text_color(rgb(theme.text)).child(label));
+        if let Some(d) = detail {
+            rowdiv = rowdiv.child(div().text_color(rgb(theme.muted)).child(d));
+        }
+        if is_sel {
+            rowdiv = rowdiv.bg(rgb(theme.border));
+        }
+        list = list.child(rowdiv);
+    }
+
+    Some(
+        div()
+            .absolute()
+            .left(px(left))
+            .top(px(top))
+            .min_w(px(220.))
+            .max_w(px(420.))
+            .max_h(px(8.0 * 20.0 + 8.0))
+            .flex()
+            .flex_col()
+            .rounded_md()
+            .bg(rgb(theme.panel))
+            .border_1()
+            .border_color(rgb(theme.border))
+            .overflow_hidden()
+            .child(list)
+            .into_any_element(),
+    )
+}
+
+/// The floating hover panel (plain text; markdown rendering deferred).
+fn hover_popup(app: &JadeApp, flow_visible: bool, scroll_top: usize) -> Option<gpui::AnyElement> {
+    let h: &HoverState = app.hover.as_ref()?;
+    let theme = app.theme.clone();
+    let left = popup_x(h.col, flow_visible);
+    let top = popup_y(h.row, scroll_top);
+    Some(
+        div()
+            .absolute()
+            .left(px(left))
+            .top(px(top))
+            .max_w(px(480.))
+            .max_h(px(220.))
+            .p(px(8.))
+            .rounded_md()
+            .bg(rgb(theme.panel))
+            .border_1()
+            .border_color(rgb(theme.border))
+            .overflow_hidden()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(theme.text))
+                    .whitespace_normal()
+                    .child(h.text.clone()),
+            )
+            .into_any_element(),
     )
 }
 
@@ -342,7 +690,7 @@ pub fn tab_strip(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> imp
 
     for (i, tab) in app.editor.tabs.iter().enumerate() {
         let active = app.editor.active == Some(i);
-        strip = strip.child(tab_chip(i, &tab.name, active, theme, cx));
+        strip = strip.child(tab_chip(i, &tab.name, active, tab.buffer.is_dirty(), theme, cx));
     }
     strip
 }
@@ -351,6 +699,7 @@ fn tab_chip(
     index: usize,
     name: &str,
     active: bool,
+    dirty: bool,
     theme: &Theme,
     cx: &mut Context<JadeApp>,
 ) -> impl IntoElement {
@@ -383,6 +732,11 @@ fn tab_chip(
             cx.notify();
         }))
         .child(div().child(name.to_string()));
+
+    // Dirty dot ● from buffer.is_dirty() (§3); silent-close semantics preserved.
+    if dirty {
+        chip = chip.child(div().text_color(rgb(theme.accent)).child("●"));
+    }
 
     // Active underline (§4.1).
     if active {

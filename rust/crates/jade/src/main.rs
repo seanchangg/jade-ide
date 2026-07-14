@@ -162,6 +162,14 @@ fn main() {
         } else if mode == "quickopen" {
             let query = arg_value(&args, "quickopen").unwrap_or_default();
             run_smoke_quickopen(deps, &query);
+        } else if mode == "edit" {
+            let target = arg_value(&args, "edit")
+                .map(PathBuf::from)
+                .or_else(|| deps.active_file.clone());
+            run_smoke_edit(deps, target);
+        } else if mode == "lsp" {
+            let target = arg_value(&args, "lsp").map(PathBuf::from);
+            run_smoke_lsp(runtime, deps, target);
         } else {
             run_smoke(runtime, deps, app_rx, &mode);
         }
@@ -610,11 +618,111 @@ fn run_smoke_open(deps: AppDeps, target: Option<PathBuf>) {
         Some(tab) if tab.path == target => println!(
             "[smoke] open {} lines={} spans={}",
             target.display(),
-            tab.lines.len(),
+            tab.line_count(),
             tab.span_count()
         ),
         _ => println!("[smoke] FAIL open {}", target.display()),
     }
+}
+
+/// `--smoke edit <file>` (E2): open a file, apply a scripted edit sequence
+/// (insert 'x' at 0:0, newline+indent, undo, redo, word-right ×3) directly on the
+/// buffer, and print a machine-readable line proving the editing core works
+/// headlessly.
+fn run_smoke_edit(deps: AppDeps, target: Option<PathBuf>) {
+    let target = match target {
+        Some(t) => t,
+        None => {
+            println!("[smoke] FAIL edit: no file (usage: --smoke edit <file>)");
+            return;
+        }
+    };
+    let mut app = JadeApp::assemble(deps);
+    app.open_file(target.clone());
+    let Some(tab) = app.editor.active_tab_mut() else {
+        println!("[smoke] FAIL edit: could not open {}", target.display());
+        return;
+    };
+    // Caret to document start, then the scripted sequence.
+    tab.buffer.set_caret(0);
+    let mut lsp_changes = 0usize;
+    lsp_changes += tab.buffer.type_char('x').changes.len();
+    lsp_changes += tab.buffer.insert_newline().changes.len();
+    tab.buffer.undo();
+    tab.buffer.redo();
+    tab.buffer.move_word_right(false);
+    tab.buffer.move_word_right(false);
+    tab.buffer.move_word_right(false);
+    let caret = tab.caret_point();
+    println!(
+        "[smoke] edit {} version={} dirty={} caret={}:{} lsp_changes={}",
+        target.display(),
+        tab.buffer.version(),
+        tab.buffer.is_dirty(),
+        caret.row,
+        caret.col,
+        lsp_changes
+    );
+}
+
+/// `--smoke lsp <dir>` (E2, best-effort): initialize clangd on a temp project,
+/// open a file with an error, await the first diagnostics event, and print a
+/// machine-readable line. Skips gracefully when clangd is unavailable.
+fn run_smoke_lsp(runtime: tokio::runtime::Runtime, _deps: AppDeps, dir: Option<PathBuf>) {
+    use forge_lsp::{LspClient, LspEvent};
+    runtime.block_on(async move {
+        // Build a throwaway project (or use the passed dir) with a known error.
+        let root = match dir {
+            Some(d) => d,
+            None => {
+                let d = std::env::temp_dir().join(format!("jade-lsp-smoke-{}", std::process::id()));
+                let _ = std::fs::create_dir_all(&d);
+                let _ = std::fs::write(
+                    d.join("main.cpp"),
+                    "int main() { int x = ; return 0; }\n",
+                );
+                d
+            }
+        };
+        let file = root.join("main.cpp");
+        let t0 = std::time::Instant::now();
+        let mut handle = match LspClient::initialize(&root, None).await {
+            Ok(h) => h,
+            Err(e) => {
+                println!("[smoke] lsp skipped (clangd unavailable: {e})");
+                return;
+            }
+        };
+        let mut events = handle.take_events().expect("events");
+        let text = std::fs::read_to_string(&file).unwrap_or_default();
+        let _ = handle.did_open(&file, &text, 1);
+        // Await the first non-empty diagnostics for our file, with a timeout.
+        let deadline = std::time::Duration::from_secs(20);
+        let got = tokio::time::timeout(deadline, async {
+            loop {
+                match events.recv().await {
+                    Some(LspEvent::Diagnostics { path, diagnostics })
+                        if path == file && !diagnostics.is_empty() =>
+                    {
+                        return Some(diagnostics.len());
+                    }
+                    Some(LspEvent::Exited) | None => return None,
+                    _ => continue,
+                }
+            }
+        })
+        .await;
+        match got {
+            Ok(Some(n)) => println!(
+                "[smoke] lsp diagnostics={} in {}ms",
+                n,
+                t0.elapsed().as_millis()
+            ),
+            Ok(None) => println!("[smoke] lsp skipped (clangd exited before diagnostics)"),
+            Err(_) => println!("[smoke] lsp skipped (no diagnostics within timeout)"),
+        }
+        handle.shutdown().await;
+    });
 }
 
 /// The file tree's scan root: the `--project` dir if given, else the active

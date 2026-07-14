@@ -2882,13 +2882,16 @@ name = "jade"
 version = "0.1.0"
 dependencies = [
  "forge-ai",
+ "forge-buffer",
  "forge-build",
  "forge-debug",
+ "forge-lsp",
  "forge-sysmon",
  "forge-telemetry",
  "forge-term",
  "gpui",
  "gpui_platform",
+ "lsp-types",
  "notify",
  "regex",
  "serde",

@@ -13,8 +13,9 @@
 //! [`Handle`].
 
 use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::atomic::AtomicU32;
+use std::ops::Range;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -22,17 +23,24 @@ use forge_ai::{AiState, AiStatus, InlineCompletionBackend};
 use forge_build::{
     BuildEngine, BuildResult, CompileRequest, RunConfig, RunEvent, RunResult, PROBE_DYLIB,
 };
+use forge_buffer::{Point, Selection};
 use forge_debug::{DebugEvent, LldbDriver};
+use forge_lsp::{
+    CompletionItem, DidChange, HoverContents, LspClient, LspEvent, LspHandle, TextDocumentSyncKind,
+};
 use forge_sysmon::{SystemMonitor, SystemStats};
 use forge_telemetry::{Event, Kind, TelemetryServer};
 use forge_term::{GridSnapshot, TermEvent, TermId, TermManager};
-use gpui::{div, prelude::*, px, rgb, Context, FocusHandle, KeyDownEvent, Window};
+use gpui::{
+    div, prelude::*, px, rgb, Bounds, ClipboardItem, Context, EntityInputHandler, FocusHandle,
+    KeyDownEvent, Pixels, UTF16Selection, Window,
+};
 use serde_json::{Map, Value};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::Mutex as AsyncMutex;
 
-use crate::editor_view::EditorState;
+use crate::editor_view::{self, EditorState};
 use crate::highlight::TokenPalette;
 use crate::memory_bar::{project, Level, MemoryBarState};
 use crate::output::push_output;
@@ -92,6 +100,30 @@ pub enum AppEvent {
     /// The workspace file tree changed on disk (debounced fs-watch, §5.1) — the
     /// app re-scans preserving expansion. Carries nothing; the refresh reads disk.
     TreeChanged,
+    /// clangd finished its initialize handshake; carries the live handle + the
+    /// negotiated sync kind so the app can start `didOpen`-ing tabs (E2).
+    LspReady {
+        handle: Arc<LspHandle>,
+        sync_kind: TextDocumentSyncKind,
+    },
+    /// A clangd event: `Ready` / `Diagnostics{path,…}` / `Exited` (E2).
+    Lsp(LspEvent),
+    /// A completion response arrived for request `generation`, anchored at the
+    /// caret point it was requested from (E2). Stale generations are dropped.
+    Completion {
+        generation: u64,
+        items: Vec<CompletionItem>,
+        anchor: (usize, usize),
+    },
+    /// A hover response for request `generation` at `(row,col)` (E2).
+    Hover {
+        generation: u64,
+        text: Option<String>,
+        row: usize,
+        col: usize,
+    },
+    /// A go-to-definition target resolved from a ⌘-click (E2): open + reveal.
+    Definition { path: PathBuf, line: usize },
 }
 
 /// Everything [`JadeApp`] needs from `main` to be constructed — kept as one
@@ -122,6 +154,30 @@ pub struct RunStatus {
     pub exit_code: i32,
     pub duration_ms: u128,
     pub executed_lines: usize,
+}
+
+/// Live autocomplete popup state (E2). Filtered against what's typed; `selected`
+/// indexes into `filtered`, which indexes into `items`.
+pub struct CompletionState {
+    pub items: Vec<CompletionItem>,
+    pub filtered: Vec<usize>,
+    pub selected: usize,
+    /// Caret point (row, char col) the popup is anchored under.
+    pub anchor: (usize, usize),
+}
+
+impl CompletionState {
+    /// The currently highlighted item, if any.
+    pub fn current(&self) -> Option<&CompletionItem> {
+        self.filtered.get(self.selected).map(|&i| &self.items[i])
+    }
+}
+
+/// Floating hover-panel state (E2): plain-text contents at a screen anchor.
+pub struct HoverState {
+    pub text: String,
+    pub row: usize,
+    pub col: usize,
 }
 
 pub struct JadeApp {
@@ -169,8 +225,45 @@ pub struct JadeApp {
     // ── Code-viewing vertical (deliverables §1-§5) ────────────────────────────
     /// Scanned workspace file tree (left panel). `None` if the root is unreadable.
     pub tree: Option<FileTree>,
-    /// Open tabs + read-only highlighted viewer state (center).
+    /// Open tabs + editable buffer-backed editor state (center).
     pub editor: EditorState,
+
+    // ── Editable editor surface (E2) ──────────────────────────────────────────
+    /// Focus handle for the editor surface (created lazily; None headless).
+    pub editor_focus: Option<FocusHandle>,
+    /// True while a left-drag is extending the selection.
+    pub editor_selecting: bool,
+    /// The code-text left edge in window px (f32 bits), captured each frame by a
+    /// canvas underlay, so mouse handlers can map click-x → char column.
+    pub editor_text_left: Arc<AtomicU32>,
+    /// Visible editor row count (viewport height / line height), captured each
+    /// frame, so `scroll_caret_into_view` does minimal follow-scroll.
+    pub editor_rows: Arc<AtomicU32>,
+    /// Monotonic clock origin for the decoration debounces + IME timing.
+    epoch: Instant,
+    /// True while the decoration-recompute wake task is running (avoids dupes).
+    decoration_wake_running: bool,
+
+    // ── LSP (clangd) integration (E2) ─────────────────────────────────────────
+    /// Live clangd handle once initialized (`did_*` notifications go through it).
+    lsp: Option<Arc<LspHandle>>,
+    /// The sync kind clangd negotiated (Incremental vs Full didChange).
+    lsp_sync_kind: TextDocumentSyncKind,
+    /// True once initialize has been kicked off (so we do it once per workspace).
+    lsp_init_started: bool,
+    /// The forge include dir passed to clangd as a fallback `-I`, if it exists.
+    lsp_include: Option<PathBuf>,
+    /// Autocomplete popup (E2). `Some` when visible.
+    pub completion: Option<CompletionState>,
+    /// Monotonic completion-request generation (supersede stale responses).
+    completion_gen: u64,
+    /// Hover panel (E2). `Some` when a dwell resolved hover contents.
+    pub hover: Option<HoverState>,
+    /// Monotonic hover-request generation (supersede stale dwell responses).
+    hover_gen: u64,
+    /// The (row,col) the last hover request targeted, so mouse-move doesn't
+    /// re-request while the pointer sits on the same cell.
+    hover_target: Option<(usize, usize)>,
 
     // ── Structure panel + Quick Open (Phase-4 wave 3, §5.5/§5.7) ──────────────
     /// Which view the left sidebar shows (FILES tree vs STRUCTURE outline).
@@ -283,6 +376,11 @@ impl JadeApp {
     pub fn assemble(deps: AppDeps) -> Self {
         // Scan the workspace root for the file tree (§5.1) and seed the editor.
         let tree = Some(FileTree::scan(deps.workspace_root.clone()));
+        // clangd fallback `-I<repo>/include` when that directory exists.
+        let lsp_include = {
+            let inc = deps.repo_root.join("include");
+            inc.is_dir().then_some(inc)
+        };
         let mut editor = EditorState::new(TokenPalette::forge_dark());
         // Preserve the --file/--project seeding as the initially open tab: open it
         // through the real tab/highlight path so `active_file` follows the tab.
@@ -322,6 +420,23 @@ impl JadeApp {
 
             tree,
             editor,
+
+            editor_focus: None,
+            editor_selecting: false,
+            editor_text_left: Arc::new(AtomicU32::new(0)),
+            editor_rows: Arc::new(AtomicU32::new(30)),
+            epoch: Instant::now(),
+            decoration_wake_running: false,
+
+            lsp: None,
+            lsp_sync_kind: TextDocumentSyncKind::FULL,
+            lsp_init_started: false,
+            lsp_include,
+            completion: None,
+            completion_gen: 0,
+            hover: None,
+            hover_gen: 0,
+            hover_target: None,
 
             sidebar_tab: SidebarTab::Files,
             quick_open: None,
@@ -398,6 +513,23 @@ impl JadeApp {
                 }
                 // Quick Open's cached file list is now stale (§5.7).
                 self.file_cache = None;
+            }
+            AppEvent::LspReady { handle, sync_kind } => self.on_lsp_ready(handle, sync_kind),
+            AppEvent::Lsp(ev) => self.on_lsp_event(ev),
+            AppEvent::Completion {
+                generation,
+                items,
+                anchor,
+            } => self.on_completion(generation, items, anchor),
+            AppEvent::Hover {
+                generation,
+                text,
+                row,
+                col,
+            } => self.on_hover(generation, text, row, col),
+            AppEvent::Definition { path, line } => {
+                self.open_file(path);
+                self.reveal_line(line);
             }
         }
     }
@@ -840,7 +972,12 @@ impl JadeApp {
     /// so the Build/Run target follows the front tab.
     pub fn open_file(&mut self, path: PathBuf) {
         match self.editor.open(&path) {
-            Ok(_) => self.active_file = self.editor.active_path(),
+            Ok(_) => {
+                self.active_file = self.editor.active_path();
+                self.dismiss_popups();
+                self.ensure_lsp();
+                self.lsp_did_open(&path);
+            }
             Err(e) => self.status_line(&format!("[forge] Could not open {}: {e}", path.display())),
         }
     }
@@ -862,8 +999,19 @@ impl JadeApp {
     /// Close a tab (close-index logic per `editor-manager.ts:208-241`);
     /// `active_file` follows the new active tab (or clears when none remain).
     pub fn close_tab(&mut self, index: usize) {
+        // did_close before removing (need the path). Silent close even if dirty —
+        // matches the Electron app, which had no save prompt.
+        if let Some(tab) = self.editor.tabs.get(index) {
+            let path = tab.path.clone();
+            if tab.lsp_opened {
+                if let Some(lsp) = &self.lsp {
+                    let _ = lsp.did_close(&path);
+                }
+            }
+        }
         self.editor.close(index);
         self.active_file = self.editor.active_path();
+        self.dismiss_popups();
     }
 
     // ── Structure panel + Quick Open (Phase-4 wave 3) ─────────────────────────
@@ -1070,6 +1218,993 @@ impl JadeApp {
     }
 }
 
+/// Char advance of Menlo at the editor font size (mouse↔column mapping). See the
+/// note on `panels::code_view::CHAR_W`.
+use crate::panels::code_view::{CHAR_W, LINE_H};
+
+/// clangd handles the C/C++ families; `.metal` is Metal (never clangd) and other
+/// extensions are plain text. This is the §4.4 gating with the inventory's
+/// c-family fix (the old app registered cpp only).
+fn lsp_eligible(path: &Path) -> bool {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    matches!(
+        ext.as_deref(),
+        Some(
+            "c" | "cc" | "cpp" | "cxx" | "c++" | "h" | "hpp" | "hxx" | "hh" | "inl" | "m" | "mm"
+        )
+    )
+}
+
+// ── Editable-editor + LSP behavior (E2) ───────────────────────────────────────
+impl JadeApp {
+    /// Monotonic milliseconds since app construction (decoration debounces).
+    fn now_ms(&self) -> u64 {
+        self.epoch.elapsed().as_millis() as u64
+    }
+
+    /// Close the autocomplete + hover popups.
+    pub fn dismiss_popups(&mut self) {
+        self.completion = None;
+        self.hover = None;
+        self.hover_target = None;
+    }
+
+    /// Dispatch one editor keystroke; returns true when consumed (the caller then
+    /// stops propagation so the key doesn't bubble / reach the IME). Character
+    /// keys return false so macOS routes them to `replace_text_in_range`.
+    pub fn editor_key(&mut self, ks: &gpui::Keystroke, cx: &mut Context<Self>) -> bool {
+        let m = ks.modifiers;
+        let key = ks.key.as_str();
+        let shift = m.shift;
+
+        // Popup-first interception.
+        if self.completion.is_some() {
+            match key {
+                "up" => {
+                    self.completion_move(-1);
+                    return true;
+                }
+                "down" => {
+                    self.completion_move(1);
+                    return true;
+                }
+                "enter" | "tab" => {
+                    self.completion_accept(cx);
+                    return true;
+                }
+                "escape" => {
+                    self.completion = None;
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        if self.hover.is_some() && key == "escape" {
+            self.hover = None;
+            return true;
+        }
+
+        // ⌘ chords.
+        if m.platform && !m.control && !m.alt {
+            match key {
+                "s" => self.editor_save(),
+                "w" => {
+                    if let Some(i) = self.editor.active {
+                        self.close_tab(i);
+                    }
+                }
+                "a" => {
+                    self.buf_move(|b, _| b.select_all(), false);
+                }
+                "z" => {
+                    if shift {
+                        self.editor_redo(cx);
+                    } else {
+                        self.editor_undo(cx);
+                    }
+                }
+                "c" => self.editor_copy(cx),
+                "x" => self.editor_cut(cx),
+                "v" => self.editor_paste(cx),
+                "left" => self.buf_move(|b, e| b.move_home(e), shift),
+                "right" => self.buf_move(|b, e| b.move_end(e), shift),
+                "up" => self.buf_move(|b, e| b.move_doc_start(e), shift),
+                "down" => self.buf_move(|b, e| b.move_doc_end(e), shift),
+                _ => return false, // let ⌘P etc. bubble
+            }
+            return true;
+        }
+
+        // ⌥ chords (word nav + word delete).
+        if m.alt && !m.platform {
+            match key {
+                "left" => self.buf_move(|b, e| b.move_word_left(e), shift),
+                "right" => self.buf_move(|b, e| b.move_word_right(e), shift),
+                "backspace" => {
+                    let r = self.with_edit(|b| b.delete_word_back());
+                    self.after_edit(r, cx);
+                }
+                _ => return false,
+            }
+            return true;
+        }
+
+        // Plain named keys.
+        match key {
+            "left" => self.buf_move(|b, e| b.move_left(e), shift),
+            "right" => self.buf_move(|b, e| b.move_right(e), shift),
+            "up" => self.buf_move(|b, e| b.move_up(e), shift),
+            "down" => self.buf_move(|b, e| b.move_down(e), shift),
+            "home" => self.buf_move(|b, e| b.move_home(e), shift),
+            "end" => self.buf_move(|b, e| b.move_end(e), shift),
+            "pageup" => self.editor_page(-1, shift),
+            "pagedown" => self.editor_page(1, shift),
+            "backspace" => {
+                let r = self.with_edit(|b| b.delete_backward());
+                self.after_edit(r, cx);
+            }
+            "delete" => {
+                let r = self.with_edit(|b| b.delete_forward());
+                self.after_edit(r, cx);
+            }
+            "enter" => {
+                let r = self.with_edit(|b| b.insert_newline());
+                self.after_edit(r, cx);
+            }
+            "tab" => {
+                let r = self.with_edit(|b| b.insert_tab());
+                self.after_edit(r, cx);
+            }
+            "escape" if self.completion.is_some() || self.hover.is_some() => {
+                self.dismiss_popups()
+            }
+            _ => return false, // escape-with-nothing / character key → IME
+        }
+        true
+    }
+
+    /// Apply a cursor-only motion to the active buffer, dismiss popups, follow.
+    fn buf_move(&mut self, f: impl FnOnce(&mut forge_buffer::Buffer, bool), extend: bool) {
+        if let Some(tab) = self.editor.active_tab_mut() {
+            f(&mut tab.buffer, extend);
+        }
+        self.completion = None;
+        self.hover = None;
+        self.hover_target = None;
+        self.scroll_caret_into_view();
+    }
+
+    /// Page up/down by the current viewport height in rows.
+    fn editor_page(&mut self, dir: i32, extend: bool) {
+        let rows = (self.editor_rows.load(Ordering::Relaxed) as usize).max(1);
+        if let Some(tab) = self.editor.active_tab_mut() {
+            for _ in 0..rows {
+                if dir < 0 {
+                    tab.buffer.move_up(extend);
+                } else {
+                    tab.buffer.move_down(extend);
+                }
+            }
+        }
+        self.completion = None;
+        self.scroll_caret_into_view();
+    }
+
+    /// Run a text-changing buffer op on the active tab, returning its record.
+    fn with_edit(
+        &mut self,
+        f: impl FnOnce(&mut forge_buffer::Buffer) -> forge_buffer::EditRecord,
+    ) -> forge_buffer::EditRecord {
+        match self.editor.active_tab_mut() {
+            Some(tab) => f(&mut tab.buffer),
+            None => forge_buffer::EditRecord {
+                changes: Vec::new(),
+                version: 0,
+            },
+        }
+    }
+
+    /// Shared post-edit bookkeeping: recompute eager decorations + arm debounces,
+    /// forward an incremental `didChange`, follow the caret, wake the debounce.
+    fn after_edit(&mut self, record: forge_buffer::EditRecord, cx: &mut Context<Self>) {
+        let now = self.now_ms();
+        let payload = self.editor.active_tab_mut().map(|tab| {
+            tab.on_edited(now);
+            (
+                tab.path.clone(),
+                tab.lsp_opened,
+                tab.lsp_version(),
+                tab.buffer.to_string(),
+                editor_view::record_to_lsp_edits(&record),
+            )
+        });
+        if let Some((path, opened, version, text, edits)) = payload {
+            if !record.is_noop() && opened {
+                self.lsp_did_change(&path, edits, text, version);
+            }
+        }
+        self.scroll_caret_into_view();
+        self.ensure_decoration_wake(cx);
+    }
+
+    /// The topmost visible editor row (from the uniform-list scroll handle).
+    pub fn editor_scroll_top(&self) -> usize {
+        self.code_scroll.0.borrow().base_handle.top_item()
+    }
+
+    /// Minimal follow-scroll: bring the caret row into the visible window only
+    /// when it's currently outside it (no jarring recentre on every keystroke).
+    fn scroll_caret_into_view(&mut self) {
+        let Some(tab) = self.editor.active_tab() else {
+            return;
+        };
+        let row = tab.caret_point().row;
+        let top = self.editor_scroll_top();
+        let rows = (self.editor_rows.load(Ordering::Relaxed) as usize).max(1);
+        if row < top {
+            self.code_scroll
+                .scroll_to_item(row, gpui::ScrollStrategy::Top);
+        } else if row >= top + rows {
+            self.code_scroll
+                .scroll_to_item(row + 1 - rows, gpui::ScrollStrategy::Top);
+        }
+    }
+
+    /// Spawn the decoration-recompute wake loop if one isn't already running and
+    /// some tab has a pending debounce.
+    fn ensure_decoration_wake(&mut self, cx: &mut Context<Self>) {
+        if self.decoration_wake_running
+            || !self.editor.tabs.iter().any(|t| t.decorations_pending())
+        {
+            return;
+        }
+        self.decoration_wake_running = true;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(50))
+                    .await;
+                let still = this.update(cx, |app, cx| {
+                    let now = app.now_ms();
+                    let mut changed = false;
+                    for tab in &mut app.editor.tabs {
+                        changed |= tab.poll_decorations(now);
+                    }
+                    if changed {
+                        cx.notify();
+                    }
+                    app.editor.tabs.iter().any(|t| t.decorations_pending())
+                });
+                match still {
+                    Ok(true) => continue,
+                    _ => break,
+                }
+            }
+            let _ = this.update(cx, |app, _| app.decoration_wake_running = false);
+        })
+        .detach();
+    }
+
+    // ── Save / undo / redo / clipboard ────────────────────────────────────────
+
+    /// ⌘S: write the buffer to disk, mark saved, notify clangd.
+    pub fn editor_save(&mut self) {
+        let Some((path, text)) = self
+            .editor
+            .active_tab()
+            .map(|t| (t.path.clone(), t.buffer.to_string()))
+        else {
+            return;
+        };
+        match std::fs::write(&path, text.as_bytes()) {
+            Ok(()) => {
+                if let Some(tab) = self.editor.tab_mut_for(&path) {
+                    tab.buffer.mark_saved();
+                }
+                self.lsp_did_save(&path);
+                self.status_line(&format!("[forge] Saved {}", path.display()));
+            }
+            Err(e) => self.status_line(&format!("[forge] Save failed: {e}")),
+        }
+    }
+
+    fn editor_undo(&mut self, cx: &mut Context<Self>) {
+        self.editor_history(true, cx);
+    }
+
+    fn editor_redo(&mut self, cx: &mut Context<Self>) {
+        self.editor_history(false, cx);
+    }
+
+    /// Undo/redo change text without an incremental record, so we resync clangd
+    /// with a full-text `didChange`.
+    fn editor_history(&mut self, undo: bool, cx: &mut Context<Self>) {
+        let now = self.now_ms();
+        let payload = self.editor.active_tab_mut().and_then(|tab| {
+            let changed = if undo { tab.buffer.undo() } else { tab.buffer.redo() };
+            if !changed {
+                return None;
+            }
+            tab.on_edited(now);
+            Some((
+                tab.path.clone(),
+                tab.lsp_opened,
+                tab.lsp_version(),
+                tab.buffer.to_string(),
+            ))
+        });
+        if let Some((path, opened, version, text)) = payload {
+            if opened {
+                if let Some(lsp) = &self.lsp {
+                    let _ = lsp.did_change(&path, DidChange::Full(text), version);
+                }
+            }
+        }
+        self.dismiss_popups();
+        self.scroll_caret_into_view();
+        self.ensure_decoration_wake(cx);
+    }
+
+    /// The selected text of the active buffer, if any.
+    fn selected_text(&self) -> Option<String> {
+        let tab = self.editor.active_tab()?;
+        let sel = tab.buffer.selection();
+        if sel.is_empty() {
+            return None;
+        }
+        Some(tab.buffer.to_string()[sel.range()].to_string())
+    }
+
+    fn editor_copy(&mut self, cx: &mut Context<Self>) {
+        if let Some(text) = self.selected_text() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+    }
+
+    fn editor_cut(&mut self, cx: &mut Context<Self>) {
+        if let Some(text) = self.selected_text() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+            let r = self.with_edit(|b| b.delete_backward());
+            self.after_edit(r, cx);
+        }
+    }
+
+    fn editor_paste(&mut self, cx: &mut Context<Self>) {
+        let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) else {
+            return;
+        };
+        let r = self.with_edit(|b| b.insert_text(&text));
+        self.after_edit(r, cx);
+    }
+
+    // ── Mouse ─────────────────────────────────────────────────────────────────
+
+    /// Left mouse-down on row `row` at window x `x` (click_count drives the
+    /// caret/word/line selection).
+    pub fn editor_mouse_down(
+        &mut self,
+        row: usize,
+        x: f32,
+        shift: bool,
+        clicks: usize,
+    ) {
+        self.dismiss_popups();
+        let text_left = f32::from_bits(self.editor_text_left.load(Ordering::Relaxed));
+        let selecting = {
+            let Some(tab) = self.editor.active_tab_mut() else {
+                return;
+            };
+            let row = row.min(tab.line_count().saturating_sub(1));
+            let line = tab.buffer.line(row).into_owned();
+            let maxcol = line.chars().count();
+            let col = editor_view::px_to_col(x - text_left, CHAR_W, maxcol);
+            let byte = tab.buffer.point_to_offset(Point::new(row, col));
+            match clicks {
+                n if n >= 3 => {
+                    let start = tab.buffer.point_to_offset(Point::new(row, 0));
+                    let end = if row + 1 < tab.line_count() {
+                        tab.buffer.point_to_offset(Point::new(row + 1, 0))
+                    } else {
+                        tab.buffer.len_bytes()
+                    };
+                    tab.buffer.set_selection(Selection::new(start, end));
+                    false
+                }
+                2 => {
+                    let wr = editor_view::word_range_in_line(&line, col);
+                    let s = tab.buffer.point_to_offset(Point::new(row, wr.start));
+                    let e = tab.buffer.point_to_offset(Point::new(row, wr.end));
+                    tab.buffer.set_selection(Selection::new(s, e));
+                    false
+                }
+                _ => {
+                    if shift {
+                        let anchor = tab.buffer.selection().anchor;
+                        tab.buffer.set_selection(Selection::new(anchor, byte));
+                    } else {
+                        tab.buffer.set_caret(byte);
+                    }
+                    true
+                }
+            }
+        };
+        self.editor_selecting = selecting;
+    }
+
+    /// Left-drag: extend the selection head to the pointer.
+    pub fn editor_mouse_drag(&mut self, row: usize, x: f32) {
+        if !self.editor_selecting {
+            return;
+        }
+        let text_left = f32::from_bits(self.editor_text_left.load(Ordering::Relaxed));
+        {
+            let Some(tab) = self.editor.active_tab_mut() else {
+                return;
+            };
+            let row = row.min(tab.line_count().saturating_sub(1));
+            let maxcol = tab.buffer.line(row).chars().count();
+            let col = editor_view::px_to_col(x - text_left, CHAR_W, maxcol);
+            let byte = tab.buffer.point_to_offset(Point::new(row, col));
+            let anchor = tab.buffer.selection().anchor;
+            tab.buffer.set_selection(Selection::new(anchor, byte));
+        }
+        self.scroll_caret_into_view();
+    }
+
+    /// End a drag-select.
+    pub fn editor_mouse_up(&mut self) {
+        self.editor_selecting = false;
+    }
+
+    // ── Completion ────────────────────────────────────────────────────────────
+
+    /// Called after IME text insertion: (re)filter an open popup and, on an
+    /// identifier/trigger char, (re)request completion; otherwise dismiss.
+    fn on_text_inserted(&mut self, inserted: &str, cx: &mut Context<Self>) {
+        let last = inserted.chars().last();
+        let is_ident = last.is_some_and(|c| c.is_alphanumeric() || c == '_');
+        let is_trigger = last.is_some_and(|c| matches!(c, '.' | ':' | '>' | '<' | '"' | '/'));
+        if !is_ident && !is_trigger {
+            self.completion = None;
+            return;
+        }
+        self.refresh_completion_filter();
+        self.schedule_completion(cx);
+    }
+
+    /// Re-narrow an open popup against the currently-typed prefix.
+    fn refresh_completion_filter(&mut self) {
+        let prefix = match self.editor.active_tab() {
+            Some(tab) => {
+                let caret = tab.buffer.selection().caret();
+                let ident = editor_view::ident_range_before(&tab.buffer, caret);
+                tab.buffer.to_string()[ident].to_string()
+            }
+            None => return,
+        };
+        if let Some(c) = &mut self.completion {
+            c.filtered = editor_view::completion_filter(&c.items, &prefix);
+            c.selected = 0;
+            if c.filtered.is_empty() {
+                self.completion = None;
+            }
+        }
+    }
+
+    /// Request completion at the caret, debounced 80ms, superseding older
+    /// requests via the generation counter.
+    fn schedule_completion(&mut self, _cx: &mut Context<Self>) {
+        let Some(lsp) = self.lsp.clone() else {
+            return;
+        };
+        let Some(tab) = self.editor.active_tab() else {
+            return;
+        };
+        if !lsp_eligible(&tab.path) {
+            return;
+        }
+        let caret = tab.buffer.selection().caret();
+        let pos = tab.buffer.offset_to_lsp(caret);
+        let point = tab.caret_point();
+        let path = tab.path.clone();
+        self.completion_gen += 1;
+        let generation = self.completion_gen;
+        let tx = self.app_tx.clone();
+        let anchor = (point.row, point.col);
+        self.runtime.spawn(async move {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            let position = forge_lsp::Position::new(pos.line as u32, pos.character as u32);
+            if let Ok(items) = lsp.completion(&path, position).await {
+                let _ = tx.send(AppEvent::Completion {
+                    generation,
+                    items,
+                    anchor,
+                });
+            }
+        });
+    }
+
+    fn on_completion(&mut self, generation: u64, items: Vec<CompletionItem>, anchor: (usize, usize)) {
+        if generation != self.completion_gen {
+            return; // superseded
+        }
+        if items.is_empty() {
+            self.completion = None;
+            return;
+        }
+        let prefix = match self.editor.active_tab() {
+            Some(tab) => {
+                let caret = tab.buffer.selection().caret();
+                let ident = editor_view::ident_range_before(&tab.buffer, caret);
+                tab.buffer.to_string()[ident].to_string()
+            }
+            None => return,
+        };
+        let filtered = editor_view::completion_filter(&items, &prefix);
+        if filtered.is_empty() {
+            self.completion = None;
+            return;
+        }
+        self.completion = Some(CompletionState {
+            items,
+            filtered,
+            selected: 0,
+            anchor,
+        });
+    }
+
+    /// Move the popup selection (wraps within the filtered list).
+    pub fn completion_move(&mut self, delta: i32) {
+        if let Some(c) = &mut self.completion {
+            let n = c.filtered.len() as i32;
+            if n == 0 {
+                return;
+            }
+            c.selected = (((c.selected as i32 + delta) % n + n) % n) as usize;
+        }
+    }
+
+    /// Accept the highlighted completion, applying its textEdit / insertText.
+    pub fn completion_accept(&mut self, cx: &mut Context<Self>) {
+        let item = self.completion.as_ref().and_then(|c| c.current().cloned());
+        self.completion = None;
+        let Some(item) = item else {
+            return;
+        };
+        let record = match self.editor.active_tab_mut() {
+            Some(tab) => {
+                let caret = tab.buffer.selection().caret();
+                let ident = editor_view::ident_range_before(&tab.buffer, caret);
+                let (range, text) = editor_view::completion_edit(&item, &tab.buffer, ident);
+                Some(tab.buffer.edit(range, &text))
+            }
+            None => None,
+        };
+        if let Some(record) = record {
+            self.after_edit(record, cx);
+        }
+    }
+
+    // ── Hover ─────────────────────────────────────────────────────────────────
+
+    /// Pointer moved over the code at row `row`, window x `x`: schedule a hover
+    /// request after a 300ms dwell if the target cell changed.
+    pub fn editor_hover_move(&mut self, row: usize, x: f32) {
+        if self.editor_selecting {
+            return;
+        }
+        let text_left = f32::from_bits(self.editor_text_left.load(Ordering::Relaxed));
+        let (path, pos, cell) = {
+            let Some(tab) = self.editor.active_tab() else {
+                return;
+            };
+            if !lsp_eligible(&tab.path) {
+                return;
+            }
+            let row = row.min(tab.line_count().saturating_sub(1));
+            let maxcol = tab.buffer.line(row).chars().count();
+            let col = editor_view::px_to_col(x - text_left, CHAR_W, maxcol);
+            let byte = tab.buffer.point_to_offset(Point::new(row, col));
+            (tab.path.clone(), tab.buffer.offset_to_lsp(byte), (row, col))
+        };
+        if self.hover_target == Some(cell) {
+            return; // same cell — don't re-request
+        }
+        self.hover_target = Some(cell);
+        self.hover = None;
+        let Some(lsp) = self.lsp.clone() else {
+            return;
+        };
+        self.hover_gen += 1;
+        let generation = self.hover_gen;
+        let tx = self.app_tx.clone();
+        let (row, col) = cell;
+        self.runtime.spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let position = forge_lsp::Position::new(pos.line as u32, pos.character as u32);
+            let text = match lsp.hover(&path, position).await {
+                Ok(Some(h)) => Some(flatten_hover(&h)),
+                _ => None,
+            };
+            let _ = tx.send(AppEvent::Hover {
+                generation,
+                text,
+                row,
+                col,
+            });
+        });
+    }
+
+    fn on_hover(&mut self, generation: u64, text: Option<String>, row: usize, col: usize) {
+        if generation != self.hover_gen {
+            return;
+        }
+        match text {
+            Some(t) if !t.trim().is_empty() => {
+                self.hover = Some(HoverState { text: t, row, col })
+            }
+            _ => self.hover = None,
+        }
+    }
+
+    /// ⌘-click: request the definition at row `row`, window x `x`, and open it.
+    pub fn editor_goto_definition(&mut self, row: usize, x: f32) {
+        let text_left = f32::from_bits(self.editor_text_left.load(Ordering::Relaxed));
+        let (path, pos) = {
+            let Some(tab) = self.editor.active_tab() else {
+                return;
+            };
+            if !lsp_eligible(&tab.path) {
+                return;
+            }
+            let row = row.min(tab.line_count().saturating_sub(1));
+            let maxcol = tab.buffer.line(row).chars().count();
+            let col = editor_view::px_to_col(x - text_left, CHAR_W, maxcol);
+            let byte = tab.buffer.point_to_offset(Point::new(row, col));
+            (tab.path.clone(), tab.buffer.offset_to_lsp(byte))
+        };
+        let Some(lsp) = self.lsp.clone() else {
+            return;
+        };
+        let tx = self.app_tx.clone();
+        self.runtime.spawn(async move {
+            let position = forge_lsp::Position::new(pos.line as u32, pos.character as u32);
+            if let Ok(locs) = lsp.definition(&path, position).await {
+                if let Some(loc) = locs.into_iter().next() {
+                    let target = path_from_uri(&loc.uri);
+                    let _ = tx.send(AppEvent::Definition {
+                        path: target,
+                        line: loc.range.start.line as usize + 1,
+                    });
+                }
+            }
+        });
+    }
+
+    // ── LSP lifecycle ─────────────────────────────────────────────────────────
+
+    /// Kick off `clangd` initialize once per workspace (spawned on the runtime).
+    fn ensure_lsp(&mut self) {
+        if self.lsp_init_started {
+            return;
+        }
+        self.lsp_init_started = true;
+        let root = self.workspace_root.clone();
+        let include = self.lsp_include.clone();
+        let tx = self.app_tx.clone();
+        self.runtime.spawn(async move {
+            match LspClient::initialize(&root, include.as_deref()).await {
+                Ok(mut handle) => {
+                    let sync_kind = handle.sync_kind();
+                    if let Some(mut events) = handle.take_events() {
+                        let etx = tx.clone();
+                        tokio::spawn(async move {
+                            while let Some(ev) = events.recv().await {
+                                if etx.send(AppEvent::Lsp(ev)).is_err() {
+                                    break;
+                                }
+                            }
+                        });
+                    }
+                    let handle = Arc::new(handle);
+                    let _ = tx.send(AppEvent::LspReady { handle, sync_kind });
+                }
+                Err(e) => {
+                    let _ = tx.send(AppEvent::BuildOutput(format!(
+                        "[forge] clangd unavailable: {e}"
+                    )));
+                }
+            }
+        });
+    }
+
+    fn on_lsp_ready(&mut self, handle: Arc<LspHandle>, sync_kind: TextDocumentSyncKind) {
+        self.lsp = Some(handle);
+        self.lsp_sync_kind = sync_kind;
+        // didOpen every already-open C-family tab.
+        let paths: Vec<PathBuf> = self
+            .editor
+            .tabs
+            .iter()
+            .filter(|t| lsp_eligible(&t.path))
+            .map(|t| t.path.clone())
+            .collect();
+        for p in paths {
+            self.lsp_did_open(&p);
+        }
+    }
+
+    fn on_lsp_event(&mut self, ev: LspEvent) {
+        match ev {
+            LspEvent::Ready => {}
+            LspEvent::Diagnostics { path, diagnostics } => {
+                if let Some(tab) = self.editor.tab_mut_for(&path) {
+                    tab.diagnostics = diagnostics;
+                }
+            }
+            LspEvent::Exited => {
+                self.lsp = None;
+                for tab in &mut self.editor.tabs {
+                    tab.lsp_opened = false;
+                }
+                self.status_line("[forge] clangd exited");
+            }
+        }
+    }
+
+    /// Send `didOpen` for `path` if clangd is up, the file is eligible, and it
+    /// hasn't been opened yet.
+    fn lsp_did_open(&mut self, path: &Path) {
+        let Some(lsp) = self.lsp.clone() else {
+            return;
+        };
+        if !lsp_eligible(path) {
+            return;
+        }
+        let Some(tab) = self.editor.tab_mut_for(path) else {
+            return;
+        };
+        if tab.lsp_opened {
+            return;
+        }
+        let text = tab.buffer.to_string();
+        let version = tab.lsp_version();
+        tab.lsp_opened = true;
+        let _ = lsp.did_open(path, &text, version);
+    }
+
+    /// Forward an incremental (or full, when clangd negotiated full sync)
+    /// `didChange`.
+    fn lsp_did_change(
+        &self,
+        path: &Path,
+        edits: Vec<forge_lsp::Utf16RangeEdit>,
+        full_text: String,
+        version: i32,
+    ) {
+        let Some(lsp) = &self.lsp else {
+            return;
+        };
+        let change = if self.lsp_sync_kind == TextDocumentSyncKind::INCREMENTAL {
+            DidChange::Incremental(edits)
+        } else {
+            DidChange::Full(full_text)
+        };
+        let _ = lsp.did_change(path, change, version);
+    }
+
+    fn lsp_did_save(&self, path: &Path) {
+        if let Some(lsp) = &self.lsp {
+            let _ = lsp.did_save(path);
+        }
+    }
+
+    /// Aggregate diagnostic counts across the active tab (action-bar badges).
+    pub fn active_diag_counts(&self) -> (usize, usize, usize) {
+        self.editor
+            .active_tab()
+            .map(|t| editor_view::diagnostic_counts(&t.diagnostics))
+            .unwrap_or((0, 0, 0))
+    }
+}
+
+/// Flatten LSP hover contents to plain text (no markdown rendering yet — E2
+/// deferral). Handles the scalar / array / markup encodings.
+fn flatten_hover(hover: &forge_lsp::Hover) -> String {
+    match &hover.contents {
+        HoverContents::Scalar(m) => marked_string_text(m),
+        HoverContents::Array(ms) => ms
+            .iter()
+            .map(marked_string_text)
+            .collect::<Vec<_>>()
+            .join("\n"),
+        HoverContents::Markup(mc) => mc.value.clone(),
+    }
+}
+
+fn marked_string_text(m: &lsp_types::MarkedString) -> String {
+    match m {
+        lsp_types::MarkedString::String(s) => s.clone(),
+        lsp_types::MarkedString::LanguageString(ls) => ls.value.clone(),
+    }
+}
+
+/// Recover a filesystem path from a `file://` URI (lsp-types 0.97 models URIs
+/// with `fluent_uri`, which has no `to_file_path`). Reverses percent-encoding.
+fn path_from_uri(uri: &lsp_types::Uri) -> PathBuf {
+    let s = uri.as_str();
+    let rest = s.strip_prefix("file://").unwrap_or(s);
+    let bytes = rest.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    PathBuf::from(String::from_utf8_lossy(&out).into_owned())
+}
+
+// ── IME / text input (E2) ─────────────────────────────────────────────────────
+impl EntityInputHandler for JadeApp {
+    fn text_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        adjusted: &mut Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let tab = self.editor.active_tab()?;
+        let text = tab.buffer.to_string();
+        let s = editor_view::doc_utf16_to_byte(&tab.buffer, range_utf16.start).min(text.len());
+        let e = editor_view::doc_utf16_to_byte(&tab.buffer, range_utf16.end).min(text.len());
+        let (s, e) = (s.min(e), s.max(e));
+        *adjusted = Some(
+            editor_view::byte_to_doc_utf16(&tab.buffer, s)
+                ..editor_view::byte_to_doc_utf16(&tab.buffer, e),
+        );
+        Some(text[s..e].to_string())
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        let tab = self.editor.active_tab()?;
+        let sel = tab.buffer.selection();
+        let range = editor_view::byte_to_doc_utf16(&tab.buffer, sel.start())
+            ..editor_view::byte_to_doc_utf16(&tab.buffer, sel.end());
+        Some(UTF16Selection {
+            range,
+            reversed: sel.head < sel.anchor,
+        })
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
+        let tab = self.editor.active_tab()?;
+        let m = tab.marked.clone()?;
+        Some(
+            editor_view::byte_to_doc_utf16(&tab.buffer, m.start)
+                ..editor_view::byte_to_doc_utf16(&tab.buffer, m.end),
+        )
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tab) = self.editor.active_tab_mut() {
+            tab.marked = None;
+        }
+        cx.notify();
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        text: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let record = self.editor.active_tab_mut().map(|tab| {
+            let range = range_utf16
+                .map(|r| {
+                    editor_view::doc_utf16_to_byte(&tab.buffer, r.start)
+                        ..editor_view::doc_utf16_to_byte(&tab.buffer, r.end)
+                })
+                .or_else(|| tab.marked.clone())
+                .unwrap_or_else(|| tab.buffer.selection().range());
+            tab.marked = None;
+            tab.buffer.edit(range, text)
+        });
+        if let Some(record) = record {
+            self.after_edit(record, cx);
+        }
+        if text.is_empty() {
+            self.dismiss_popups();
+        } else {
+            self.on_text_inserted(text, cx);
+        }
+        cx.notify();
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        _new_selected_range_utf16: Option<Range<usize>>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let record = self.editor.active_tab_mut().map(|tab| {
+            let range = range_utf16
+                .map(|r| {
+                    editor_view::doc_utf16_to_byte(&tab.buffer, r.start)
+                        ..editor_view::doc_utf16_to_byte(&tab.buffer, r.end)
+                })
+                .or_else(|| tab.marked.clone())
+                .unwrap_or_else(|| tab.buffer.selection().range());
+            let start = range.start;
+            let rec = tab.buffer.edit(range, new_text);
+            tab.marked = if new_text.is_empty() {
+                None
+            } else {
+                Some(start..start + new_text.len())
+            };
+            rec
+        });
+        if let Some(record) = record {
+            self.after_edit(record, cx);
+        }
+        cx.notify();
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        element_bounds: Bounds<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        let tab = self.editor.active_tab()?;
+        let byte = editor_view::doc_utf16_to_byte(&tab.buffer, range_utf16.start);
+        let p = tab.buffer.offset_to_point(byte);
+        let top = self.editor_scroll_top();
+        let text_left = f32::from_bits(self.editor_text_left.load(Ordering::Relaxed));
+        // Anchor at the caret cell, using the captured text-left and the row's
+        // offset from the current scroll top (best-effort IME candidate position).
+        let x = px(text_left + editor_view::col_to_px(p.col, CHAR_W));
+        let y = element_bounds.origin.y + px((p.row.saturating_sub(top)) as f32 * LINE_H);
+        Some(Bounds::new(
+            gpui::point(x, y),
+            gpui::size(px(2.0), px(LINE_H)),
+        ))
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: gpui::Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        None
+    }
+}
+
 /// Parse the first `path:line:col` triple in sanitizer output into a 1-based
 /// error line (app.ts:1169 `/(\S+):(\d+):\d+/`). The `\S+` path segment must be
 /// non-empty and the two numeric groups colon-separated.
@@ -1103,6 +2238,12 @@ impl Render for JadeApp {
             .term_focus
             .get_or_insert_with(|| cx.focus_handle())
             .clone();
+
+        // Ensure the editor focus handle exists so the center surface can take
+        // keyboard + IME input (created lazily like the terminal's).
+        if self.editor_focus.is_none() {
+            self.editor_focus = Some(cx.focus_handle());
+        }
 
         let mut root = div()
             .flex()
@@ -1240,10 +2381,39 @@ fn action_bar(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl I
             |a, _| a.action_toggle_runtime(),
         ));
 
+    let (errs, warns, infos) = app.active_diag_counts();
+    let diag_badges = div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .text_xs()
+        .when(errs > 0, |d| {
+            d.child(
+                div()
+                    .text_color(rgb(theme.red))
+                    .child(format!("⊘ {errs}")),
+            )
+        })
+        .when(warns > 0, |d| {
+            d.child(
+                div()
+                    .text_color(rgb(theme.amber))
+                    .child(format!("△ {warns}")),
+            )
+        })
+        .when(infos > 0, |d| {
+            d.child(
+                div()
+                    .text_color(rgb(theme.periwinkle))
+                    .child(format!("ⓘ {infos}")),
+            )
+        });
+
     let right_group = div()
         .flex()
         .items_center()
         .gap_2()
+        .child(diag_badges)
         // ASM viewer is a Phase-4 overlay — disabled placeholder for now.
         .child(chip("ASM", theme, false))
         .child(action_chip(
