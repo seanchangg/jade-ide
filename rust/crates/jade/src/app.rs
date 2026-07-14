@@ -389,6 +389,10 @@ pub struct JadeApp {
     // ── Runtime panel state (§5.4) ────────────────────────────────────────────
     /// Whether the RUNTIME panel is shown (toggled by the Runtime chip).
     pub runtime_visible: bool,
+    /// True while the sidebar's slide-out animation plays (still rendered).
+    pub sidebar_closing: bool,
+    /// Bumped on every sidebar toggle so the slide animation restarts.
+    pub sidebar_anim_gen: usize,
     /// Wall-clock start of the in-flight run (drives the live SPEED tick).
     pub run_started: Option<Instant>,
     /// 1-based counter of completed runs.
@@ -647,6 +651,8 @@ impl JadeApp {
             last_run: None,
 
             runtime_visible: false,
+            sidebar_closing: false,
+            sidebar_anim_gen: 0,
             run_started: None,
             run_counter: 0,
             run_history: Vec::new(),
@@ -817,12 +823,33 @@ impl JadeApp {
     }
 
     /// Toggle the RUNTIME panel (Runtime chip, §5.4).
-    /// Timer/gauge button: opens/closes the whole right sidebar (runtime
-    /// graphs + training + telemetry). While it's open the bottom strip is
-    /// fully hidden (render gate) — `output_visible` is left untouched so the
-    /// terminal comes back exactly as it was when the sidebar closes.
-    pub fn action_toggle_runtime(&mut self) {
-        self.runtime_visible = !self.runtime_visible;
+    /// Timer/gauge button: slides the whole right sidebar (runtime graphs +
+    /// training + telemetry) open/closed. All three regions coexist — the
+    /// flex layout resizes around whichever are open. Closing keeps the
+    /// sidebar rendered while the slide-out plays, then drops it.
+    pub fn action_toggle_runtime(&mut self, cx: &mut Context<Self>) {
+        self.sidebar_anim_gen += 1;
+        if self.runtime_visible && !self.sidebar_closing {
+            self.sidebar_closing = true;
+            let gen = self.sidebar_anim_gen;
+            cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(SIDEBAR_SLIDE_MS))
+                    .await;
+                let _ = this.update(cx, |app, cx| {
+                    // Ignore if re-toggled mid-slide (gen moved on).
+                    if app.sidebar_closing && app.sidebar_anim_gen == gen {
+                        app.sidebar_closing = false;
+                        app.runtime_visible = false;
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+        } else {
+            self.sidebar_closing = false;
+            self.runtime_visible = true;
+        }
     }
 
     /// Toggle the execution-flow decorations (Flow chip / ⌘E, §4.8).
@@ -3313,7 +3340,7 @@ impl Render for JadeApp {
         let theme = self.theme.clone();
 
         // Create the terminal (and its focus handle) on first show of the strip.
-        if self.output_visible && !self.runtime_visible && self.bottom_view == BottomView::Terminal {
+        if self.output_visible && self.bottom_view == BottomView::Terminal {
             self.ensure_terminal();
         }
         let term_handle = self
@@ -3441,7 +3468,7 @@ impl Render for JadeApp {
         // active (§5.8); else the terminal/output strip shows when visible.
         if self.debug_visible {
             root = root.child(debug_panel::render(self, cx));
-        } else if self.output_visible && !self.runtime_visible {
+        } else if self.output_visible {
             root = root.child(bottom_panel(self, cx, &theme, term_handle));
         }
         let mut root = root
@@ -3518,8 +3545,8 @@ fn action_bar(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl I
         .child(icon_btn("tgl-flow", "corner-down-right", theme, app.flow_visible, cx, |a, _| {
             a.action_toggle_flow()
         }))
-        .child(icon_btn("tgl-runtime", "gauge", theme, app.runtime_visible, cx, |a, _| {
-            a.action_toggle_runtime()
+        .child(icon_btn("tgl-runtime", "gauge", theme, app.runtime_visible, cx, |a, cx| {
+            a.action_toggle_runtime(cx)
         }));
 
     // Diagnostic pills (always visible, zero included — screenshot center-left).
@@ -3901,21 +3928,28 @@ fn welcome_overlay(cx: &mut Context<JadeApp>, theme: &Theme) -> impl IntoElement
         )
 }
 
-/// The right sidebar (gauge toggle): RUNTIME graphs over TRAINING + TELEMETRY.
-/// Fully hidden (zero-size) when toggled off — the gauge controls the whole
-/// sidebar, not just the runtime section (§5.4; user spec 2026-07-15).
+/// Sidebar slide duration (open and close).
+const SIDEBAR_SLIDE_MS: u64 = 180;
+
+/// The right sidebar (gauge toggle): RUNTIME graphs over TRAINING + TELEMETRY,
+/// sliding in/out as a drawer (§5.4; user spec 2026-07-15). The inner card
+/// keeps its fixed 280px width so content doesn't reflow mid-slide; the outer
+/// wrapper animates its width and clips.
 fn runtime_sidebar(
     app: &JadeApp,
     cx: &mut Context<JadeApp>,
     theme: &Theme,
     bench_handle: FocusHandle,
 ) -> gpui::AnyElement {
+    use gpui::{Animation, AnimationExt as _};
+
     if !app.runtime_visible {
         return div().into_any_element();
     }
-    div()
+    let card = div()
         .id("runtime-sidebar")
         .flex()
+        .flex_none()
         .flex_col()
         .gap_3()
         .w(px(280.))
@@ -3928,7 +3962,22 @@ fn runtime_sidebar(
         .overflow_y_scroll()
         .child(runtime_panel::render(app, bench_handle, cx))
         .child(training_view::render(app, cx))
-        .child(telemetry_sidebar::render(app, cx))
+        .child(telemetry_sidebar::render(app, cx));
+
+    let closing = app.sidebar_closing;
+    div()
+        .flex_none()
+        .overflow_hidden()
+        .child(card)
+        .with_animation(
+            ("sidebar-slide", app.sidebar_anim_gen),
+            Animation::new(std::time::Duration::from_millis(SIDEBAR_SLIDE_MS))
+                .with_easing(gpui::ease_out_quint()),
+            move |el, t| {
+                let w = if closing { 280.0 * (1.0 - t) } else { 280.0 * t };
+                el.w(px(w))
+            },
+        )
         .into_any_element()
 }
 
