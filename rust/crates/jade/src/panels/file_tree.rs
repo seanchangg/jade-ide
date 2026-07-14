@@ -114,7 +114,9 @@ fn tree_row(
         .pr(px(6.))
         .rounded_sm()
         .text_xs()
-        .cursor_pointer();
+        .cursor_pointer()
+        // Hover affordance (§2; main.css:562-564 `.file-tree-row:hover`).
+        .hover(|s| s.bg(rgb(theme.border)));
 
     if is_active {
         el = el.bg(rgb(theme.border));

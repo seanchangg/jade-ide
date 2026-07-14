@@ -32,8 +32,9 @@ use forge_sysmon::{SystemMonitor, SystemStats};
 use forge_telemetry::{Event, Kind, TelemetryServer};
 use forge_term::{GridSnapshot, TermEvent, TermId, TermManager};
 use gpui::{
-    div, prelude::*, px, rgb, Bounds, ClipboardItem, Context, EntityInputHandler, FocusHandle,
-    KeyDownEvent, MouseButton, Pixels, UTF16Selection, Window,
+    div, hsla, prelude::*, px, rgb, Bounds, BoxShadow, ClipboardItem, Context,
+    EntityInputHandler, FocusHandle, KeyDownEvent, MouseButton, Pixels, UTF16Selection, Window,
+    WindowControlArea,
 };
 use serde_json::{Map, Value};
 use tokio::runtime::Handle;
@@ -366,6 +367,9 @@ pub struct JadeApp {
     // ── Structure panel + Quick Open (Phase-4 wave 3, §5.5/§5.7) ──────────────
     /// Which view the left sidebar shows (FILES tree vs STRUCTURE outline).
     pub sidebar_tab: SidebarTab,
+    /// Whether the left sidebar is collapsed to the 28px strip (§2; app.ts:449-459,
+    /// main.css:481-495). Binary toggle — 260px ⇄ 28px "FILES" strip.
+    pub sidebar_collapsed: bool,
     /// Quick Open overlay state (`Some` == open); the transient query + selection.
     pub quick_open: Option<QuickOpenState>,
     /// Focus handle for the Quick Open overlay (created lazily; None headless).
@@ -623,6 +627,7 @@ impl JadeApp {
             note_save_gen: 0,
 
             sidebar_tab: SidebarTab::Files,
+            sidebar_collapsed: false,
             quick_open: None,
             quick_open_focus: None,
             file_cache: None,
@@ -1352,6 +1357,11 @@ impl JadeApp {
     /// Switch the left sidebar between FILES and STRUCTURE (§5.5).
     pub fn set_sidebar_tab(&mut self, tab: SidebarTab) {
         self.sidebar_tab = tab;
+    }
+
+    /// Collapse/expand the left sidebar (§2; app.ts:449-459): 260px ⇄ 28px strip.
+    pub fn toggle_sidebar(&mut self) {
+        self.sidebar_collapsed = !self.sidebar_collapsed;
     }
 
     /// The active tab's tree-sitter outline (empty when no tab / non-C-family).
@@ -3477,6 +3487,14 @@ impl Render for JadeApp {
     }
 }
 
+/// The floating-card drop shadow (§2 "the look"; main.css `--shadow-sm`,
+/// main.css:85 / :2342-2344): `0 1px 2px rgba(0,0,0,0.25)`. Applied to the
+/// sidebar / editor / runtime / terminal cards so both themes share one subtle
+/// elevation.
+fn card_shadow() -> Vec<BoxShadow> {
+    vec![BoxShadow::new(px(0.), px(1.), hsla(0., 0., 0., 0.25)).blur_radius(px(2.))]
+}
+
 fn action_bar(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl IntoElement {
     let file_label = app
         .active_file
@@ -3503,7 +3521,17 @@ fn action_bar(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl I
         .flex()
         .items_center()
         .gap_2()
-        .child(chip("panel-left", "Files", theme, false))
+        // Files chip toggles the left-sidebar collapse (§2; app.ts:449-459).
+        .child(action_chip(
+            "tgl-files",
+            "panel-left",
+            "Files".to_string(),
+            theme,
+            !app.sidebar_collapsed,
+            false,
+            cx,
+            |a, _| a.toggle_sidebar(),
+        ))
         .child(action_chip(
             "tgl-terminal",
             "terminal",
@@ -3686,11 +3714,15 @@ fn action_bar(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl I
         .items_center()
         .justify_between()
         .h(px(38.))
-        .pl(px(80.)) // clear the traffic lights (hiddenInset title bar)
+        .pl(px(80.)) // clear the traffic lights (hiddenInset title bar; main.css:222-243)
         .pr(px(12.))
         .bg(rgb(theme.panel))
         .border_b_1()
         .border_color(rgb(theme.border))
+        // Window-drag region: empty parts of the bar drag the window; the chips'
+        // own click hitboxes take priority, so they stay `no-drag`
+        // (main.css:222-243 `-webkit-app-region: drag`/`no-drag`).
+        .window_control_area(WindowControlArea::Drag)
         .child(
             div()
                 .flex()
@@ -3706,24 +3738,6 @@ fn action_bar(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl I
                 ),
         )
         .child(right_group)
-}
-
-/// A static (non-clickable) action-bar chip: a leading lucide icon + label.
-fn chip(icon: &'static str, label: &str, theme: &Theme, accent: bool) -> impl IntoElement {
-    let color = if accent { theme.accent } else { theme.muted };
-    div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap_1()
-        .px_2()
-        .py_1()
-        .rounded_md()
-        .text_xs()
-        .bg(rgb(theme.bg))
-        .text_color(rgb(color))
-        .child(crate::assets::ui_icon(icon, 14.))
-        .child(label.to_string())
 }
 
 /// A clickable action-bar chip: a leading lucide `icon` + `label`. `active`
@@ -3765,15 +3779,56 @@ fn action_chip(
     if disabled {
         el
     } else {
-        el.cursor_pointer().on_click(cx.listener(move |app, _ev, _win, cx| {
-            f(app, cx);
-            cx.notify();
-        }))
+        // Hover affordance (§2; main.css:290-294 `.action-btn:hover`): a subtle
+        // border-wash fill + pointer cursor.
+        let hover_bg = theme.border;
+        el.cursor_pointer()
+            .hover(move |s| s.bg(rgb(hover_bg)))
+            .on_click(cx.listener(move |app, _ev, _win, cx| {
+                f(app, cx);
+                cx.notify();
+            }))
     }
 }
 
-/// Left panel: the file-tree card (deliverable §2), replacing the placeholder.
+/// Left panel: the file-tree card (deliverable §2, floating-card look §2). When
+/// collapsed it shrinks to a 28px clickable strip showing a stacked "FILES" label
+/// that reopens it (app.ts:449-459, main.css:481-495).
 fn left_panel(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl IntoElement {
+    // Collapsed: a 28px strip with a vertical "FILES" label (GPUI has no cheap
+    // text-rotation, so the letters are stacked); clicking anywhere reopens it.
+    if app.sidebar_collapsed {
+        let mut label = div().flex().flex_col().items_center().gap(px(1.)).pt(px(12.));
+        for ch in "FILES".chars() {
+            label = label.child(
+                div()
+                    .text_color(rgb(theme.muted))
+                    .text_xs()
+                    .child(ch.to_string()),
+            );
+        }
+        return div()
+            .id("sidebar-collapsed")
+            .flex()
+            .flex_col()
+            .items_center()
+            .w(px(28.))
+            .rounded_lg()
+            .bg(rgb(theme.panel))
+            .border_1()
+            .border_color(rgb(theme.border))
+            .shadow(card_shadow())
+            .overflow_hidden()
+            .cursor_pointer()
+            .hover(|s| s.bg(rgb(theme.border)))
+            .on_click(cx.listener(|a: &mut JadeApp, _e, _w, cx| {
+                a.toggle_sidebar();
+                cx.notify();
+            }))
+            .child(label)
+            .into_any_element();
+    }
+
     // FILES | STRUCTURE tab switcher over the tree or the symbol outline (§5.5).
     let body = match app.sidebar_tab {
         SidebarTab::Files => file_tree::render(app, cx).into_any_element(),
@@ -3789,9 +3844,11 @@ fn left_panel(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl I
         .bg(rgb(theme.panel))
         .border_1()
         .border_color(rgb(theme.border))
+        .shadow(card_shadow())
         .overflow_hidden()
         .child(structure_panel::tab_switcher(app, cx, theme))
         .child(body)
+        .into_any_element()
 }
 
 /// Center: the tab strip + read-only code viewer (deliverables §3, §5), replacing
@@ -3806,6 +3863,7 @@ fn center_content(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> im
         .bg(rgb(theme.bg))
         .border_1()
         .border_color(rgb(theme.border))
+        .shadow(card_shadow()) // floating-card look (§2, main.css:2342-2344)
         .overflow_hidden()
         .child(code_view::tab_strip(app, cx, theme))
         .child(code_view::render(app, cx));
@@ -3833,6 +3891,7 @@ fn runtime_sidebar(
         .bg(rgb(theme.panel))
         .border_1()
         .border_color(rgb(theme.border))
+        .shadow(card_shadow()) // floating-card look (§2, main.css:2342-2344)
         .overflow_y_scroll();
     // RUNTIME panel sits above TRAINING, shown when toggled (§5.4).
     if app.runtime_visible {
@@ -3940,17 +3999,31 @@ fn bottom_panel(
         output_view(app, theme, cx).into_any_element()
     };
 
+    // Floating-card treatment (§2; main.css `#terminal-area` padding 6px 6px 0 6px
+    // + `.terminal-panel` card): the strip sits in a 6px gutter as a rounded,
+    // bordered, shadowed card matching the sidebar / editor / runtime cards.
     div()
-        .id("bottom-panel")
         .flex()
         .flex_col()
-        .h(px(220.))
-        .w_full()
-        .bg(rgb(theme.bg))
-        .border_t_1()
-        .border_color(rgb(theme.border))
-        .child(header)
-        .child(body)
+        .flex_none()
+        .px(px(6.))
+        .pt(px(6.))
+        .child(
+            div()
+                .id("bottom-panel")
+                .flex()
+                .flex_col()
+                .h(px(220.))
+                .w_full()
+                .rounded_lg()
+                .bg(rgb(theme.bg))
+                .border_1()
+                .border_color(rgb(theme.border))
+                .shadow(card_shadow())
+                .overflow_hidden()
+                .child(header)
+                .child(body),
+        )
 }
 
 /// The OUTPUT scrollback view (deliverable §4): capped scrollback, monospace,

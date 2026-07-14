@@ -72,7 +72,10 @@ use forge_build::{BuildEngine, EngineConfig};
 use forge_sysmon::SystemMonitor;
 use forge_telemetry::{Event, TelemetryServer};
 use forge_term::TermManager;
-use gpui::{px, size, App, AppContext, Bounds, WindowBounds, WindowOptions};
+use gpui::{
+    point, px, size, App, AppContext, Bounds, TitlebarOptions, WindowBackgroundAppearance,
+    WindowBounds, WindowOptions,
+};
 use gpui_platform::application;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -240,10 +243,21 @@ fn main() {
     // font registration below is unaffected (it runs against the same `App`).
     application().with_assets(assets::Assets).run(move |cx: &mut App| {
         fonts::register_bundled_fonts(cx);
+        // Signature window chrome (§2 "the look" / main.ts:41-66): 1400×900 window,
+        // `hiddenInset`-equivalent titlebar (transparent, traffic lights at 12,12),
+        // 800×500 minimum. The #1E1F22 backdrop is painted by the root div's
+        // `bg(theme.bg)`, which now fills the titlebar inset too (appears_transparent).
         let bounds = Bounds::centered(None, size(px(1400.), px(900.)), cx);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
+                titlebar: Some(TitlebarOptions {
+                    title: Some("Jade".into()),
+                    appears_transparent: true,
+                    traffic_light_position: Some(point(px(12.), px(12.))),
+                }),
+                window_min_size: Some(size(px(800.), px(500.))),
+                window_background: WindowBackgroundAppearance::Opaque,
                 ..Default::default()
             },
             |_, cx| cx.new(|cx| JadeApp::new(cx, deps, app_rx)),

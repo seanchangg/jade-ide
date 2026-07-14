@@ -850,6 +850,8 @@ fn tab_chip(
         .cursor_pointer()
         .text_color(rgb(fg))
         .bg(rgb(theme.bg))
+        // Hover affordance (§2; main.css:766-769 `.tab:hover`): subtle border wash.
+        .hover(|s| s.bg(rgb(theme.border)))
         // Middle-click closes (mouse-down carries the button).
         .on_mouse_down(
             gpui::MouseButton::Middle,
