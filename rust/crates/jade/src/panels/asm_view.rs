@@ -152,7 +152,7 @@ fn asm_list(n: usize, app: &JadeApp, cx: &mut Context<JadeApp>) -> gpui::AnyElem
     .py(px(4.))
     .text_size(px(11.))
     .line_height(px(ASM_LINE_H))
-    .font_family("Menlo");
+    .font_family(crate::fonts::mono_family());
 
     div().flex().flex_1().size_full().child(list).into_any_element()
 }

@@ -41,6 +41,7 @@ mod benchmark;
 mod debug;
 mod decorations;
 mod editor_view;
+mod fonts;
 mod format;
 mod frequency;
 mod ghost;
@@ -196,6 +197,7 @@ fn main() {
     maybe_launch_train(&args, &socket);
 
     application().run(move |cx: &mut App| {
+        fonts::register_bundled_fonts(cx);
         let bounds = Bounds::centered(None, size(px(1400.), px(900.)), cx);
         cx.open_window(
             WindowOptions {

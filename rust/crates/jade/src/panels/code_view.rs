@@ -439,7 +439,7 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> gpui::AnyElement {
     .px(px(8.))
     .text_size(px(FONT_PX))
     .line_height(px(LINE_H))
-    .font_family("Menlo");
+    .font_family(crate::fonts::mono_family());
 
     let entity = cx.entity();
     let mut container = div()

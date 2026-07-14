@@ -288,7 +288,7 @@ fn console_col(app: &JadeApp, theme: &Theme) -> impl IntoElement {
         .h_full()
         .overflow_y_scroll()
         .child(col_label("CONSOLE", theme))
-        .child(div().px(px(6.)).font_family("Menlo").child(list))
+        .child(div().px(px(6.)).font_family(crate::fonts::mono_family()).child(list))
 }
 
 /// Shorten a path to its basename for the compact frame/status readouts.

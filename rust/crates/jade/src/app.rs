@@ -3313,7 +3313,7 @@ impl Render for JadeApp {
             .size_full()
             .bg(rgb(theme.bg))
             .text_color(rgb(theme.text))
-            .font_family("Menlo") // JetBrains Mono isn't installed on this machine
+            .font_family(crate::fonts::mono_family()) // bundled JetBrains Mono, else Menlo
             .text_sm()
             // Global ⌘P: toggle Quick Open (§5.7). Root-level so it fires whether
             // or not a child (terminal, overlay) holds focus — key events bubble

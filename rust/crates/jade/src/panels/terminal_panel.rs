@@ -262,7 +262,7 @@ pub fn render(app: &JadeApp, handle: FocusHandle, _cx: &mut Context<JadeApp>) ->
         .overflow_hidden()
         .bg(rgb(theme.bg))
         .track_focus(&handle)
-        .font_family("Menlo")
+        .font_family(crate::fonts::mono_family())
         .text_size(px(12.))
         .line_height(px(CELL_H));
 
