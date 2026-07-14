@@ -744,18 +744,17 @@ fn runtime_allocs_for(app: &JadeApp, tab: &crate::editor_view::OpenTab) -> HashM
 /// an `x` close icon, the active tab underlined. Middle-click also closes (GPUI exposes
 /// the mouse button on the down event).
 pub fn tab_strip(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl IntoElement {
+    // Seamless strip (screenshot ref): darker band, active tab shares the
+    // editor's background and carries the accent underline — no chip boxes.
     let mut strip = div()
         .id("tab-strip")
         .flex()
         .flex_row()
-        .items_center()
-        .h(px(30.))
+        .items_end()
+        .h(px(34.))
         .w_full()
-        .gap(px(2.))
-        .px(px(4.))
+        .px(px(6.))
         .bg(rgb(theme.panel))
-        .border_b_1()
-        .border_color(rgb(theme.border))
         .overflow_x_hidden();
 
     for (i, tab) in app.editor.tabs.iter().enumerate() {
@@ -834,22 +833,23 @@ fn tab_chip(
     cx: &mut Context<JadeApp>,
 ) -> impl IntoElement {
     let fg = if active { theme.text } else { theme.muted };
+    let hover_bg = theme.border;
 
+    // Seamless tab: full strip height, the active tab takes the editor's own
+    // background (merging into the code below) + a 2px accent underline;
+    // inactive tabs are flat text on the strip band.
     let mut chip = div()
         .id(("tab", index))
         .flex()
         .flex_row()
         .items_center()
         .gap_1()
-        .h(px(26.))
-        .px(px(8.))
-        .rounded_md()
+        .h(px(30.))
+        .px(px(14.))
+        .rounded_t_md()
         .text_xs()
         .cursor_pointer()
         .text_color(rgb(fg))
-        .bg(rgb(theme.bg))
-        // Hover affordance (§2; main.css:766-769 `.tab:hover`): subtle border wash.
-        .hover(|s| s.bg(rgb(theme.border)))
         // Middle-click closes (mouse-down carries the button).
         .on_mouse_down(
             gpui::MouseButton::Middle,
@@ -867,22 +867,21 @@ fn tab_chip(
         }))
         .child(div().child(name.to_string()));
 
+    if active {
+        chip = chip.bg(rgb(theme.bg)).border_b_2().border_color(rgb(theme.accent));
+    } else {
+        chip = chip.hover(move |st| st.bg(rgb(hover_bg)));
+    }
+
     // Dirty dot ● from buffer.is_dirty() (§3); silent-close semantics preserved.
     if dirty {
         chip = chip.child(div().text_color(rgb(theme.accent)).child("●"));
-    }
-
-    // Active underline (§4.1).
-    if active {
-        chip = chip.border_b_2().border_color(rgb(theme.accent));
     }
 
     // Close button.
     chip.child(
         div()
             .id(("tab-close", index))
-            .flex()
-            .items_center()
             .px_1()
             .text_color(rgb(theme.muted))
             .cursor_pointer()

@@ -399,6 +399,10 @@ pub struct JadeApp {
     pub bottom_anim_gen: usize,
     /// Bumped on every left-sidebar collapse toggle so its slide restarts.
     pub left_anim_gen: usize,
+    /// Every project opened this session (CLion-style project subtabs). The
+    /// active one is `workspace_root`; switching goes through `open_project`,
+    /// whose per-workspace ui persistence restores each project's tab set.
+    pub open_projects: Vec<PathBuf>,
     /// Wall-clock start of the in-flight run (drives the live SPEED tick).
     pub run_started: Option<Instant>,
     /// 1-based counter of completed runs.
@@ -587,7 +591,7 @@ impl JadeApp {
             runtime: deps.runtime,
             app_tx: deps.app_tx,
             repo_root: deps.repo_root,
-            workspace_root: deps.workspace_root,
+            workspace_root: deps.workspace_root.clone(),
             workspace_opened: opened,
             fs_watch: deps.fs_watch,
             fs_watcher,
@@ -662,6 +666,11 @@ impl JadeApp {
             bottom_closing: false,
             bottom_anim_gen: 0,
             left_anim_gen: 0,
+            open_projects: if opened {
+                vec![deps.workspace_root]
+            } else {
+                Vec::new()
+            },
             run_started: None,
             run_counter: 0,
             run_history: Vec::new(),
@@ -1425,6 +1434,17 @@ impl JadeApp {
     /// and restart the fs-watch on the new root. `cx`-free so the state transition
     /// is unit-testable; the dialog handler drives `cx.notify` around it.
     pub fn open_project(&mut self, dir: PathBuf) {
+        if self.workspace_root == dir && self.workspace_opened {
+            return; // already the active project
+        }
+        // Persist the outgoing workspace's tab set so switching back restores it.
+        if self.workspace_opened {
+            self.save_ui_state();
+        }
+        // Register in the project subtabs (dedupe; active follows workspace_root).
+        if !self.open_projects.iter().any(|p| p == &dir) {
+            self.open_projects.push(dir.clone());
+        }
         // Leaving any prior workspace: drop its clangd session so the new root
         // re-initializes lazily on the first file open (clangd is per-workspace).
         self.lsp = None;
@@ -3487,6 +3507,7 @@ impl Render for JadeApp {
                 }
             }))
             .child(action_bar(self, cx, &theme))
+            .child(project_tabs(self, cx, &theme))
             .child(
                 // Main area: left panel | center content | right runtime sidebar.
                 // min_h(0): flex children default to min-height:auto, so tall
@@ -3575,6 +3596,64 @@ impl Render for JadeApp {
 /// elevation.
 fn card_shadow() -> Vec<BoxShadow> {
     vec![BoxShadow::new(px(0.), px(1.), hsla(0., 0., 0., 0.25)).blur_radius(px(2.))]
+}
+
+/// CLion-style project subtabs: one chip per opened project, active follows
+/// `workspace_root`. Hidden until a second project is opened. Switching goes
+/// through `open_project`, whose per-workspace persistence restores each
+/// project's tabs/breakpoints.
+fn project_tabs(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> gpui::AnyElement {
+    if app.open_projects.len() < 2 {
+        return div().into_any_element();
+    }
+    let mut bar = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .h(px(26.))
+        .px(px(12.))
+        .gap_1()
+        .bg(rgb(theme.panel))
+        .border_b_1()
+        .border_color(rgb(theme.border))
+        .text_xs();
+    for (i, dir) in app.open_projects.iter().enumerate() {
+        let active = *dir == app.workspace_root;
+        let name = dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| dir.display().to_string());
+        let target = dir.clone();
+        let hover_bg = theme.border;
+        let mut chip = div()
+            .id(("proj-tab", i))
+            .flex()
+            .items_center()
+            .gap_1()
+            .px_2()
+            .py(px(2.))
+            .rounded_md()
+            .cursor_pointer()
+            .text_color(rgb(if active { theme.text } else { theme.muted }))
+            .child(crate::assets::ui_icon(
+                "folder",
+                12.,
+                if active { theme.accent } else { theme.muted },
+            ))
+            .child(name);
+        if active {
+            chip = chip.bg(rgb(theme.bg));
+        } else {
+            chip = chip
+                .hover(move |st| st.bg(rgb(hover_bg)))
+                .on_click(cx.listener(move |a: &mut JadeApp, _ev, _w, cx| {
+                    a.open_project(target.clone());
+                    cx.notify();
+                }));
+        }
+        bar = bar.child(chip);
+    }
+    bar.into_any_element()
 }
 
 fn action_bar(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl IntoElement {

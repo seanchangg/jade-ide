@@ -82,6 +82,10 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use app::{AppDeps, AppEvent, JadeApp};
 use workspace_tree::{is_watch_relevant, WatchDebounce};
 
+// Native menu-bar actions (File → Open Folder…, Jade → Quit). Dispatched by
+// the OS menu; handlers are registered in `main`'s run closure.
+gpui::actions!(jade, [OpenFolder, Quit]);
+
 /// GUI apps launched from Finder/Dock inherit launchd's minimal PATH
 /// (`/usr/bin:/bin:/usr/sbin:/sbin`) — no `/opt/homebrew/bin` — so `cmake`,
 /// `clangd`, and `llama-server` fail to resolve and every Build/Run/Debug
@@ -262,21 +266,38 @@ fn main() {
         // 800×500 minimum. The #1E1F22 backdrop is painted by the root div's
         // `bg(theme.bg)`, which now fills the titlebar inset too (appears_transparent).
         let bounds = Bounds::centered(None, size(px(1400.), px(900.)), cx);
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: Some(TitlebarOptions {
-                    title: Some("Jade".into()),
-                    appears_transparent: true,
-                    traffic_light_position: Some(point(px(12.), px(12.))),
-                }),
-                window_min_size: Some(size(px(800.), px(500.))),
-                window_background: WindowBackgroundAppearance::Opaque,
-                ..Default::default()
-            },
-            |_, cx| cx.new(|cx| JadeApp::new(cx, deps, app_rx)),
-        )
-        .unwrap();
+        let window = cx
+            .open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    titlebar: Some(TitlebarOptions {
+                        title: Some("Jade".into()),
+                        appears_transparent: true,
+                        traffic_light_position: Some(point(px(12.), px(12.))),
+                    }),
+                    window_min_size: Some(size(px(800.), px(500.))),
+                    window_background: WindowBackgroundAppearance::Opaque,
+                    ..Default::default()
+                },
+                |_, cx| cx.new(|cx| JadeApp::new(cx, deps, app_rx)),
+            )
+            .unwrap();
+
+        // Native macOS menu bar: File → Open Folder… routes to the same
+        // directory picker as ⌘O / the action-bar button (CLion-style project
+        // opening); each opened folder lands in the project subtabs.
+        cx.on_action(move |_: &OpenFolder, cx| {
+            let _ = window.update(cx, |app, _window, cx| app.prompt_open_project(cx));
+        });
+        cx.on_action(|_: &Quit, cx| cx.quit());
+        cx.set_menus(vec![
+            gpui::Menu::new("Jade").items(vec![gpui::MenuItem::action("Quit Jade", Quit)]),
+            gpui::Menu::new("File").items(vec![gpui::MenuItem::action(
+                "Open Folder…",
+                OpenFolder,
+            )]),
+        ]);
+
         cx.activate(true);
     });
 }
