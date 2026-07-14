@@ -462,3 +462,50 @@ async fn click_past_eol_and_type_follow_scroll(cx: &mut TestAppContext) {
         "typing out of view must scroll the caret back into view (top {top_after}, rows {rows})"
     );
 }
+
+/// ⌘⌫ deletes the whole current line; ⌘← is line-aware Home: first press goes
+/// to the text edge (first non-whitespace), second to column 0.
+#[gpui::test]
+async fn cmd_backspace_and_smart_home(cx: &mut TestAppContext) {
+    let (dir, file) = test_workspace();
+    let (deps, app_rx) = test_deps(dir);
+
+    let (app, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps, app_rx));
+    app.update_in(cx, |app, _window, cx| {
+        app.open_file(file.clone());
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    // Caret into row 1 ("    int alpha = 1;") at col 8.
+    let cell = cx.debug_bounds("code-cell-1").expect("row 1 painted");
+    cx.simulate_click(
+        gpui::point(
+            cell.origin.x + px(8.0 * crate::panels::code_view::CHAR_W + 1.0),
+            cell.origin.y + px(crate::panels::code_view::LINE_H / 2.0),
+        ),
+        Modifiers::default(),
+    );
+
+    // Smart home: ⌘← → col 4 (text edge), again → col 0, again → back to 4.
+    cx.simulate_keystrokes("cmd-left");
+    app.update_in(cx, |app, _w, _cx| {
+        assert_eq!(app.editor.active_tab().unwrap().caret_point().col, 4);
+    });
+    cx.simulate_keystrokes("cmd-left");
+    app.update_in(cx, |app, _w, _cx| {
+        assert_eq!(app.editor.active_tab().unwrap().caret_point().col, 0);
+    });
+    cx.simulate_keystrokes("cmd-left");
+    app.update_in(cx, |app, _w, _cx| {
+        assert_eq!(app.editor.active_tab().unwrap().caret_point().col, 4);
+    });
+
+    // ⌘⌫ deletes the whole line: row 1 becomes the old row 2.
+    cx.simulate_keystrokes("cmd-backspace");
+    app.update_in(cx, |app, _w, _cx| {
+        let tab = app.editor.active_tab().unwrap();
+        assert_eq!(tab.line(1), "    int beta = 2;", "line 1 deleted wholesale");
+        assert!(tab.buffer.is_dirty());
+    });
+}

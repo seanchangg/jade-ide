@@ -68,6 +68,13 @@ pub struct OpenTab {
     /// IME composition range (byte range in the buffer), rendered with an
     /// underline. `None` when not composing.
     pub marked: Option<Range<usize>>,
+    /// Foldable regions: fold-start row → matching close row (both 0-based),
+    /// recomputed on every edit alongside the highlights. A region hides rows
+    /// `start+1 ..= end-1` when folded.
+    pub fold_map: HashMap<usize, usize>,
+    /// Rows the user has folded. Stale entries (no longer fold starts after an
+    /// edit) are ignored by [`visible_rows`](Self::visible_rows).
+    pub folds: std::collections::BTreeSet<usize>,
     /// True once `didOpen` was sent for this tab (so we don't double-open).
     pub lsp_opened: bool,
     /// Debounce for the static size-annotation rescan (§10: 1000ms).
@@ -124,6 +131,8 @@ impl OpenTab {
             symbols,
             diagnostics: Vec::new(),
             marked: None,
+            fold_map: fold_regions(text),
+            folds: std::collections::BTreeSet::new(),
             lsp_opened: false,
             sizes_debounce: Debounce::new(SIZES_DEBOUNCE_MS),
             flow_debounce: Debounce::new(FLOW_DEBOUNCE_MS),
@@ -163,13 +172,15 @@ impl OpenTab {
         self.struct_debounce.arm(now_ms);
     }
 
-    /// Full-file re-highlight (see the module-level invalidation note).
+    /// Full-file re-highlight (see the module-level invalidation note). The
+    /// fold map rides along — same eager-per-edit cadence, same text pass.
     pub fn rehighlight(&mut self) {
         let text = self.buffer.to_string();
         self.highlights = match &self.highlighter {
             Some(h) => h.highlight(&text),
             None => highlight::highlight_file(&self.path, &text, self.palette),
         };
+        self.fold_map = fold_regions(&text);
     }
 
     /// Swap the token palette (theme toggle, §4.2): rebuild the cached
@@ -222,6 +233,59 @@ impl OpenTab {
     /// The primary caret as a render Point (row + char column).
     pub fn caret_point(&self) -> Point {
         self.buffer.offset_to_point(self.buffer.selection().caret())
+    }
+
+    /// The buffer rows currently on screen, in order, honoring folds: a folded
+    /// region shows its start row and hides `start+1 ..= end-1`. Stale fold
+    /// entries (rows that stopped being fold starts) are skipped.
+    pub fn visible_rows(&self) -> Vec<usize> {
+        let n = self.line_count();
+        let mut out = Vec::with_capacity(n);
+        let mut row = 0;
+        while row < n {
+            out.push(row);
+            if self.folds.contains(&row) {
+                if let Some(&end) = self.fold_map.get(&row) {
+                    if end > row + 1 {
+                        out.push(end.min(n - 1)); // keep the closing-brace row
+                        row = end + 1;
+                        continue;
+                    }
+                }
+            }
+            row += 1;
+        }
+        out
+    }
+
+    /// Display index of `buffer_row` in [`visible_rows`](Self::visible_rows)
+    /// (the nearest visible row at/before it when hidden).
+    pub fn display_row(&self, buffer_row: usize) -> usize {
+        let vis = self.visible_rows();
+        match vis.binary_search(&buffer_row) {
+            Ok(i) => i,
+            Err(i) => i.saturating_sub(1),
+        }
+    }
+
+    /// Unfold any folded region hiding `row` (caret auto-unfold: the caret must
+    /// never sit in an invisible line).
+    pub fn unfold_containing(&mut self, row: usize) -> bool {
+        let covering: Vec<usize> = self
+            .folds
+            .iter()
+            .copied()
+            .filter(|&start| {
+                self.fold_map
+                    .get(&start)
+                    .is_some_and(|&end| start < row && row < end)
+            })
+            .collect();
+        let changed = !covering.is_empty();
+        for start in covering {
+            self.folds.remove(&start);
+        }
+        changed
     }
 }
 
@@ -425,6 +489,64 @@ pub fn merge_line_styles(
         }
     }
     runs
+}
+
+/// Brace-based fold regions: for each row whose LAST opened `{` closes on a
+/// later row, map start row → close row. Nested blocks fold independently
+/// (hierarchical). String/char/comment contents are skipped so braces inside
+/// literals don't pair.
+pub fn fold_regions(text: &str) -> HashMap<usize, usize> {
+    let mut map = HashMap::new();
+    let mut stack: Vec<usize> = Vec::new(); // rows of currently-open braces
+    let mut row = 0usize;
+    let mut chars = text.chars().peekable();
+    let (mut in_str, mut in_chr, mut in_line_c, mut in_block_c, mut esc) =
+        (false, false, false, false, false);
+    while let Some(c) = chars.next() {
+        if c == '\n' {
+            row += 1;
+            in_line_c = false;
+            esc = false;
+            continue;
+        }
+        if esc {
+            esc = false;
+            continue;
+        }
+        match c {
+            '\\' if in_str || in_chr => esc = true,
+            '"' if !in_chr && !in_line_c && !in_block_c => in_str = !in_str,
+            '\'' if !in_str && !in_line_c && !in_block_c => in_chr = !in_chr,
+            '/' if !in_str && !in_chr && !in_block_c && !in_line_c => {
+                match chars.peek() {
+                    Some('/') => in_line_c = true,
+                    Some('*') => {
+                        chars.next();
+                        in_block_c = true;
+                    }
+                    _ => {}
+                }
+            }
+            '*' if in_block_c => {
+                if chars.peek() == Some(&'/') {
+                    chars.next();
+                    in_block_c = false;
+                }
+            }
+            '{' if !in_str && !in_chr && !in_line_c && !in_block_c => stack.push(row),
+            '}' if !in_str && !in_chr && !in_line_c && !in_block_c => {
+                if let Some(start) = stack.pop() {
+                    // Only multi-line blocks fold; the LAST { on a row wins
+                    // (insert overwrites an earlier same-row pair).
+                    if row > start + 1 {
+                        map.insert(start, row);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    map
 }
 
 /// Round a line-relative x pixel to a char column, clamped to `max_col`.
@@ -985,5 +1107,59 @@ mod perf_probe {
             println!("on_edited: {:?}", t.elapsed());
         }
         println!("10 keystrokes total: {:?}", t0.elapsed());
+    }
+}
+
+#[cfg(test)]
+mod fold_tests {
+    use super::*;
+
+    const SRC: &str = "void f() {\n    int a;\n    int b;\n}\nint x;\nnamespace n {\nvoid g() {\n    int c;\n}\n}\n";
+    // rows: 0 "void f() {", 1..2 body, 3 "}", 4 "int x;",
+    //       5 "namespace n {", 6 "void g() {", 7 body, 8 "}", 9 "}"
+
+    #[test]
+    fn fold_regions_finds_multiline_blocks() {
+        let m = fold_regions(SRC);
+        assert_eq!(m.get(&0), Some(&3));
+        assert_eq!(m.get(&5), Some(&9)); // namespace (hierarchical parent)
+        assert_eq!(m.get(&6), Some(&8)); // nested fn
+        assert!(!m.contains_key(&4));
+    }
+
+    #[test]
+    fn fold_regions_ignores_braces_in_literals_and_comments() {
+        let m = fold_regions("int a; // {\nchar c = '{';\n/* { */\nvoid f() {\nint b;\n}\n");
+        assert_eq!(m.len(), 1);
+        assert_eq!(m.get(&3), Some(&5));
+    }
+
+    #[test]
+    fn visible_rows_hide_folded_interior_keep_close() {
+        let mut t = OpenTab::from_text(&PathBuf::from("/x/f.cpp"), SRC, TokenPalette::forge_dark());
+        assert_eq!(t.visible_rows().len(), t.line_count());
+        t.folds.insert(0);
+        let vis = t.visible_rows();
+        // rows 1..=2 hidden; 0 and the closing 3 stay.
+        assert!(vis.starts_with(&[0, 3, 4, 5, 6]));
+        // display_row maps hidden rows to the fold start.
+        assert_eq!(t.display_row(0), 0);
+        assert_eq!(t.display_row(2), 0);
+        assert_eq!(t.display_row(3), 1);
+        // unfold_containing restores them.
+        assert!(t.unfold_containing(2));
+        assert_eq!(t.visible_rows().len(), t.line_count());
+    }
+
+    #[test]
+    fn nested_folds_hierarchical() {
+        let mut t = OpenTab::from_text(&PathBuf::from("/x/f.cpp"), SRC, TokenPalette::forge_dark());
+        t.folds.insert(5); // fold the namespace: hides 6..=8, keeps 9
+        let vis = t.visible_rows();
+        assert_eq!(vis, vec![0, 1, 2, 3, 4, 5, 9, 10]); // 10 = trailing empty line
+        // folding the inner fn alone (namespace open) hides only 7
+        t.folds.clear();
+        t.folds.insert(6);
+        assert_eq!(t.visible_rows(), vec![0, 1, 2, 3, 4, 5, 6, 8, 9, 10]);
     }
 }

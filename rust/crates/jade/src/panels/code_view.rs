@@ -30,6 +30,8 @@ pub const PAD_TOP: f32 = 16.0;
 const GUTTER_W: f32 = 52.0;
 /// Width of the flow glyph margin column (shown only when Flow is toggled on).
 const GLYPH_W: f32 = 16.0;
+/// Width of the fold-chevron column between the gutter and the code.
+const FOLD_W: f32 = 12.0;
 /// Menlo's char advance at [`FONT_PX`] (Menlo is monospace, ~0.602 em → 7.83px
 /// at 13px). Used for caret/selection/popup placement and click→column mapping;
 /// the two share this constant so hit-testing stays self-consistent. Wide glyphs
@@ -86,7 +88,7 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> gpui::AnyElement {
             .into_any_element();
     };
 
-    let line_count = tab.line_count();
+    let visible_count = tab.visible_rows().len();
     let default_color = theme.text;
     let flow_visible_now = app.flow_visible;
 
@@ -98,7 +100,7 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> gpui::AnyElement {
 
     let list = uniform_list(
         "code-lines",
-        line_count,
+        visible_count,
         cx.processor(move |this, range: std::ops::Range<usize>, window, cx| {
             let mut rows = Vec::with_capacity(range.len());
 
@@ -139,7 +141,11 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> gpui::AnyElement {
             let sel = tab.buffer.selection();
             let caret_point = tab.caret_point();
 
-            for i in range {
+            // Display → buffer row map (folds hide interior rows).
+            let visible = tab.visible_rows();
+
+            for di in range {
+                let Some(&i) = visible.get(di) else { break };
                 let line_no = i + 1;
                 let text = tab.line(i);
                 let line_bytes = text.len();
@@ -336,6 +342,33 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> gpui::AnyElement {
                 );
                 row = row.child(gutter);
 
+                // Fold chevron (§ hierarchical collapse): down = foldable +
+                // open, right = folded; click toggles. Empty for non-blocks.
+                let foldable = tab.fold_map.contains_key(&i);
+                let folded = foldable && tab.folds.contains(&i);
+                let mut fold_cell = div()
+                    .id(("fold", i))
+                    .w(px(FOLD_W))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center();
+                if foldable {
+                    let chev = if folded { "chevron-right" } else { "chevron-down" };
+                    let ccol = if folded { theme.accent } else { theme.muted };
+                    fold_cell = fold_cell
+                        .cursor_pointer()
+                        .child(crate::assets::ui_icon(chev, 11., ccol))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |app: &mut JadeApp, _ev: &MouseDownEvent, _w, cx| {
+                                app.toggle_fold(i);
+                                cx.notify();
+                            }),
+                        );
+                }
+                row = row.child(fold_cell);
+
                 // Code cell: relative so the caret bar can be absolutely placed.
                 // Stateful (`.id`) from the start so the mouse handlers below keep
                 // the element type consistent.
@@ -372,6 +405,15 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> gpui::AnyElement {
                         .text_color(rgb(default_color))
                         .child(styled),
                 );
+                if folded {
+                    cell = cell.child(
+                        div()
+                            .flex_none()
+                            .px_1()
+                            .text_color(rgba_a(theme.muted, 0.7))
+                            .child("…"),
+                    );
+                }
                 // Ghost text run (§4.11): faded (~40% muted) at the caret row,
                 // appended right after the line text (before the EOL annotation).
                 if focused {
@@ -552,7 +594,7 @@ fn ime_geometry_canvas(
         move |_bounds, _window, _cx| {},
         move |bounds: Bounds<gpui::Pixels>, _, window, cx| {
             let glyph = if flow_visible { GLYPH_W } else { 0.0 };
-            let left = f32::from(bounds.origin.x) + 8.0 + GUTTER_W + glyph;
+            let left = f32::from(bounds.origin.x) + 8.0 + GUTTER_W + FOLD_W + glyph;
             text_left.store(left.to_bits(), Ordering::Relaxed);
             // Measure the mono font's real advance so caret placement and
             // click→column mapping stay correct if the bundled font changes.
@@ -583,7 +625,7 @@ fn ime_geometry_canvas(
 /// margin, for anchoring the floating popups inside the editor container.
 fn popup_x(col: usize, flow_visible: bool, char_w: f32) -> f32 {
     let glyph = if flow_visible { GLYPH_W } else { 0.0 };
-    8.0 + GUTTER_W + glyph + editor_view::col_to_px(col, char_w)
+    8.0 + GUTTER_W + FOLD_W + glyph + editor_view::col_to_px(col, char_w)
 }
 
 /// The y pixel (top) of the row below `row`, given the current scroll top.
@@ -605,6 +647,7 @@ fn completion_popup(
     }
     let theme = app.theme.clone();
     let (row, col) = c.anchor;
+    let row = app.editor.active_tab().map(|t| t.display_row(row)).unwrap_or(row);
     let left = popup_x(col, flow_visible, app.char_w());
     let top = popup_y(row, scroll_top);
 
@@ -675,8 +718,9 @@ fn completion_popup(
 fn hover_popup(app: &JadeApp, flow_visible: bool, scroll_top: usize) -> Option<gpui::AnyElement> {
     let h: &HoverState = app.hover.as_ref()?;
     let theme = app.theme.clone();
+    let row = app.editor.active_tab().map(|t| t.display_row(h.row)).unwrap_or(h.row);
     let left = popup_x(h.col, flow_visible, app.char_w());
-    let top = popup_y(h.row, scroll_top);
+    let top = popup_y(row, scroll_top);
     Some(
         div()
             .absolute()

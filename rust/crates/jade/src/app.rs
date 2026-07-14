@@ -880,8 +880,16 @@ impl JadeApp {
     /// The flow analysis is single-file, so all targets are in the active tab.
     pub fn flow_goto(&mut self, line_1based: usize) {
         if line_1based >= 1 {
+            // Unfold anything hiding the target, then scroll in display space.
+            let display = match self.editor.active_tab_mut() {
+                Some(tab) => {
+                    tab.unfold_containing(line_1based - 1);
+                    tab.display_row(line_1based - 1)
+                }
+                None => line_1based - 1,
+            };
             self.code_scroll
-                .scroll_to_item(line_1based - 1, gpui::ScrollStrategy::Center);
+                .scroll_to_item(display, gpui::ScrollStrategy::Center);
         }
     }
 
@@ -1906,10 +1914,26 @@ impl JadeApp {
                 "c" => self.editor_copy(cx),
                 "x" => self.editor_cut(cx),
                 "v" => self.editor_paste(cx),
-                "left" => self.buf_move(|b, e| b.move_home(e), shift),
+                "left" => self.smart_home(shift),
                 "right" => self.buf_move(|b, e| b.move_end(e), shift),
                 "up" => self.buf_move(|b, e| b.move_doc_start(e), shift),
                 "down" => self.buf_move(|b, e| b.move_doc_end(e), shift),
+                "backspace" => {
+                    // ⌘⌫: delete the whole line(s) spanned by the selection.
+                    let r = self.with_edit(|b| {
+                        let sel = b.selection();
+                        let sr = b.offset_to_point(sel.start()).row;
+                        let er = b.offset_to_point(sel.end()).row;
+                        let start = b.point_to_offset(Point::new(sr, 0));
+                        let end = if er + 1 < b.line_count() {
+                            b.point_to_offset(Point::new(er + 1, 0))
+                        } else {
+                            b.len_bytes()
+                        };
+                        b.edit(start..end, "")
+                    });
+                    self.after_edit(r, cx);
+                }
                 _ => return false, // let ⌘P etc. bubble
             }
             return true;
@@ -1935,7 +1959,7 @@ impl JadeApp {
             "right" => self.buf_move(|b, e| b.move_right(e), shift),
             "up" => self.buf_move(|b, e| b.move_up(e), shift),
             "down" => self.buf_move(|b, e| b.move_down(e), shift),
-            "home" => self.buf_move(|b, e| b.move_home(e), shift),
+            "home" => self.smart_home(shift),
             "end" => self.buf_move(|b, e| b.move_end(e), shift),
             "pageup" => self.editor_page(-1, shift),
             "pagedown" => self.editor_page(1, shift),
@@ -1964,6 +1988,68 @@ impl JadeApp {
     }
 
     /// Apply a cursor-only motion to the active buffer, dismiss popups, follow.
+    /// Toggle the fold at `row` (a fold-map start). Folding a region that
+    /// contains the caret first hoists the caret to the fold's start line so
+    /// it never sits in a hidden row.
+    pub fn toggle_fold(&mut self, row: usize) {
+        let Some(tab) = self.editor.active_tab_mut() else {
+            return;
+        };
+        if !tab.fold_map.contains_key(&row) {
+            return;
+        }
+        if tab.folds.contains(&row) {
+            tab.folds.remove(&row);
+        } else {
+            if let Some(&end) = tab.fold_map.get(&row) {
+                let caret_row = tab.caret_point().row;
+                if caret_row > row && caret_row < end {
+                    let start = tab.buffer.point_to_offset(Point::new(row, 0));
+                    tab.buffer.set_caret(start);
+                }
+            }
+            tab.folds.insert(row);
+        }
+        self.caret_activity();
+    }
+
+    /// After any caret move/edit: if the caret landed inside a folded region
+    /// (arrow through a fold, undo, goto), unfold it so the caret stays visible.
+    fn unfold_at_caret(&mut self) {
+        if let Some(tab) = self.editor.active_tab_mut() {
+            let row = tab.caret_point().row;
+            tab.unfold_containing(row);
+        }
+    }
+
+    /// Line-aware Home (⌘←/Home): first press jumps to the text edge (first
+    /// non-whitespace char); pressing again from there goes to column 0.
+    fn smart_home(&mut self, extend: bool) {
+        self.dismiss_popups();
+        {
+            let Some(tab) = self.editor.active_tab_mut() else {
+                return;
+            };
+            let caret = tab.caret_point();
+            let line = tab.buffer.line(caret.row).into_owned();
+            let first_ns = line
+                .chars()
+                .position(|c| !c.is_whitespace())
+                .unwrap_or(0);
+            let target_col = if caret.col == first_ns { 0 } else { first_ns };
+            let byte = tab.buffer.point_to_offset(Point::new(caret.row, target_col));
+            if extend {
+                let anchor = tab.buffer.selection().anchor;
+                tab.buffer.set_selection(Selection::new(anchor, byte));
+            } else {
+                tab.buffer.set_caret(byte);
+            }
+        }
+        self.caret_activity();
+        self.scroll_caret_into_view();
+        self.sync_asm_selection();
+    }
+
     /// Any caret movement or edit: hold the caret solid for the next blink
     /// window so it never flickers while typing/navigating.
     fn caret_activity(&mut self) {
@@ -1975,6 +2061,7 @@ impl JadeApp {
         if let Some(tab) = self.editor.active_tab_mut() {
             f(&mut tab.buffer, extend);
         }
+        self.unfold_at_caret();
         self.caret_activity();
         self.completion = None;
         self.hover = None;
@@ -2018,6 +2105,7 @@ impl JadeApp {
     /// Shared post-edit bookkeeping: recompute eager decorations + arm debounces,
     /// forward an incremental `didChange`, follow the caret, wake the debounce.
     fn after_edit(&mut self, record: forge_buffer::EditRecord, cx: &mut Context<Self>) {
+        self.unfold_at_caret();
         self.caret_activity();
         let now = self.now_ms();
         let payload = self.editor.active_tab_mut().map(|tab| {
@@ -2092,7 +2180,8 @@ impl JadeApp {
         let Some(tab) = self.editor.active_tab() else {
             return;
         };
-        let row = tab.caret_point().row;
+        // Scroll space is DISPLAY rows (folds hide buffer rows).
+        let row = tab.display_row(tab.caret_point().row);
         let top = self.editor_scroll_top();
         let rows = (self.editor_rows.load(Ordering::Relaxed) as usize).max(1);
         if row < top {
@@ -3353,7 +3442,8 @@ impl EntityInputHandler for JadeApp {
         // Anchor at the caret cell, using the captured text-left and the row's
         // offset from the current scroll top (best-effort IME candidate position).
         let x = px(text_left + editor_view::col_to_px(p.col, cw));
-        let y = element_bounds.origin.y + px((p.row.saturating_sub(top)) as f32 * LINE_H);
+        let drow = tab.display_row(p.row);
+        let y = element_bounds.origin.y + px((drow.saturating_sub(top)) as f32 * LINE_H);
         Some(Bounds::new(
             gpui::point(x, y),
             gpui::size(px(2.0), px(LINE_H)),
