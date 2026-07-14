@@ -1200,6 +1200,7 @@ impl JadeApp {
         self.error_line = None; // clear any prior run's error line
         self.training.clear(); // ghost snapshot of the previous run
         self.mem.reset(); // reset run-memory state
+        self.output.clear(); // fresh OUTPUT scrollback per run
         self.output_visible = true;
         self.bottom_closing = false;
         self.bottom_view = BottomView::Output; // run output/exit status lands here
