@@ -13,6 +13,10 @@ gpui = { git = "https://github.com/zed-industries/zed" }
 # no text renders at all (bites every standalone GPUI consumer).
 gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit"] }
 forge-telemetry = { path = "../forge-telemetry" }
+forge-build = { path = "../forge-build" }
+forge-debug = { path = "../forge-debug" }
+forge-sysmon = { path = "../forge-sysmon" }
+forge-ai = { path = "../forge-ai" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
