@@ -46,6 +46,7 @@ mod prefs;
 mod registry;
 mod theme;
 mod training;
+mod wg3d;
 mod workspace_tree;
 
 use std::path::{Path, PathBuf};
@@ -145,6 +146,8 @@ fn main() {
             run_smoke_open(deps, target);
         } else if mode == "term" {
             run_smoke_term(runtime, deps);
+        } else if mode == "wg3d" {
+            run_smoke_wg3d(deps);
         } else {
             run_smoke(runtime, deps, app_rx, &mode);
         }
@@ -298,6 +301,111 @@ fn spawn_fs_watch(
 /// `--smoke term` (Phase-4 wave 2): create a real terminal with cwd = workspace
 /// root, type `printf hello-jade-term`, and poll snapshots until the text shows
 /// up in the grid (forge-term's own integration-test pattern). Prints a
+/// `--smoke wg3d` (deliverable §7): instantiate the 3D weight-grid module,
+/// feed 70 synthetic frames of a 32×32 buffer through its ring (asserting the
+/// ring caps at 64), project the default framed camera, and print a
+/// machine-readable line. No window; exercises the real telemetry apply feed.
+fn run_smoke_wg3d(deps: AppDeps) {
+    use crate::wg3d::{grid::build_bars, math};
+
+    let mut app = JadeApp::assemble(deps);
+
+    // 70 frames of a 32×32 buffer, streamed through the SAME apply path the GUI
+    // uses (Event::Tensor → app.wg3d.on_frame ring).
+    for step in 0..70i64 {
+        let data: Vec<f32> = (0..32 * 32)
+            .map(|i| ((i as f32) * 0.017 + step as f32 * 0.1).sin())
+            .collect();
+        app.apply_app_event(AppEvent::Telemetry(Event::Tensor {
+            name: "W".to_string(),
+            step,
+            rows: 32,
+            cols: 32,
+            src_rows: None,
+            src_cols: None,
+            dtype: "f32".to_string(),
+            data,
+        }));
+    }
+
+    // Ring must cap at 64 (independent of the training view's 32).
+    let ring_len = app.wg3d.frames_len();
+    if ring_len != 64 {
+        println!("[smoke] FAIL wg3d ring={ring_len} (expected 64)");
+        return;
+    }
+
+    // Open the overlay (selects "W") and build the current frame's bars.
+    app.wg3d.open(Some("W"));
+    let Some(bars) = app.wg3d.current_bars() else {
+        println!("[smoke] FAIL wg3d produced no bars");
+        return;
+    };
+    let n = bars.bars.len();
+
+    // Depth-sort the bars back-to-front and confirm the order is monotonic.
+    let view = app.wg3d.camera.view_matrix();
+    let mut depths: Vec<f32> = bars
+        .bars
+        .iter()
+        .map(|b| math::view_depth(&view, b.centroid()))
+        .collect();
+    depths.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let depth_sorted = depths.windows(2).all(|w| w[0] <= w[1]);
+
+    // Project the scene origin through the default framed camera.
+    let (w, h) = (1400.0f32, 862.0f32);
+    let proj = math::Mat4::perspective(app.wg3d.camera.fov_y, w / h, 0.1, 4000.0);
+    let mvp = proj.mul(&view);
+    let sample = math::project(&mvp, [0.0, 0.0, 0.0], w, h);
+
+    match sample {
+        Some(pr) if depth_sorted => println!(
+            "[smoke] wg3d bars={n} depth_sorted=ok proj_sample=<{:.1},{:.1}>",
+            pr.x, pr.y
+        ),
+        Some(_) => {
+            println!("[smoke] FAIL wg3d depth sort not monotonic");
+            return;
+        }
+        None => {
+            println!("[smoke] FAIL wg3d origin projected behind camera");
+            return;
+        }
+    }
+
+    // Perf probe: per-frame CPU cost of build (colormap+subsample) + depth sort
+    // at the interactive default (64×64) and the raised budget (128×128).
+    for dim in [64u32, 128] {
+        let data: Vec<f32> = (0..dim as usize * dim as usize)
+            .map(|i| ((i as f32) * 0.013).sin())
+            .collect();
+        let f = crate::training::TensorFrame {
+            step: 0,
+            rows: dim,
+            cols: dim,
+            src_rows: None,
+            src_cols: None,
+            data,
+        };
+        let t0 = std::time::Instant::now();
+        let g = build_bars(&f).expect("bars");
+        let mut ds: Vec<(f32, usize)> = g
+            .bars
+            .iter()
+            .enumerate()
+            .map(|(i, b)| (math::view_depth(&view, b.centroid()), i))
+            .collect();
+        ds.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        let us = t0.elapsed().as_micros();
+        println!(
+            "[smoke] wg3d perf {dim}x{dim}: build+sort {us}us ({} bars)",
+            g.bars.len()
+        );
+    }
+}
+
+
 /// machine-readable `[smoke] term ok cols=<c> rows=<r>` line.
 fn run_smoke_term(runtime: tokio::runtime::Runtime, deps: AppDeps) {
     runtime.block_on(async move {

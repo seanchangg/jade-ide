@@ -35,7 +35,7 @@ struct Label {
     color: u32,
 }
 
-pub fn render(app: &JadeApp, _cx: &mut Context<JadeApp>) -> impl IntoElement {
+pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> impl IntoElement {
     let theme = &app.theme;
     let grid = rgb(theme.grid_line).alpha(theme.grid_alpha);
 
@@ -43,7 +43,7 @@ pub fn render(app: &JadeApp, _cx: &mut Context<JadeApp>) -> impl IntoElement {
         .flex()
         .flex_col()
         .gap_2()
-        .child(section_header("TRAINING", theme));
+        .child(training_header(app, theme, cx));
 
     // ── Loss ──
     let (loss_series, loss_labels) = loss_data(app);
@@ -94,6 +94,35 @@ fn section_header(text: &str, theme: &Theme) -> impl IntoElement {
         .text_color(rgb(theme.accent))
         .text_xs()
         .child(text.to_string())
+}
+
+/// TRAINING header with the "3D" button (§7.1) that opens the weight-grid
+/// overlay (§7.2). The grid's ring already filled while hidden, so it shows the
+/// selected buffer's replay immediately.
+fn training_header(app: &JadeApp, theme: &Theme, cx: &mut Context<JadeApp>) -> impl IntoElement {
+    let has_buffers = !app.wg3d.buffer_names().is_empty();
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .child(section_header("TRAINING", theme))
+        .child(
+            div()
+                .id("wg3d-open")
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .text_xs()
+                .bg(rgb(theme.bg))
+                .text_color(rgb(if has_buffers { theme.accent } else { theme.muted }))
+                .cursor_pointer()
+                .on_click(cx.listener(|app, _e, _w, cx| {
+                    app.wg3d.open(None);
+                    cx.notify();
+                }))
+                .child("3D"),
+        )
 }
 
 fn section_label(text: &str, theme: &Theme) -> impl IntoElement {

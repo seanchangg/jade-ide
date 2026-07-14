@@ -42,6 +42,7 @@ use crate::prefs::TelemetryPrefs;
 use crate::registry::{key_of, TelemetryRegistry, DEFAULT_MAX_DIM};
 use crate::theme::Theme;
 use crate::training::{TensorFrame, TrainingData};
+use crate::wg3d::WeightGrid3D;
 use crate::workspace_tree::FileTree;
 
 /// Which view the bottom panel shows. The TERMINAL view is a live shell; the
@@ -117,6 +118,9 @@ pub struct JadeApp {
     pub training: TrainingData,
     pub prefs: TelemetryPrefs,
     pub theme: Theme,
+    /// 3D weight-grid overlay (§7.2). Owns its own 64-frame ring per buffer,
+    /// fed from the telemetry apply path below and rendered only while visible.
+    pub wg3d: WeightGrid3D,
 
     // ── Phase-3 engine handles ────────────────────────────────────────────────
     engine: Arc<BuildEngine>,
@@ -256,6 +260,7 @@ impl JadeApp {
             training: TrainingData::new(),
             prefs: TelemetryPrefs::load(),
             theme: Theme::forge_dark(),
+            wg3d: WeightGrid3D::new(),
 
             engine: deps.engine,
             ai: deps.ai,
@@ -861,17 +866,18 @@ impl JadeApp {
                 if out.pref_enabled {
                     self.push_track(Kind::Buffer, &name, true);
                 }
-                self.training.push_tensor(
-                    &name,
-                    TensorFrame {
-                        step,
-                        rows,
-                        cols,
-                        src_rows,
-                        src_cols,
-                        data,
-                    },
-                );
+                let frame = TensorFrame {
+                    step,
+                    rows,
+                    cols,
+                    src_rows,
+                    src_cols,
+                    data,
+                };
+                // §7.2 event feed: the 3D grid keeps its OWN 64-frame ring per
+                // buffer, filled from the same apply path even while hidden.
+                self.wg3d.on_frame(&name, frame.clone());
+                self.training.push_tensor(&name, frame);
                 self.tensors_seen += 1;
                 if self.demo && (self.tensors_seen == 1 || self.tensors_seen % 25 == 0) {
                     println!(
@@ -921,7 +927,7 @@ fn meta_dims(meta: Option<&Map<String, Value>>) -> (Option<u32>, Option<u32>) {
 // ── Layout ───────────────────────────────────────────────────────────────────
 
 impl Render for JadeApp {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme.clone();
 
         // Create the terminal (and its focus handle) on first show of the strip.
@@ -958,8 +964,28 @@ impl Render for JadeApp {
         if self.output_visible {
             root = root.child(bottom_panel(self, cx, &theme, term_handle));
         }
-        root.child(memory_bar(self, &theme))
-            .child(status_strip(self, &theme))
+        let mut root = root
+            .child(memory_bar(self, &theme))
+            .child(status_strip(self, &theme));
+
+        // §7.2 open/close hook: while visible, overlay the full-window 3D grid
+        // on top of everything and hand it keyboard focus (for Esc).
+        if self.wg3d.visible {
+            let focus = crate::wg3d::render::ensure_focus(self, cx);
+            if !focus.is_focused(window) {
+                focus.focus(window, cx);
+            }
+            let vp = window.viewport_size();
+            let overlay = crate::wg3d::render::overlay(
+                self,
+                focus,
+                f32::from(vp.width),
+                f32::from(vp.height),
+                cx,
+            );
+            root = root.child(overlay);
+        }
+        root
     }
 }
 
