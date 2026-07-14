@@ -7,13 +7,15 @@
 //! `JadeApp::active_file`.
 //!
 //! ## Highlight invalidation choice
-//! On every text change we re-highlight the **whole file** (`rehighlight`). At the
-//! single-source-file scale Jade targets (a few thousand lines) a full tree-sitter
-//! reparse is sub-millisecond and keeps the code path trivially correct — there is
-//! no incremental-edit bookkeeping to get wrong. Tree-sitter's incremental `edit`
-//! API would let us reparse only the touched range, but the win is negligible here
-//! and the complexity (byte/point deltas fed to `Tree::edit`) is not worth it yet;
-//! this is the documented, deliberate choice.
+//! On every text change we re-highlight the **whole file** (`rehighlight`) with a
+//! per-tab **cached** [`highlight::Highlighter`] — compiling the tree-sitter query
+//! is ~20ms and doing it per keystroke was the editor's typing latency (measured
+//! 73ms/keystroke on a 1.1k-line file; ~7ms debug / ~1ms release after caching +
+//! opt-level-2 deps — see the `perf_probe` test). At the single-source-file scale
+//! Jade targets this keeps the code path trivially correct with no
+//! incremental-edit bookkeeping. Tree-sitter's incremental `edit` API (reparse
+//! only the touched range) is the next lever if large files ever hurt; this is
+//! the documented, deliberate choice.
 //!
 //! ## Decoration debounces (inventory §10)
 //! Highlighting + the cheap static size scan run immediately on edit (needed for a
@@ -75,6 +77,10 @@ pub struct OpenTab {
     /// Debounce for the symbol-outline recompute (§10: 800ms).
     pub struct_debounce: Debounce,
     palette: TokenPalette,
+    /// Compiled highlighter reused across edits. Building one compiles the
+    /// tree-sitter query from source (~20ms) — doing that per keystroke was
+    /// the editor's typing latency. `None` for non-highlightable files.
+    highlighter: Option<highlight::Highlighter>,
 }
 
 impl OpenTab {
@@ -89,7 +95,13 @@ impl OpenTab {
     pub fn from_text(path: &Path, text: &str, palette: TokenPalette) -> OpenTab {
         let buffer = Buffer::from_text(text);
         let highlightable = highlight::is_highlightable(path);
-        let highlights = highlight::highlight_file(path, text, palette);
+        let highlighter = highlightable
+            .then(|| highlight::Highlighter::new_cpp(palette).ok())
+            .flatten();
+        let highlights = match &highlighter {
+            Some(h) => h.highlight(text),
+            None => highlight::highlight_file(path, text, palette),
+        };
         let (sizes, flow, symbols) = if highlightable {
             (
                 size_annotations::collect_size_annotations(text),
@@ -117,6 +129,7 @@ impl OpenTab {
             flow_debounce: Debounce::new(FLOW_DEBOUNCE_MS),
             struct_debounce: Debounce::new(STRUCT_DEBOUNCE_MS),
             palette,
+            highlighter,
         }
     }
 
@@ -153,12 +166,19 @@ impl OpenTab {
     /// Full-file re-highlight (see the module-level invalidation note).
     pub fn rehighlight(&mut self) {
         let text = self.buffer.to_string();
-        self.highlights = highlight::highlight_file(&self.path, &text, self.palette);
+        self.highlights = match &self.highlighter {
+            Some(h) => h.highlight(&text),
+            None => highlight::highlight_file(&self.path, &text, self.palette),
+        };
     }
 
-    /// Swap the token palette (theme toggle, §4.2) and re-highlight this tab.
+    /// Swap the token palette (theme toggle, §4.2): rebuild the cached
+    /// highlighter (capture→color table is baked in) and re-highlight.
     pub fn set_palette(&mut self, palette: TokenPalette) {
         self.palette = palette;
+        if self.highlighter.is_some() {
+            self.highlighter = highlight::Highlighter::new_cpp(palette).ok();
+        }
         self.rehighlight();
     }
 
@@ -924,5 +944,46 @@ mod tests {
         assert!(runs[1].1.selected && runs[1].1.color == Some(0x111111));
         assert_eq!(runs[3].0, 4..5);
         assert!(runs[3].1.selected && runs[3].1.underline == Some(0xff0000));
+    }
+}
+/// Typing-latency probe (kept `#[ignore]`d; run explicitly when touching the
+/// edit hot path): `cargo test -p jade perf_probe -- --ignored --nocapture`.
+/// Point `PERF_FILE` at a real source file, else a synthetic 1.1k-line C++
+/// file is generated. History: 73ms/keystroke (query recompiled per edit +
+/// unoptimized deps) → 7ms debug / ~1ms release after caching the compiled
+/// highlighter and opt-level 2 deps. Next lever if large files hurt:
+/// tree-sitter incremental parse (`Tree::edit` + old-tree reparse).
+#[cfg(test)]
+mod perf_probe {
+    use std::time::Instant;
+
+    #[test]
+    #[ignore]
+    fn keystroke_cost_on_real_file() {
+        let text = std::env::var("PERF_FILE")
+            .ok()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .unwrap_or_else(|| {
+                (0..1100)
+                    .map(|i| format!("static int value_{i} = {i} * 42; // filler\n"))
+                    .collect()
+            });
+        let path = std::path::PathBuf::from("/x/perf.cpp");
+        let mut tab = crate::editor_view::OpenTab::from_text(
+            &path,
+            &text,
+            crate::highlight::TokenPalette::forge_dark(),
+        );
+        // Simulate 10 keystrokes at a middle line: insert char + eager bookkeeping.
+        let mid = tab.buffer.point_to_offset(forge_buffer::Point::new(500, 0));
+        tab.buffer.set_caret(mid);
+        let t0 = Instant::now();
+        for i in 0..10 {
+            tab.buffer.type_char('x');
+            let t = Instant::now();
+            tab.on_edited(i);
+            println!("on_edited: {:?}", t.elapsed());
+        }
+        println!("10 keystrokes total: {:?}", t0.elapsed());
     }
 }
