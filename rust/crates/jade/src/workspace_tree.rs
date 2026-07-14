@@ -12,8 +12,15 @@
 //!
 //! Lazy loading: the initial scan materializes **3 levels**; expanding an
 //! unloaded directory loads **1 more level** (§5.1). A directory whose children
-//! are `None` is an unloaded placeholder. No fs watching yet (Phase-4 wave 2).
+//! are `None` is an unloaded placeholder.
+//!
+//! FS watching (Phase-4 wave 2, §5.1): the app watches the workspace root
+//! recursively (the `notify` crate, wired in `main.rs`), filters events through
+//! [`is_watch_relevant`] (the same ignore rules), and debounces bursts 250ms via
+//! [`WatchDebounce`] before a single tree refresh. [`FileTree::refresh`] re-scans
+//! while preserving the set of expanded directories by path.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 /// Directory names never shown (`workspace.ts:6-10`).
@@ -131,6 +138,148 @@ impl FileTree {
     /// expansion. Returns true if a matching directory was found and toggled.
     pub fn toggle_dir(&mut self, path: &Path) -> bool {
         toggle_in(&mut self.roots, path)
+    }
+
+    /// The set of currently-expanded directory paths (Phase-4 wave 2: captured
+    /// before an fs-watch refresh so expansion survives a re-scan).
+    pub fn expanded_paths(&self) -> HashSet<PathBuf> {
+        let mut set = HashSet::new();
+        collect_expanded(&self.roots, &mut set);
+        set
+    }
+
+    /// Re-scan the root (to the initial depth) and re-apply the previously
+    /// expanded directories, loading beyond the initial depth as needed so a
+    /// deeply-expanded subtree is restored. Used by the debounced fs-watch
+    /// refresh (§5.1). Directories that vanished simply drop out; new ones appear
+    /// collapsed. Open editor tabs are intentionally left untouched (a deleted
+    /// file keeps its tab — the read-only viewer already holds its contents).
+    pub fn refresh(&mut self) {
+        let expanded = self.expanded_paths();
+        self.roots = scan_dir(&self.root, true, INITIAL_DEPTH);
+        // Apply shallow-first so an ancestor is loaded before its descendants.
+        let mut paths: Vec<PathBuf> = expanded.into_iter().collect();
+        paths.sort_by_key(|p| p.components().count());
+        for p in paths {
+            reexpand(&mut self.roots, &p);
+        }
+    }
+}
+
+fn collect_expanded(nodes: &[FileNode], out: &mut HashSet<PathBuf>) {
+    for n in nodes {
+        if n.is_dir && n.expanded {
+            out.insert(n.path.clone());
+        }
+        if let Some(children) = &n.children {
+            collect_expanded(children, out);
+        }
+    }
+}
+
+/// Descend toward `path`, lazily loading directories along the way, and mark the
+/// target directory expanded. Returns true if `path` was found.
+fn reexpand(nodes: &mut [FileNode], path: &Path) -> bool {
+    for n in nodes.iter_mut() {
+        if n.path == path {
+            if n.is_dir {
+                n.ensure_loaded();
+                n.expanded = true;
+            }
+            return true;
+        }
+        if n.is_dir && path.starts_with(&n.path) {
+            n.ensure_loaded();
+            if let Some(children) = &mut n.children {
+                if reexpand(children, path) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// True if a changed path is one the tree would display — i.e. no path component
+/// is an ignored directory / hidden dotfile / `.dSYM` bundle, and the leaf's
+/// extension is not an ignored build-artifact type. Used to drop the FSEvents
+/// bursts that build artifacts (`.o`, `cmake-build-forge/…`) generate (§5.1).
+pub fn is_watch_relevant(path: &Path) -> bool {
+    let mut comps = path.components().peekable();
+    while let Some(comp) = comps.next() {
+        let os = comp.as_os_str();
+        let name = os.to_string_lossy();
+        let is_leaf = comps.peek().is_none();
+        // A path component that is a normal name (skip `/`, `.`, `..`).
+        if matches!(
+            comp,
+            std::path::Component::RootDir
+                | std::path::Component::CurDir
+                | std::path::Component::ParentDir
+                | std::path::Component::Prefix(_)
+        ) {
+            continue;
+        }
+        if IGNORED_DIRS.contains(&name.as_ref()) {
+            return false;
+        }
+        if name.starts_with('.') && name != ".forge" {
+            return false;
+        }
+        if name.ends_with(".dSYM") {
+            return false;
+        }
+        if is_leaf {
+            if let Some(dot) = name.rfind('.') {
+                let ext = name[dot..].to_ascii_lowercase();
+                if IGNORED_EXTENSIONS.contains(&ext.as_str()) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Debounce state for coalescing fs-watch bursts (the pure part of the 250ms
+/// refresh, §5.1). Operates on a monotonic millisecond clock passed in by the
+/// caller so it is deterministic to test; the async wiring supplies
+/// `Instant::elapsed`-derived millis.
+#[derive(Debug, Clone)]
+pub struct WatchDebounce {
+    window_ms: u64,
+    pending: bool,
+    last_event_ms: u64,
+}
+
+impl WatchDebounce {
+    pub fn new(window_ms: u64) -> Self {
+        WatchDebounce {
+            window_ms,
+            pending: false,
+            last_event_ms: 0,
+        }
+    }
+
+    /// Record a relevant change at `now_ms`; arms/extends the debounce window.
+    pub fn on_event(&mut self, now_ms: u64) {
+        self.pending = true;
+        self.last_event_ms = now_ms;
+    }
+
+    /// If a refresh is due (armed and the window has elapsed since the last
+    /// event), consume the pending flag and return true. Otherwise false.
+    pub fn poll(&mut self, now_ms: u64) -> bool {
+        if self.pending && now_ms.saturating_sub(self.last_event_ms) >= self.window_ms {
+            self.pending = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn is_pending(&self) -> bool {
+        self.pending
     }
 }
 
@@ -410,5 +559,81 @@ mod tests {
         tree.toggle_dir(&src_path);
         let rows = tree.visible_rows();
         assert!(rows.iter().any(|r| r.name == "core.cc" && r.depth == 1));
+    }
+
+    #[test]
+    fn watch_relevance_filters_ignored_paths() {
+        let root = Path::new("/proj");
+        // Kept.
+        assert!(is_watch_relevant(&root.join("src/main.cpp")));
+        assert!(is_watch_relevant(&root.join("util.h")));
+        assert!(is_watch_relevant(&root.join(".forge/workspace.json"))); // exception
+        // Dropped: ignored dir component, build-artifact ext, dotfile, dSYM.
+        assert!(!is_watch_relevant(&root.join("cmake-build-forge/out.o")));
+        assert!(!is_watch_relevant(&root.join("node_modules/x/index.js")));
+        assert!(!is_watch_relevant(&root.join("src/main.o")));
+        assert!(!is_watch_relevant(&root.join(".git/HEAD")));
+        assert!(!is_watch_relevant(&root.join("app.dSYM/Contents")));
+        assert!(!is_watch_relevant(&root.join("lib.dylib")));
+    }
+
+    #[test]
+    fn debounce_coalesces_and_fires_after_window() {
+        let mut d = WatchDebounce::new(250);
+        assert!(!d.is_pending());
+        assert!(!d.poll(0), "nothing pending → no fire");
+
+        // A burst of events at t=0,100,200 keeps extending the window.
+        d.on_event(0);
+        assert!(d.is_pending());
+        assert!(!d.poll(100), "only 100ms since last event");
+        d.on_event(100);
+        d.on_event(200);
+        assert!(!d.poll(300), "only 100ms since the last (t=200) event");
+
+        // 250ms after the final event → fires exactly once, then disarms.
+        assert!(d.poll(450), "250ms elapsed since t=200");
+        assert!(!d.is_pending());
+        assert!(!d.poll(999), "already consumed");
+
+        // A fresh event re-arms.
+        d.on_event(1000);
+        assert!(d.poll(1300));
+    }
+
+    #[test]
+    fn refresh_preserves_expansion_and_picks_up_new_files() {
+        let dir = temp_fixture();
+        // Build a subtree beyond the initial depth and expand into it.
+        let deep = dir.0.join("l1").join("l2").join("l3");
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(deep.join("a.cpp"), "").unwrap();
+
+        let mut tree = FileTree::scan(dir.0.clone());
+        let src_path = tree.roots.iter().find(|n| n.name == "src").unwrap().path.clone();
+        let l3_path = deep.clone();
+        tree.toggle_dir(&src_path); // expand src
+        tree.toggle_dir(&dir.0.join("l1")); // expand the chain down to the
+        tree.toggle_dir(&dir.0.join("l1").join("l2")); // deep (initially
+        tree.toggle_dir(&l3_path); // unloaded) directory
+
+        let expanded_before = tree.expanded_paths();
+        assert!(expanded_before.contains(&src_path));
+        assert!(expanded_before.contains(&l3_path));
+
+        // Simulate an fs change: a new file appears under src.
+        fs::write(dir.0.join("src").join("new.cpp"), "").unwrap();
+        tree.refresh();
+
+        // Expansion survived the re-scan.
+        let expanded_after = tree.expanded_paths();
+        assert!(expanded_after.contains(&src_path), "src still expanded");
+        assert!(expanded_after.contains(&l3_path), "deep dir still expanded");
+
+        // The new file is now visible under the (still-expanded) src.
+        let rows = tree.visible_rows();
+        assert!(rows.iter().any(|r| r.name == "new.cpp" && r.depth == 1));
+        // And the deep file is still reachable (subtree reloaded).
+        assert!(rows.iter().any(|r| r.name == "a.cpp"));
     }
 }

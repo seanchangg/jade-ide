@@ -13,6 +13,7 @@
 //!   cargo run -p jade -- --project dir/        # first .cpp/.cc/.mm in dir
 //!   cargo run -p jade -- --train ../probe      # launch the probe demo program
 //!   cargo run -p jade -- --project dir --smoke build-run   # headless verify
+//!   cargo run -p jade -- --project dir --smoke term        # headless PTY check
 //!
 //! Repo root (for the engine's native-source dirs) is resolved at runtime from
 //! `JADE_REPO_ROOT`, falling back to `CARGO_MANIFEST_DIR/../../..` (the
@@ -27,7 +28,8 @@
 //!   output      — output-panel scrollback + ANSI strip (§6)
 //!   memory_bar  — memory-bar model + threshold classification (§5.3)
 //!   app         — window layout + unified event pump + action handlers (§2, §6)
-//!   panels      — training_view + telemetry_sidebar renderers
+//!   panels      — file_tree / code_view / training_view / telemetry_sidebar,
+//!                 plus Phase-4 wave 2: terminal_panel (§5.2) + runtime_panel (§5.4)
 
 // Phase-2 shell helpers (deferred pref setters, some TrainingData helpers) are
 // deliberately present ahead of full wiring.
@@ -53,12 +55,14 @@ use forge_ai::InlineCompletionBackend;
 use forge_build::{BuildEngine, EngineConfig};
 use forge_sysmon::SystemMonitor;
 use forge_telemetry::{Event, TelemetryServer};
+use forge_term::TermManager;
 use gpui::{px, size, App, AppContext, Bounds, WindowBounds, WindowOptions};
 use gpui_platform::application;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use app::{AppDeps, AppEvent, JadeApp};
+use workspace_tree::{is_watch_relevant, WatchDebounce};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -86,13 +90,32 @@ fn main() {
         sysmon.start(); // SystemMonitor runs from app start
     }
 
+    // ── Terminal engine (§5.2) ────────────────────────────────────────────────
+    let term = Arc::new(TermManager::new());
+    let term_events = term.take_events();
+
     // ── Unified event channel + source forwarders (deliverable §1) ────────────
     let (app_tx, app_rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
     spawn_forwarders(&handle, app_tx.clone(), tel_events, &sysmon, &ai);
 
+    // Forward terminal events (Damaged/Exited) onto the unified pump.
+    if let Some(mut trx) = term_events {
+        let tx = app_tx.clone();
+        handle.spawn(async move {
+            while let Some(ev) = trx.recv().await {
+                if tx.send(AppEvent::Term(ev)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
     let active_file = resolve_active_file(&args);
     let workspace_root = resolve_workspace_root(&args, active_file.as_deref(), &root);
     let demo = args.iter().any(|a| a == "--train");
+
+    // ── FS-watch: debounced tree refresh (§5.1) ───────────────────────────────
+    let watcher = spawn_fs_watch(&workspace_root, &handle, app_tx.clone());
 
     println!("FORGE_TELEMETRY_SOCK={}", socket.display());
     println!("repo root: {}", root.display());
@@ -105,6 +128,7 @@ fn main() {
         engine,
         ai,
         sysmon,
+        term: term.clone(),
         runtime: handle.clone(),
         app_tx,
         active_file,
@@ -119,14 +143,19 @@ fn main() {
             // `--smoke open <file>`: drive the real tab/highlight path headlessly.
             let target = arg_value(&args, "open").map(PathBuf::from);
             run_smoke_open(deps, target);
+        } else if mode == "term" {
+            run_smoke_term(runtime, deps);
         } else {
             run_smoke(runtime, deps, app_rx, &mode);
         }
         return;
     }
 
-    // Keep the runtime alive on a background thread (GUI path).
-    std::thread::spawn(move || runtime.block_on(std::future::pending::<()>()));
+    // Keep the runtime + fs-watcher alive on a background thread (GUI path).
+    std::thread::spawn(move || {
+        let _watcher = watcher; // hold the watcher for the process lifetime
+        runtime.block_on(std::future::pending::<()>())
+    });
 
     // Optionally launch the probe's test training program against ourselves.
     maybe_launch_train(&args, &socket);
@@ -185,6 +214,123 @@ fn spawn_forwarders(
             if tx.send(AppEvent::Ai(arx.borrow().clone())).is_err() {
                 break;
             }
+        }
+    });
+}
+
+/// Watch the workspace root recursively (Phase-4 wave 2, §5.1). Raw notify
+/// callbacks are filtered through the tree's ignore rules
+/// ([`is_watch_relevant`]) and debounced 250ms ([`WatchDebounce`]) on the tokio
+/// runtime; each settled burst emits one [`AppEvent::TreeChanged`], which the
+/// app answers with an expansion-preserving re-scan. Returns the watcher, which
+/// must be kept alive for the process lifetime; `None` (with a stderr note) if
+/// the watch could not be established — the tree simply stops auto-refreshing.
+fn spawn_fs_watch(
+    root: &Path,
+    handle: &Handle,
+    app_tx: UnboundedSender<AppEvent>,
+) -> Option<notify::RecommendedWatcher> {
+    use notify::{RecursiveMode, Watcher};
+
+    let (raw_tx, mut raw_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    // Judge relevance on the path *relative to the root* so a dot-directory or
+    // otherwise-ignored ancestor of the workspace root can't drop everything.
+    let rel_root = root.to_path_buf();
+    let watcher = notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
+        if let Ok(ev) = res {
+            // Only changes the tree would display; drops `.o`/build-dir bursts.
+            let relevant = ev
+                .paths
+                .iter()
+                .any(|p| is_watch_relevant(p.strip_prefix(&rel_root).unwrap_or(p)));
+            if relevant {
+                let _ = raw_tx.send(());
+            }
+        }
+    });
+    let mut watcher = match watcher {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("[jade] fs-watch unavailable: {e}");
+            return None;
+        }
+    };
+    if let Err(e) = watcher.watch(root, RecursiveMode::Recursive) {
+        eprintln!("[jade] fs-watch failed for {}: {e}", root.display());
+        return None;
+    }
+
+    // Debounce loop: WatchDebounce holds the pure 250ms-window logic; this task
+    // supplies the clock and the channel plumbing.
+    handle.spawn(async move {
+        let start = std::time::Instant::now();
+        let mut deb = WatchDebounce::new(250);
+        loop {
+            if deb.is_pending() {
+                // Poll for more events in short slices so the window can lapse.
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(50),
+                    raw_rx.recv(),
+                )
+                .await
+                {
+                    Ok(Some(())) => deb.on_event(start.elapsed().as_millis() as u64),
+                    Ok(None) => break, // watcher dropped
+                    Err(_) => {}       // timeout slice — just re-check the window
+                }
+                if deb.poll(start.elapsed().as_millis() as u64)
+                    && app_tx.send(AppEvent::TreeChanged).is_err()
+                {
+                    break;
+                }
+            } else {
+                match raw_rx.recv().await {
+                    Some(()) => deb.on_event(start.elapsed().as_millis() as u64),
+                    None => break,
+                }
+            }
+        }
+    });
+
+    Some(watcher)
+}
+
+/// `--smoke term` (Phase-4 wave 2): create a real terminal with cwd = workspace
+/// root, type `printf hello-jade-term`, and poll snapshots until the text shows
+/// up in the grid (forge-term's own integration-test pattern). Prints a
+/// machine-readable `[smoke] term ok cols=<c> rows=<r>` line.
+fn run_smoke_term(runtime: tokio::runtime::Runtime, deps: AppDeps) {
+    runtime.block_on(async move {
+        let term = deps.term.clone();
+        let id = match term.create(&deps.workspace_root) {
+            Ok(id) => id,
+            Err(e) => {
+                println!("[smoke] FAIL term: {e}");
+                return;
+            }
+        };
+        term.write(id, b"printf 'hello-jade-term\\n'\n");
+
+        // Generous timeout: shell startup (user dotfiles) can be slow.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut ok = false;
+        let (mut cols, mut rows) = (0usize, 0usize);
+        while std::time::Instant::now() < deadline {
+            if let Some(snap) = term.snapshot(id) {
+                cols = snap.cols;
+                rows = snap.rows;
+                if snap.contains_text("hello-jade-term") {
+                    ok = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        term.destroy(id);
+        if ok {
+            println!("[smoke] term ok cols={cols} rows={rows}");
+        } else {
+            println!("[smoke] FAIL term: text never appeared in the grid");
         }
     });
 }

@@ -17,6 +17,12 @@ forge-build = { path = "../forge-build" }
 forge-debug = { path = "../forge-debug" }
 forge-sysmon = { path = "../forge-sysmon" }
 forge-ai = { path = "../forge-ai" }
+# Headless terminal engine (PTY + alacritty grid state machine); Jade renders
+# its GridSnapshots in the bottom TERMINAL strip (Phase-4 wave 2, §5.2).
+forge-term = { path = "../forge-term" }
+# Cross-platform filesystem watcher for the file-tree auto-refresh (§5.1); the
+# recommended backend (FSEvents on macOS) is debounced 250ms in app wiring.
+notify = "8"
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

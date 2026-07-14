@@ -93,6 +93,8 @@ pub struct MemoryBarState {
     pub leak_count: i64,
     /// Total alloc events seen — used to decide "has program data yet".
     pub alloc_count: i64,
+    /// Total free events seen (runtime panel MEMORY section, §5.4).
+    pub free_count: i64,
     /// Per `file:line` cumulative allocated bytes (AllocBatch roll-up).
     pub per_line: std::collections::HashMap<String, i64>,
 }
@@ -127,6 +129,7 @@ impl MemoryBarState {
                         }
                         AllocKind::Free => {
                             self.heap_used -= e.size;
+                            self.free_count += 1;
                         }
                     }
                     if self.heap_used > self.peak_allocation {
@@ -139,6 +142,7 @@ impl MemoryBarState {
                 current_heap,
                 peak_heap,
                 alloc_count,
+                free_count,
                 ..
             } => {
                 // The interposer summary is authoritative for heap/peak.
@@ -148,6 +152,9 @@ impl MemoryBarState {
                 }
                 if *alloc_count > self.alloc_count {
                     self.alloc_count = *alloc_count;
+                }
+                if *free_count > self.free_count {
+                    self.free_count = *free_count;
                 }
                 Some((*current_heap).max(0) as f64)
             }

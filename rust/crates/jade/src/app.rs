@@ -14,8 +14,9 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use forge_ai::{AiState, AiStatus, InlineCompletionBackend};
 use forge_build::{
@@ -24,7 +25,8 @@ use forge_build::{
 use forge_debug::{DebugEvent, LldbDriver};
 use forge_sysmon::{SystemMonitor, SystemStats};
 use forge_telemetry::{Event, Kind, TelemetryServer};
-use gpui::{div, prelude::*, px, rgb, Context, Window};
+use forge_term::{GridSnapshot, TermEvent, TermId, TermManager};
+use gpui::{div, prelude::*, px, rgb, Context, FocusHandle, Window};
 use serde_json::{Map, Value};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -34,12 +36,22 @@ use crate::editor_view::EditorState;
 use crate::highlight::TokenPalette;
 use crate::memory_bar::{project, Level, MemoryBarState};
 use crate::output::push_output;
-use crate::panels::{code_view, file_tree, telemetry_sidebar, training_view};
+use crate::panels::runtime_panel::{self, RunRecord};
+use crate::panels::{code_view, file_tree, telemetry_sidebar, terminal_panel, training_view};
 use crate::prefs::TelemetryPrefs;
 use crate::registry::{key_of, TelemetryRegistry, DEFAULT_MAX_DIM};
 use crate::theme::Theme;
 use crate::training::{TensorFrame, TrainingData};
 use crate::workspace_tree::FileTree;
+
+/// Which view the bottom panel shows. The TERMINAL view is a live shell; the
+/// OUTPUT view is the plain `[forge]`/build/run scrollback fallback (see
+/// `terminal_panel` for why status lines can't be injected into the shell grid).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BottomView {
+    Terminal,
+    Output,
+}
 
 /// The single unified event type crossing into the app pump. Every async source
 /// (deliverable §1) is one of these variants, so burst-coalescing and the
@@ -61,6 +73,12 @@ pub enum AppEvent {
     Sys(SystemStats),
     /// An AI backend status change.
     Ai(AiStatus),
+    /// A terminal event from `forge-term` (grid damaged → re-snapshot; child
+    /// exited → dim `[exited <code>]`). Phase-4 wave 2, §5.2.
+    Term(TermEvent),
+    /// The workspace file tree changed on disk (debounced fs-watch, §5.1) — the
+    /// app re-scans preserving expansion. Carries nothing; the refresh reads disk.
+    TreeChanged,
 }
 
 /// Everything [`JadeApp`] needs from `main` to be constructed — kept as one
@@ -70,6 +88,9 @@ pub struct AppDeps {
     pub engine: Arc<BuildEngine>,
     pub ai: Arc<InlineCompletionBackend>,
     pub sysmon: Arc<SystemMonitor>,
+    /// Headless terminal engine (bottom TERMINAL strip, §5.2). Shared behind an
+    /// `Arc`; its events are forwarded onto [`AppEvent::Term`] in `main.rs`.
+    pub term: Arc<TermManager>,
     /// Handle to the tokio runtime; button handlers spawn engine futures here.
     pub runtime: Handle,
     /// The write end of the unified event channel — cloned into every future.
@@ -104,8 +125,30 @@ pub struct JadeApp {
     runtime: Handle,
     app_tx: UnboundedSender<AppEvent>,
     repo_root: PathBuf,
+    /// Root the file tree scans + the cwd new terminals spawn in.
+    workspace_root: PathBuf,
     /// LLDB driver, constructed lazily on the first Debug (deliverable §2).
     driver: Option<Arc<AsyncMutex<LldbDriver>>>,
+
+    // ── Terminal panel (§5.2) ─────────────────────────────────────────────────
+    /// Shared terminal engine (also held in `AppDeps` for the event forwarder).
+    pub term: Arc<TermManager>,
+    /// The single visible terminal instance, created on first show.
+    pub term_id: Option<TermId>,
+    /// Latest grid snapshot (refreshed on `Damaged`; rendered by the panel).
+    pub term_snapshot: Option<GridSnapshot>,
+    /// Set once the child exits — renders the dim `[exited <code>]` line.
+    pub term_exited: bool,
+    pub term_exit_code: Option<i32>,
+    /// True if PTY allocation failed — stop retrying, show a message.
+    term_failed: bool,
+    /// Last cols/rows applied by the resize canvas (packed `cols<<16 | rows`),
+    /// so we only `resize()` when the derived geometry actually changed.
+    pub term_last_size: Arc<AtomicU32>,
+    /// Focus handle for the terminal (created lazily in render; None headless).
+    pub term_focus: Option<FocusHandle>,
+    /// Which view the bottom panel shows (TERMINAL vs OUTPUT scrollback).
+    pub bottom_view: BottomView,
 
     // ── Code-viewing vertical (deliverables §1-§5) ────────────────────────────
     /// Scanned workspace file tree (left panel). `None` if the root is unreadable.
@@ -122,6 +165,24 @@ pub struct JadeApp {
     last_sanitize: bool,
     last_instrument: bool,
     pub last_run: Option<RunStatus>,
+
+    // ── Runtime panel state (§5.4) ────────────────────────────────────────────
+    /// Whether the RUNTIME panel is shown (toggled by the Runtime chip).
+    pub runtime_visible: bool,
+    /// Wall-clock start of the in-flight run (drives the live SPEED tick).
+    pub run_started: Option<Instant>,
+    /// 1-based counter of completed runs.
+    pub run_counter: usize,
+    /// Last 10 completed runs (most recent last), for HISTORY.
+    pub run_history: Vec<RunRecord>,
+    /// Fastest completed run so far (ms).
+    pub best_run_ms: Option<u128>,
+    /// True when the most recent run beat the previous best.
+    pub last_was_best: bool,
+    /// Signed delta (ms) of the last run vs the run before it.
+    pub last_delta_ms: Option<i128>,
+    /// The last run's per-line execution counts (HOTSPOTS source).
+    pub last_executed: HashMap<u32, u32>,
 
     // ── Output panel + memory bar ─────────────────────────────────────────────
     pub output: Vec<String>,
@@ -202,7 +263,18 @@ impl JadeApp {
             runtime: deps.runtime,
             app_tx: deps.app_tx,
             repo_root: deps.repo_root,
+            workspace_root: deps.workspace_root,
             driver: None,
+
+            term: deps.term,
+            term_id: None,
+            term_snapshot: None,
+            term_exited: false,
+            term_exit_code: None,
+            term_failed: false,
+            term_last_size: Arc::new(AtomicU32::new(0)),
+            term_focus: None,
+            bottom_view: BottomView::Terminal,
 
             tree,
             editor,
@@ -215,6 +287,15 @@ impl JadeApp {
             last_sanitize: false,
             last_instrument: false,
             last_run: None,
+
+            runtime_visible: false,
+            run_started: None,
+            run_counter: 0,
+            run_history: Vec::new(),
+            best_run_ms: None,
+            last_was_best: false,
+            last_delta_ms: None,
+            last_executed: HashMap::new(),
 
             output: Vec::new(),
             output_visible: true,
@@ -257,7 +338,83 @@ impl JadeApp {
             AppEvent::Debug(ev) => self.on_debug_event(ev),
             AppEvent::Sys(stats) => self.sys_stats = stats,
             AppEvent::Ai(status) => self.ai_status = status,
+            AppEvent::Term(ev) => self.on_term_event(ev),
+            AppEvent::TreeChanged => {
+                if let Some(tree) = &mut self.tree {
+                    tree.refresh();
+                }
+            }
         }
+    }
+
+    /// Follow the `forge-term` contract: on `Damaged` re-snapshot the current
+    /// instance; on `Exited` record the code for the dim `[exited …]` line.
+    fn on_term_event(&mut self, ev: TermEvent) {
+        match ev {
+            TermEvent::Damaged { id } => {
+                if self.term_id == Some(id) {
+                    self.term_snapshot = self.term.snapshot(id);
+                }
+            }
+            TermEvent::Exited { id, code } => {
+                if self.term_id == Some(id) {
+                    self.term_exited = true;
+                    self.term_exit_code = code;
+                    // Capture the final grid so the last output stays visible.
+                    self.term_snapshot = self.term.snapshot(id);
+                }
+            }
+        }
+    }
+
+    /// Create the single terminal instance on first show (cwd = workspace root).
+    /// Degrades gracefully if the PTY can't be allocated (§5.2).
+    fn ensure_terminal(&mut self) {
+        if self.term_id.is_some() || self.term_failed {
+            return;
+        }
+        match self.term.create(&self.workspace_root) {
+            Ok(id) => {
+                self.term_id = Some(id);
+                self.term_exited = false;
+                self.term_exit_code = None;
+                self.term_last_size.store(0, std::sync::atomic::Ordering::Relaxed);
+                self.term_snapshot = self.term.snapshot(id);
+            }
+            Err(e) => {
+                self.term_failed = true;
+                self.status_line(&format!("[forge] terminal unavailable: {e}"));
+            }
+        }
+    }
+
+    /// New-terminal button: replace the single visible instance with a fresh
+    /// shell (the panel shows one terminal at a time; §5.2's multi-instance list
+    /// is deferred).
+    pub fn action_new_terminal(&mut self) {
+        if let Some(old) = self.term_id.take() {
+            self.term.destroy(old);
+        }
+        self.term_snapshot = None;
+        self.term_exited = false;
+        self.term_exit_code = None;
+        self.term_failed = false;
+        self.term_last_size.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.bottom_view = BottomView::Terminal;
+        self.output_visible = true;
+        self.ensure_terminal();
+    }
+
+    /// Toggle the RUNTIME panel (Runtime chip, §5.4).
+    pub fn action_toggle_runtime(&mut self) {
+        self.runtime_visible = !self.runtime_visible;
+    }
+
+    /// Switch the bottom panel between the live TERMINAL and the OUTPUT
+    /// scrollback fallback.
+    pub fn set_bottom_view(&mut self, view: BottomView) {
+        self.bottom_view = view;
+        self.output_visible = true;
     }
 
     fn status_line(&mut self, s: &str) {
@@ -305,8 +462,31 @@ impl JadeApp {
 
     fn on_run_done(&mut self, res: RunResult) {
         self.running = false;
+        self.run_started = None;
         let ms = res.duration.as_millis();
         let executed = res.executed_lines.len();
+
+        // ── Runtime panel bookkeeping (§5.4) ──
+        // vs-last delta is measured against the previous run (before we push).
+        self.last_delta_ms = self
+            .run_history
+            .last()
+            .map(|prev| ms as i128 - prev.duration_ms as i128);
+        // Personal best: only "beaten" if there was a slower prior best.
+        self.last_was_best = self.best_run_ms.map(|b| ms < b).unwrap_or(false);
+        self.best_run_ms = Some(self.best_run_ms.map_or(ms, |b| b.min(ms)));
+        self.run_counter += 1;
+        self.run_history.push(RunRecord {
+            n: self.run_counter,
+            duration_ms: ms,
+            peak: self.mem.peak_allocation,
+        });
+        // Keep memory bounded; HISTORY only renders the last 10 anyway.
+        if self.run_history.len() > 50 {
+            let drop = self.run_history.len() - 50;
+            self.run_history.drain(0..drop);
+        }
+        self.last_executed = res.executed_lines.clone();
         if res.exit_code == 0 {
             self.status_line(&format!("[forge] Exited with code 0 ({ms}ms)"));
         } else {
@@ -416,6 +596,7 @@ impl JadeApp {
             return;
         }
         self.running = true;
+        self.run_started = Some(Instant::now()); // drive the live SPEED tick
         self.training.clear(); // ghost snapshot of the previous run
         self.mem.reset(); // reset run-memory state
         self.output_visible = true;
@@ -743,6 +924,15 @@ impl Render for JadeApp {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme.clone();
 
+        // Create the terminal (and its focus handle) on first show of the strip.
+        if self.output_visible && self.bottom_view == BottomView::Terminal {
+            self.ensure_terminal();
+        }
+        let term_handle = self
+            .term_focus
+            .get_or_insert_with(|| cx.focus_handle())
+            .clone();
+
         let mut root = div()
             .flex()
             .flex_col()
@@ -766,7 +956,7 @@ impl Render for JadeApp {
             );
 
         if self.output_visible {
-            root = root.child(output_panel(self, &theme));
+            root = root.child(bottom_panel(self, cx, &theme, term_handle));
         }
         root.child(memory_bar(self, &theme))
             .child(status_strip(self, &theme))
@@ -794,6 +984,7 @@ fn action_bar(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl I
 
     // Left toggles: Terminal now toggles the output panel; the rest stay
     // placeholders until Phase-4 wires the file tree / flow / runtime panels.
+    let terminal_active = app.output_visible && app.bottom_view == BottomView::Terminal;
     let toggles = div()
         .flex()
         .items_center()
@@ -803,13 +994,29 @@ fn action_bar(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl I
             "tgl-terminal",
             "Terminal".to_string(),
             theme,
-            app.output_visible,
+            terminal_active,
             false,
             cx,
-            |a, _| a.action_toggle_output(),
+            |a, _| {
+                // Show + focus the TERMINAL view, or hide the strip if it's the
+                // one already up.
+                if a.output_visible && a.bottom_view == BottomView::Terminal {
+                    a.action_toggle_output();
+                } else {
+                    a.set_bottom_view(BottomView::Terminal);
+                }
+            },
         ))
         .child(chip("Flow", theme, false))
-        .child(chip("Runtime", theme, false));
+        .child(action_chip(
+            "tgl-runtime",
+            "Runtime".to_string(),
+            theme,
+            app.runtime_visible,
+            false,
+            cx,
+            |a, _| a.action_toggle_runtime(),
+        ));
 
     let right_group = div()
         .flex()
@@ -979,7 +1186,7 @@ fn center_content(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> im
 }
 
 fn runtime_sidebar(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl IntoElement {
-    div()
+    let mut col = div()
         .id("runtime-sidebar")
         .flex()
         .flex_col()
@@ -990,14 +1197,120 @@ fn runtime_sidebar(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> i
         .bg(rgb(theme.panel))
         .border_1()
         .border_color(rgb(theme.border))
-        .overflow_y_scroll()
-        .child(training_view::render(app, cx))
+        .overflow_y_scroll();
+    // RUNTIME panel sits above TRAINING, shown when toggled (§5.4).
+    if app.runtime_visible {
+        col = col.child(runtime_panel::render(app, cx));
+    }
+    col.child(training_view::render(app, cx))
         .child(telemetry_sidebar::render(app, cx))
 }
 
-/// Bottom output panel (deliverable §4): capped scrollback, monospace, muted,
-/// newest visible (render the tail that fits). ANSI already stripped on ingest.
-fn output_panel(app: &JadeApp, theme: &Theme) -> impl IntoElement {
+/// Bottom panel (§5.2): a header (view toggle · new-terminal · minimize) over the
+/// live TERMINAL grid or the OUTPUT scrollback fallback. `[forge]`/build/run
+/// status lines land in OUTPUT (the terminal is a real shell we can't inject
+/// display text into — see `terminal_panel`).
+fn bottom_panel(
+    app: &JadeApp,
+    cx: &mut Context<JadeApp>,
+    theme: &Theme,
+    term_handle: FocusHandle,
+) -> impl IntoElement {
+    let is_term = app.bottom_view == BottomView::Terminal;
+
+    // View-toggle tabs: TERMINAL | OUTPUT.
+    let view_tab = |id: &'static str, label: &'static str, active: bool, view: BottomView| {
+        let color = if active { theme.text } else { theme.muted };
+        div()
+            .id(id)
+            .px_2()
+            .text_xs()
+            .cursor_pointer()
+            .text_color(rgb(color))
+            .on_click(cx.listener(move |a: &mut JadeApp, _ev, _win, cx| {
+                a.set_bottom_view(view);
+                cx.notify();
+            }))
+            .child(label)
+    };
+
+    let header = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .h(px(22.))
+        .px(px(8.))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(view_tab("bv-terminal", "TERMINAL", is_term, BottomView::Terminal))
+                .child(view_tab("bv-output", "OUTPUT", !is_term, BottomView::Output)),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                // New-terminal.
+                .child(
+                    div()
+                        .id("term-new")
+                        .text_color(rgb(theme.muted))
+                        .text_xs()
+                        .cursor_pointer()
+                        .on_click(cx.listener(|a: &mut JadeApp, _ev, _win, cx| {
+                            a.action_new_terminal();
+                            cx.notify();
+                        }))
+                        .child("+"),
+                )
+                // Minimize (hide the strip).
+                .child(
+                    div()
+                        .id("term-min")
+                        .text_color(rgb(theme.muted))
+                        .text_xs()
+                        .cursor_pointer()
+                        .on_click(cx.listener(|a: &mut JadeApp, _ev, _win, cx| {
+                            a.action_toggle_output();
+                            cx.notify();
+                        }))
+                        .child("—"),
+                ),
+        );
+
+    let body = if is_term {
+        div()
+            .flex()
+            .flex_1()
+            .w_full()
+            .child(terminal_panel::render(app, term_handle, cx))
+            .into_any_element()
+    } else {
+        output_view(app, theme).into_any_element()
+    };
+
+    div()
+        .id("bottom-panel")
+        .flex()
+        .flex_col()
+        .h(px(220.))
+        .w_full()
+        .bg(rgb(theme.bg))
+        .border_t_1()
+        .border_color(rgb(theme.border))
+        .child(header)
+        .child(body)
+}
+
+/// The OUTPUT scrollback view (deliverable §4): capped scrollback, monospace,
+/// muted, newest visible. ANSI already stripped on ingest.
+fn output_view(app: &JadeApp, theme: &Theme) -> impl IntoElement {
     // Render the last ~200 lines — enough to fill the strip without a huge tree.
     let start = app.output.len().saturating_sub(200);
     let mut list = div().flex().flex_col();
@@ -1012,12 +1325,9 @@ fn output_panel(app: &JadeApp, theme: &Theme) -> impl IntoElement {
     }
     div()
         .id("output-panel")
-        .h(px(200.))
+        .flex_1()
         .w_full()
         .p(px(8.))
-        .bg(rgb(theme.bg))
-        .border_t_1()
-        .border_color(rgb(theme.border))
         .overflow_y_scroll()
         .child(list)
 }
