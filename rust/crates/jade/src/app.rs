@@ -817,14 +817,12 @@ impl JadeApp {
     }
 
     /// Toggle the RUNTIME panel (Runtime chip, §5.4).
-    /// Timer/gauge button: the TRAINING + TELEMETRY sidebar is always there;
-    /// this toggles the extra RUNTIME graphs above them, reclaiming the bottom
-    /// strip (terminal/output) for vertical room when they open.
+    /// Timer/gauge button: opens/closes the whole right sidebar (runtime
+    /// graphs + training + telemetry). While it's open the bottom strip is
+    /// fully hidden (render gate) — `output_visible` is left untouched so the
+    /// terminal comes back exactly as it was when the sidebar closes.
     pub fn action_toggle_runtime(&mut self) {
         self.runtime_visible = !self.runtime_visible;
-        if self.runtime_visible {
-            self.output_visible = false;
-        }
     }
 
     /// Toggle the execution-flow decorations (Flow chip / ⌘E, §4.8).
@@ -3315,7 +3313,7 @@ impl Render for JadeApp {
         let theme = self.theme.clone();
 
         // Create the terminal (and its focus handle) on first show of the strip.
-        if self.output_visible && self.bottom_view == BottomView::Terminal {
+        if self.output_visible && !self.runtime_visible && self.bottom_view == BottomView::Terminal {
             self.ensure_terminal();
         }
         let term_handle = self
@@ -3443,7 +3441,7 @@ impl Render for JadeApp {
         // active (§5.8); else the terminal/output strip shows when visible.
         if self.debug_visible {
             root = root.child(debug_panel::render(self, cx));
-        } else if self.output_visible {
+        } else if self.output_visible && !self.runtime_visible {
             root = root.child(bottom_panel(self, cx, &theme, term_handle));
         }
         let mut root = root
@@ -3903,13 +3901,19 @@ fn welcome_overlay(cx: &mut Context<JadeApp>, theme: &Theme) -> impl IntoElement
         )
 }
 
+/// The right sidebar (gauge toggle): RUNTIME graphs over TRAINING + TELEMETRY.
+/// Fully hidden (zero-size) when toggled off — the gauge controls the whole
+/// sidebar, not just the runtime section (§5.4; user spec 2026-07-15).
 fn runtime_sidebar(
     app: &JadeApp,
     cx: &mut Context<JadeApp>,
     theme: &Theme,
     bench_handle: FocusHandle,
-) -> impl IntoElement {
-    let mut col = div()
+) -> gpui::AnyElement {
+    if !app.runtime_visible {
+        return div().into_any_element();
+    }
+    div()
         .id("runtime-sidebar")
         .flex()
         .flex_col()
@@ -3921,13 +3925,11 @@ fn runtime_sidebar(
         .border_1()
         .border_color(rgb(theme.border))
         .shadow(card_shadow()) // floating-card look (§2, main.css:2342-2344)
-        .overflow_y_scroll();
-    // RUNTIME panel sits above TRAINING, shown when toggled (§5.4).
-    if app.runtime_visible {
-        col = col.child(runtime_panel::render(app, bench_handle, cx));
-    }
-    col.child(training_view::render(app, cx))
+        .overflow_y_scroll()
+        .child(runtime_panel::render(app, bench_handle, cx))
+        .child(training_view::render(app, cx))
         .child(telemetry_sidebar::render(app, cx))
+        .into_any_element()
 }
 
 /// Bottom panel (§5.2): a header (view toggle · new-terminal · minimize) over the
