@@ -6,6 +6,7 @@ members = [
     "crates/forge-debug",
     "crates/forge-ai",
     "crates/forge-sysmon",
+    "crates/forge-term",
     "crates/jade",
 ]
 
