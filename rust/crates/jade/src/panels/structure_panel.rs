@@ -80,7 +80,7 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> impl IntoElement {
 /// One symbol row plus (indented, connector-bordered) its children.
 fn node(sym: &Symbol, theme: &Theme, cx: &mut Context<JadeApp>) -> gpui::AnyElement {
     let line = sym.line;
-    let dot_color = kind_color(sym.kind);
+    let dot_color = kind_color(sym.kind, theme);
 
     // The clickable pill: dot + name (+ a muted access tag for members/methods).
     let mut pill = div()

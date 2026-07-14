@@ -38,30 +38,20 @@ pub const CHAR_W: f32 = 7.83;
 /// End-of-line annotation text size (§4.5: 11px emerald @0.7 opacity).
 const ANN_PX: f32 = 11.0;
 
-/// Gutter line-number colors (§4.1).
-const GUTTER_FG: u32 = 0x4B4E56;
-
-// ── Flow decoration colors (§4.8 FLOW_COLORS) ──────────────────────────────
-const FLOW_SEQ: u32 = 0x56B389; // emerald — sequential
-const FLOW_CALL: u32 = 0x8DB2FF; // periwinkle — call / loop-back
-const FLOW_RETURN: u32 = 0xD4A76A; // amber — return / branch
-const FLOW_ERROR: u32 = 0xCF6B6B; // red — error
-/// Static/exec/runtime annotation color (§4.5: emerald #56B389).
-const ANN_EMERALD: u32 = 0x56B389;
-
 /// A packed `0xRRGGBB` with an alpha fraction → `gpui::Rgba`.
 fn rgba_a(rgb: u32, alpha: f32) -> Rgba {
     let a = (alpha.clamp(0.0, 1.0) * 255.0).round() as u32;
     rgba((rgb << 8) | (a & 0xff))
 }
 
-/// Base color for a flow glyph kind.
-fn flow_color(kind: GlyphKind) -> u32 {
+/// Base color for a flow glyph kind, resolved from the active [`Theme`] (§4.8
+/// FLOW_COLORS map onto accent/periwinkle/amber/red so the light theme applies).
+fn flow_color(kind: GlyphKind, theme: &Theme) -> u32 {
     match kind {
-        GlyphKind::Sequential => FLOW_SEQ,
-        GlyphKind::Call | GlyphKind::Loop => FLOW_CALL,
-        GlyphKind::Return | GlyphKind::Branch => FLOW_RETURN,
-        GlyphKind::Error => FLOW_ERROR,
+        GlyphKind::Sequential => theme.accent,
+        GlyphKind::Call | GlyphKind::Loop => theme.periwinkle,
+        GlyphKind::Return | GlyphKind::Branch => theme.amber,
+        GlyphKind::Error => theme.red,
     }
 }
 
@@ -208,12 +198,12 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> gpui::AnyElement {
                     let executed = has_run && this.last_executed.contains_key(&(line_no as u32));
                     if let Some(fg) = tab.flow.glyphs.get(&line_no) {
                         nav_target = fg.targets.first().copied();
-                        let color = flow_color(fg.kind);
+                        let color = flow_color(fg.kind, &theme);
                         let (ba, bo) = flow_tint(fg.kind);
                         let mut gcolor = rgba_a(color, 1.0);
                         if has_run {
                             if executed {
-                                row_bg = Some(rgba_a(FLOW_SEQ, 0.08));
+                                row_bg = Some(rgba_a(theme.accent, 0.08));
                                 border_col = rgba_a(color, bo);
                             } else {
                                 gcolor = rgba_a(color, 0.25);
@@ -224,18 +214,20 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> gpui::AnyElement {
                         }
                         glyph = Some((fg.kind.glyph(), gcolor));
                     } else if executed {
-                        row_bg = Some(rgba_a(FLOW_SEQ, 0.04));
+                        row_bg = Some(rgba_a(theme.accent, 0.04));
                     }
                     if error_line == Some(line_no as u32) {
-                        row_bg = Some(rgba_a(FLOW_ERROR, 0.12));
-                        border_col = rgba_a(FLOW_ERROR, 0.5);
-                        glyph = Some((GlyphKind::Error.glyph(), rgba_a(FLOW_ERROR, 1.0)));
+                        row_bg = Some(rgba_a(theme.red, 0.12));
+                        border_col = rgba_a(theme.red, 0.5);
+                        glyph = Some((GlyphKind::Error.glyph(), rgba_a(theme.red, 1.0)));
                         nav_target = None;
                     }
                 }
 
                 // Gutter diagnostic dot (max severity starting on this row).
                 let diag_dot = diag_dot_color(&tab.diagnostics, i, &theme);
+                // Breakpoint on this line (§4.6) — takes visual precedence.
+                let has_bp = this.is_breakpoint(line_no as u32);
 
                 let mut row = div().flex().flex_row().h(px(LINE_H)).items_center();
 
@@ -267,8 +259,8 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> gpui::AnyElement {
 
                 row = row.border_l_2().border_color(border_col);
                 if row_bg.is_none() {
-                    if let Some(color) = crate::structure::line_tint(&tab.symbols, line_no) {
-                        row_bg = Some(rgba_a(color, 0.047));
+                    if let Some(idx) = crate::structure::line_tint(&tab.symbols, line_no) {
+                        row_bg = Some(rgba_a(theme.series[idx % theme.series.len()], 0.047));
                     }
                 }
                 if let Some(bg) = row_bg {
@@ -283,22 +275,44 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> gpui::AnyElement {
                     .flex_row()
                     .items_center()
                     .pr(px(8.));
+                // The 8px glyph margin: click toggles a breakpoint (§4.6); it
+                // shows a red breakpoint dot (precedence) or the diagnostic dot.
+                let dot: gpui::AnyElement = if has_bp {
+                    div()
+                        .w(px(6.))
+                        .h(px(6.))
+                        .rounded_full()
+                        .bg(rgb(theme.red))
+                        .into_any_element()
+                } else {
+                    match diag_dot {
+                        Some(c) => div()
+                            .w(px(5.))
+                            .h(px(5.))
+                            .rounded_full()
+                            .bg(rgb(c))
+                            .into_any_element(),
+                        None => div().into_any_element(),
+                    }
+                };
                 gutter = gutter.child(
                     div()
+                        .id(("bp-margin", i))
                         .w(px(8.))
                         .flex_none()
                         .flex()
                         .items_center()
                         .justify_center()
-                        .child(match diag_dot {
-                            Some(c) => div()
-                                .w(px(5.))
-                                .h(px(5.))
-                                .rounded_full()
-                                .bg(rgb(c))
-                                .into_any_element(),
-                            None => div().into_any_element(),
-                        }),
+                        .cursor_pointer()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |app: &mut JadeApp, _ev: &MouseDownEvent, _w, cx| {
+                                app.toggle_breakpoint(line_no as u32);
+                                app.save_ui_state();
+                                cx.notify();
+                            }),
+                        )
+                        .child(dot),
                 );
                 // Line-number: click creates a sticky note anchored here (§4.9).
                 gutter = gutter.child(
@@ -306,7 +320,7 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> gpui::AnyElement {
                         .id(("gutter-line", i))
                         .flex_1()
                         .text_right()
-                        .text_color(rgb(GUTTER_FG))
+                        .text_color(rgb(theme.muted))
                         .cursor_pointer()
                         .on_mouse_down(
                             MouseButton::Left,
@@ -376,7 +390,7 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> gpui::AnyElement {
                             .flex_none()
                             .whitespace_nowrap()
                             .text_size(px(ANN_PX))
-                            .text_color(rgba_a(ANN_EMERALD, 0.7))
+                            .text_color(rgba_a(theme.accent, 0.7))
                             .child(ann),
                     );
                 }
@@ -824,12 +838,14 @@ fn tab_chip(
             gpui::MouseButton::Middle,
             cx.listener(move |app, _ev, _win, cx| {
                 app.close_tab(index);
+                app.schedule_ui_save(cx);
                 cx.notify();
             }),
         )
         // Left-click switches to this tab.
         .on_click(cx.listener(move |app, _ev, _win, cx| {
             app.switch_tab(index);
+            app.schedule_ui_save(cx);
             cx.notify();
         }))
         .child(div().child(name.to_string()));
@@ -853,6 +869,7 @@ fn tab_chip(
             .cursor_pointer()
             .on_click(cx.listener(move |app, _ev, _win, cx| {
                 app.close_tab(index);
+                app.schedule_ui_save(cx);
                 cx.notify();
             }))
             .child("×"),

@@ -60,23 +60,58 @@ pub const ANSI_DARK: [u32; 16] = [
     0xDFE1E5, // 15 bright white
 ];
 
+/// The 16 ANSI colors for forge-light, ported from `TERMINAL_THEME_LIGHT`
+/// (`src/renderer/panels/terminal-panel.ts:28-40`): the same hues darkened for
+/// contrast on the cream background. Swapped in on the theme toggle (§5.2 — a
+/// canvas terminal can't read CSS vars, so the palette is chosen in code).
+pub const ANSI_LIGHT: [u32; 16] = [
+    0x1F2328, // 0 black
+    0xB3403F, // 1 red
+    0x2E7D5B, // 2 green
+    0x9A6700, // 3 yellow
+    0x2F5FD0, // 4 blue
+    0x6E5494, // 5 magenta
+    0x3E6D5D, // 6 cyan
+    0xE8EAED, // 7 white
+    0x6F737A, // 8 bright black
+    0xB3403F, // 9 bright red
+    0x2E7D5B, // 10 bright green
+    0x9A6700, // 11 bright yellow
+    0x2F5FD0, // 12 bright blue
+    0x6E5494, // 13 bright magenta
+    0x3E6D5D, // 14 bright cyan
+    0xF5F6F8, // 15 bright white
+];
+
 /// forge-dark terminal default fg / bg (the palette's `foreground`/`background`).
 pub const TERM_DEFAULT_FG: u32 = 0xDFE1E5;
 pub const TERM_DEFAULT_BG: u32 = 0x1E1F22;
 
-/// Resolve one raw [`Color`] into an `0xRRGGBB` value. `Named`/`Indexed` map
-/// through the ANSI palette (256-color cube/greyscale computed for 16..=255),
-/// `Rgb` passes through, `Default` yields the provided theme default.
-pub fn resolve_color(c: Color, default: u32) -> u32 {
+/// The active 16-color ANSI palette for a theme (`is_light` selects the light
+/// port). The `Color::Default` fg/bg still come from the `Theme` surfaces.
+pub fn ansi_palette(is_light: bool) -> &'static [u32; 16] {
+    if is_light {
+        &ANSI_LIGHT
+    } else {
+        &ANSI_DARK
+    }
+}
+
+/// Resolve one raw [`Color`] into an `0xRRGGBB` value against a specific ANSI
+/// `palette`. `Named`/`Indexed` map through it (256-color cube/greyscale computed
+/// for 16..=255), `Rgb` passes through, `Default` yields the theme default.
+pub fn resolve_color_pal(c: Color, default: u32, palette: &[u32; 16]) -> u32 {
     match c {
-        Color::Named(i) => ANSI_DARK
-            .get(i as usize)
-            .copied()
-            .unwrap_or(default),
-        Color::Indexed(i) => indexed_rgb(i, default),
+        Color::Named(i) => palette.get(i as usize).copied().unwrap_or(default),
+        Color::Indexed(i) => indexed_rgb(i, default, palette),
         Color::Rgb(r, g, b) => rgb_u32(r, g, b),
         Color::Default => default,
     }
+}
+
+/// [`resolve_color_pal`] against the forge-dark palette (back-compat + tests).
+pub fn resolve_color(c: Color, default: u32) -> u32 {
+    resolve_color_pal(c, default, &ANSI_DARK)
 }
 
 fn rgb_u32(r: u8, g: u8, b: u8) -> u32 {
@@ -85,9 +120,9 @@ fn rgb_u32(r: u8, g: u8, b: u8) -> u32 {
 
 /// xterm 256-color resolution: 0..=15 the ANSI palette, 16..=231 the 6×6×6 RGB
 /// cube, 232..=255 the 24-step greyscale ramp.
-fn indexed_rgb(i: u8, default: u32) -> u32 {
+fn indexed_rgb(i: u8, default: u32, palette: &[u32; 16]) -> u32 {
     match i {
-        0..=15 => ANSI_DARK[i as usize],
+        0..=15 => palette[i as usize],
         16..=231 => {
             let n = i - 16;
             let r = n / 36;
@@ -106,16 +141,21 @@ fn indexed_rgb(i: u8, default: u32) -> u32 {
     }
 }
 
-/// Resolve a cell's (fg, bg), honoring inverse video by swapping. `def_fg`/
-/// `def_bg` are the theme defaults substituted for [`Color::Default`].
-pub fn cell_colors(cell: &Cell, def_fg: u32, def_bg: u32) -> (u32, u32) {
-    let fg = resolve_color(cell.fg, def_fg);
-    let bg = resolve_color(cell.bg, def_bg);
+/// Resolve a cell's (fg, bg) against a specific ANSI `palette`, honoring inverse
+/// video by swapping. `def_fg`/`def_bg` are the theme defaults for `Color::Default`.
+pub fn cell_colors_pal(cell: &Cell, def_fg: u32, def_bg: u32, palette: &[u32; 16]) -> (u32, u32) {
+    let fg = resolve_color_pal(cell.fg, def_fg, palette);
+    let bg = resolve_color_pal(cell.bg, def_bg, palette);
     if cell.flags.inverse {
         (bg, fg)
     } else {
         (fg, bg)
     }
+}
+
+/// [`cell_colors_pal`] against the forge-dark palette (back-compat + tests).
+pub fn cell_colors(cell: &Cell, def_fg: u32, def_bg: u32) -> (u32, u32) {
+    cell_colors_pal(cell, def_fg, def_bg, &ANSI_DARK)
 }
 
 /// Modifier state for [`key_to_bytes`] (a testable subset of `gpui::Modifiers`).
@@ -188,10 +228,10 @@ struct Run {
     bold: bool,
 }
 
-fn row_runs(cells: &[Cell], def_fg: u32, def_bg: u32) -> Vec<Run> {
+fn row_runs(cells: &[Cell], def_fg: u32, def_bg: u32, palette: &[u32; 16]) -> Vec<Run> {
     let mut runs: Vec<Run> = Vec::new();
     for cell in cells {
-        let (fg, bg) = cell_colors(cell, def_fg, def_bg);
+        let (fg, bg) = cell_colors_pal(cell, def_fg, def_bg, palette);
         let bold = cell.flags.bold;
         match runs.last_mut() {
             Some(r) if r.fg == fg && r.bg == bg && r.bold == bold => r.text.push(cell.ch),
@@ -212,6 +252,7 @@ pub fn render(app: &JadeApp, handle: FocusHandle, _cx: &mut Context<JadeApp>) ->
     let theme = app.theme.clone();
     let def_fg = theme.text;
     let def_bg = theme.bg;
+    let palette = ansi_palette(theme.is_light);
 
     let body = div()
         .id("terminal-body")
@@ -219,7 +260,7 @@ pub fn render(app: &JadeApp, handle: FocusHandle, _cx: &mut Context<JadeApp>) ->
         .flex_1()
         .w_full()
         .overflow_hidden()
-        .bg(rgb(TERM_DEFAULT_BG))
+        .bg(rgb(theme.bg))
         .track_focus(&handle)
         .font_family("Menlo")
         .text_size(px(12.))
@@ -256,7 +297,7 @@ pub fn render(app: &JadeApp, handle: FocusHandle, _cx: &mut Context<JadeApp>) ->
 
     let mut grid = div().absolute().top_0().left_0().flex().flex_col();
     if let Some(snap) = &app.term_snapshot {
-        grid = render_grid(grid, snap, def_fg, def_bg);
+        grid = render_grid(grid, snap, def_fg, def_bg, palette);
     }
     if app.term_exited {
         let code = app
@@ -273,9 +314,9 @@ pub fn render(app: &JadeApp, handle: FocusHandle, _cx: &mut Context<JadeApp>) ->
     body.child(resize).child(grid)
 }
 
-fn render_grid(mut grid: Div, snap: &GridSnapshot, def_fg: u32, def_bg: u32) -> Div {
+fn render_grid(mut grid: Div, snap: &GridSnapshot, def_fg: u32, def_bg: u32, palette: &[u32; 16]) -> Div {
     for row in &snap.cells {
-        let runs = row_runs(row, def_fg, def_bg);
+        let runs = row_runs(row, def_fg, def_bg, palette);
         let mut line = div().flex().flex_row().h(px(CELL_H)).items_center();
         for r in runs {
             let mut span = div().text_color(rgb(r.fg)).child(r.text);
@@ -415,9 +456,28 @@ mod tests {
             cell('b', Color::Named(1), Color::Default, false),
             cell('c', Color::Named(2), Color::Default, false),
         ];
-        let runs = row_runs(&cells, TERM_DEFAULT_FG, TERM_DEFAULT_BG);
+        let runs = row_runs(&cells, TERM_DEFAULT_FG, TERM_DEFAULT_BG, &ANSI_DARK);
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[0].text, "ab");
         assert_eq!(runs[1].text, "c");
+    }
+
+    #[test]
+    fn light_ansi_mapping() {
+        let light = ansi_palette(true);
+        assert_eq!(light, &ANSI_LIGHT);
+        // Named colors resolve through the light palette (darkened hues).
+        assert_eq!(resolve_color_pal(Color::Named(1), 0, light), 0xB3403F); // red
+        assert_eq!(resolve_color_pal(Color::Named(2), 0, light), 0x2E7D5B); // green
+        assert_eq!(resolve_color_pal(Color::Named(4), 0, light), 0x2F5FD0); // blue
+        // ANSI black (index 0) is the dark charcoal fg on light, not near-black bg.
+        assert_eq!(resolve_color_pal(Color::Named(0), 0, light), 0x1F2328);
+        // Indexed 0..=15 also route through the light palette.
+        assert_eq!(resolve_color_pal(Color::Indexed(3), 0, light), 0x9A6700); // yellow
+        // Dark palette still selected when not light.
+        assert_eq!(ansi_palette(false), &ANSI_DARK);
+        assert_eq!(resolve_color_pal(Color::Named(1), 0, &ANSI_DARK), 0xCF6B6B);
+        // Default falls back to the supplied theme default regardless of palette.
+        assert_eq!(resolve_color_pal(Color::Default, 0x123456, light), 0x123456);
     }
 }

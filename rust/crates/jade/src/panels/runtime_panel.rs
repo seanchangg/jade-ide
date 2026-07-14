@@ -19,10 +19,11 @@
 
 use std::collections::HashMap;
 
-use gpui::{div, prelude::*, px, rgb, Context};
+use gpui::{div, prelude::*, px, rgb, Context, FocusHandle, KeyDownEvent};
 
 use crate::app::JadeApp;
-use crate::format::format_bytes;
+use crate::benchmark::{self, Delta};
+use crate::format::{format_bytes, format_duration};
 use crate::theme::Theme;
 
 /// One completed run, retained for the HISTORY section (last 10 shown).
@@ -44,7 +45,7 @@ pub fn top_hotspots(lines: &HashMap<u32, u32>, n: usize) -> Vec<(u32, u32)> {
     v
 }
 
-pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> impl IntoElement {
+pub fn render(app: &JadeApp, bench_handle: FocusHandle, cx: &mut Context<JadeApp>) -> impl IntoElement {
     let theme = app.theme.clone();
 
     div()
@@ -60,7 +61,8 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> impl IntoElement {
         .child(speed_section(app, &theme))
         .child(memory_section(app, &theme))
         .child(hotspots_section(app, &theme, cx))
-        .child(history_section(app, &theme))
+        .child(benchmarks_section(app, &theme, bench_handle, cx))
+        .child(history_section(app, &theme, cx))
 }
 
 fn section_label(text: &str, theme: &Theme) -> impl IntoElement {
@@ -231,7 +233,111 @@ fn hotspots_section(app: &JadeApp, theme: &Theme, cx: &mut Context<JadeApp>) -> 
     col
 }
 
-fn history_section(app: &JadeApp, theme: &Theme) -> impl IntoElement {
+/// BENCHMARKS (§5.4): saved named runs sorted fastest-first, fastest accented,
+/// delta vs the latest run, × delete; plus the inline ⚑ name input when naming.
+fn benchmarks_section(
+    app: &JadeApp,
+    theme: &Theme,
+    bench_handle: FocusHandle,
+    cx: &mut Context<JadeApp>,
+) -> impl IntoElement {
+    let mut col = div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(section_label("BENCHMARKS", theme));
+
+    // Inline name input (prefilled `#<run> <flags>`), shown while naming.
+    if let Some(naming) = &app.bench_naming {
+        col = col.child(
+            div()
+                .id("bench-name-input")
+                .track_focus(&bench_handle)
+                .flex()
+                .flex_row()
+                .items_center()
+                .h(px(18.))
+                .px(px(4.))
+                .rounded_sm()
+                .bg(rgb(theme.bg))
+                .border_1()
+                .border_color(rgb(theme.accent))
+                .text_size(px(10.))
+                .on_key_down(cx.listener(|a: &mut JadeApp, ev: &KeyDownEvent, _w, cx| {
+                    if a.bench_key(&ev.keystroke) {
+                        a.save_ui_state();
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                }))
+                .child(div().text_color(rgb(theme.text)).child(naming.buffer.clone()))
+                .child(div().w(px(1.)).h(px(12.)).bg(rgb(theme.accent))),
+        );
+    }
+
+    if app.benchmarks.is_empty() && app.bench_naming.is_none() {
+        return col.child(
+            div()
+                .text_color(rgb(theme.muted))
+                .text_size(px(10.))
+                .child("Save a run from history"),
+        );
+    }
+
+    let order = benchmark::sorted_fastest_first(&app.benchmarks);
+    let fastest = benchmark::fastest_duration(&app.benchmarks);
+    let latest = app.latest_run_ms();
+    for idx in order {
+        let bm = &app.benchmarks[idx];
+        let is_fastest = fastest == Some(bm.duration);
+        let dur_color = if is_fastest { theme.accent } else { theme.text };
+
+        // Delta vs latest run (accent ↓ / error ↑ / `=`).
+        let delta = benchmark::delta_vs_last(bm.duration, latest);
+        let (delta_txt, delta_color) = match delta {
+            Delta::None => (String::new(), theme.muted),
+            Delta::Equal => ("=".to_string(), theme.muted),
+            Delta::Down(_) => (delta.label().unwrap_or_default(), theme.accent),
+            Delta::Up(_) => (delta.label().unwrap_or_default(), theme.red),
+        };
+
+        let mut row = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .gap_1()
+            .text_size(px(10.))
+            .child(
+                div()
+                    .flex_1()
+                    .overflow_hidden()
+                    .text_color(rgb(theme.text))
+                    .child(bm.name.clone()),
+            )
+            .child(div().text_color(rgb(dur_color)).child(format_duration(bm.duration)))
+            .child(div().text_color(rgb(theme.muted)).child(heap_str(bm.peak_allocation)));
+        if !delta_txt.is_empty() {
+            row = row.child(div().text_color(rgb(delta_color)).child(delta_txt));
+        }
+        row = row.child(
+            div()
+                .id(("bench-del", idx as u64))
+                .text_color(rgb(theme.muted))
+                .cursor_pointer()
+                .on_click(cx.listener(move |a: &mut JadeApp, _e, _w, cx| {
+                    a.delete_benchmark(idx);
+                    a.save_ui_state();
+                    cx.notify();
+                }))
+                .child("×"),
+        );
+        col = col.child(row);
+    }
+    col
+}
+
+fn history_section(app: &JadeApp, theme: &Theme, cx: &mut Context<JadeApp>) -> impl IntoElement {
     let mut col = div()
         .flex()
         .flex_col()
@@ -243,23 +349,39 @@ fn history_section(app: &JadeApp, theme: &Theme) -> impl IntoElement {
             div()
                 .text_color(rgb(theme.muted))
                 .text_size(px(10.))
-                .child("no runs yet (benchmarks/persistence deferred)"),
+                .child("no runs yet"),
         );
     }
 
-    // Last 10, most recent first.
+    // Last 10, most recent first. Each row carries a ⚑ to save it as a benchmark.
     for rec in app.run_history.iter().rev().take(10) {
+        let run_n = rec.n;
         col = col.child(
             div()
                 .flex()
                 .flex_row()
+                .items_center()
                 .justify_between()
+                .gap_1()
                 .text_size(px(10.))
                 .child(div().text_color(rgb(theme.text)).child(format!("#{}", rec.n)))
                 .child(
                     div()
+                        .flex_1()
                         .text_color(rgb(theme.muted))
                         .child(format!("{} ms · {}", rec.duration_ms, heap_str(rec.peak))),
+                )
+                .child(
+                    // ⚑ save-named-benchmark (§5.4).
+                    div()
+                        .id(("bench-flag", run_n as u64))
+                        .text_color(rgb(theme.muted))
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |a: &mut JadeApp, _e, _w, cx| {
+                            a.begin_benchmark(run_n);
+                            cx.notify();
+                        }))
+                        .child("⚑"),
                 ),
         );
     }

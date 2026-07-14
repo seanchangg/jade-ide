@@ -15,6 +15,8 @@
 
 use tree_sitter::{Node, Query, QueryCursor, StreamingIterator};
 
+use crate::theme::Theme;
+
 /// Symbol classes shown in the outline (§5.5). Order/naming mirror the TS
 /// `SymbolKind` union so the visual treatment maps 1:1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,33 +62,36 @@ pub struct Symbol {
     pub children: Vec<Symbol>,
 }
 
-/// The §4.7 tint cycle: green/blue/amber/red/blue-gray, applied at low alpha by
-/// the code viewer as a whole-block background per top-level multi-line symbol.
-pub const TINTS: [u32; 5] = [0x56B389, 0x8DB2FF, 0xD4A76A, 0xCF6B6B, 0x9BB5CF];
+/// Number of colors in the §4.7 tint cycle (green/blue/amber/red/blue-gray),
+/// resolved at paint time from [`Theme::series`] so the light theme gets its own
+/// tints (the cycle *index* is what [`line_tint`] returns; the caller maps it
+/// through `theme.series`).
+pub const TINT_COUNT: usize = 5;
 
-/// Kind → dot color (§5.5): class/function accent2 (periwinkle), struct accent
-/// (emerald), method warning-amber, member muted, enum chart-5 (blue-gray),
-/// namespace chart-3 (amber). Values are the forge-dark palette hexes.
-pub fn kind_color(kind: SymbolKind) -> u32 {
+/// Kind → dot color (§5.5), resolved from the active [`Theme`]: class/function
+/// periwinkle, struct accent (emerald), method amber, member muted, enum
+/// blue-gray, namespace amber. Theme-aware so the light palette applies.
+pub fn kind_color(kind: SymbolKind, theme: &Theme) -> u32 {
     match kind {
-        SymbolKind::Class | SymbolKind::Function => 0x8DB2FF, // accent2
-        SymbolKind::Struct => 0x56B389,                       // accent
-        SymbolKind::Method => 0xD4A76A,                       // warning amber
-        SymbolKind::Member => 0x6B7A72,                       // muted
-        SymbolKind::Enum => 0x9BB5CF,                         // chart-5
-        SymbolKind::Namespace => 0xD4A76A,                    // chart-3
+        SymbolKind::Class | SymbolKind::Function => theme.periwinkle,
+        SymbolKind::Struct => theme.accent,
+        SymbolKind::Method => theme.amber,
+        SymbolKind::Member => theme.muted,
+        SymbolKind::Enum => theme.blue_gray,
+        SymbolKind::Namespace => theme.amber,
     }
 }
 
-/// The §4.7 background tint for a 1-based source `line`, or `None` if the line is
-/// not inside a top-level multi-line symbol. Tints cycle [`TINTS`] over the
-/// top-level multi-line symbols in document order so adjacent blocks differ.
-pub fn line_tint(symbols: &[Symbol], line: usize) -> Option<u32> {
+/// The §4.7 background-tint **cycle index** for a 1-based source `line`, or `None`
+/// if the line is not inside a top-level multi-line symbol. The index cycles over
+/// the top-level multi-line symbols in document order (so adjacent blocks differ);
+/// the caller maps it through `theme.series[idx]` at paint time.
+pub fn line_tint(symbols: &[Symbol], line: usize) -> Option<usize> {
     let mut idx = 0usize;
     for s in symbols {
         if s.end_line > s.line {
             if line >= s.line && line <= s.end_line {
-                return Some(TINTS[idx % TINTS.len()]);
+                return Some(idx % TINT_COUNT);
             }
             idx += 1;
         }
@@ -490,11 +495,11 @@ int add(int a, int b) {
         assert_eq!(syms.len(), 2);
         let t_a = line_tint(&syms, 1).expect("a tint");
         let t_b = line_tint(&syms, 4).expect("b tint");
-        assert_eq!(t_a, TINTS[0]);
-        assert_eq!(t_b, TINTS[1]);
+        assert_eq!(t_a, 0);
+        assert_eq!(t_b, 1);
         assert_ne!(t_a, t_b);
         // A line outside any symbol has no tint.
-        assert_eq!(line_tint(&syms, 3), Some(TINTS[0])); // still inside a()'s block
+        assert_eq!(line_tint(&syms, 3), Some(0)); // still inside a()'s block
         assert_eq!(line_tint(&syms, 99), None);
     }
 

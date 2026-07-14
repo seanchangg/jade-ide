@@ -13,6 +13,20 @@ pub fn format_bytes(bytes: f64) -> String {
     }
 }
 
+/// Milliseconds → compact duration (`runtime-panel.ts:459` `formatDuration`).
+/// `<1ms` / `123ms` / `1.50s` / `1m 2.3s`. Used by the BENCHMARKS section (§5.4).
+pub fn format_duration(ms: f64) -> String {
+    if ms < 1.0 {
+        "<1ms".to_string()
+    } else if ms < 1000.0 {
+        format!("{}ms", ms.round() as i64)
+    } else if ms < 60000.0 {
+        format!("{:.2}s", ms / 1000.0)
+    } else {
+        format!("{}m {:.1}s", (ms / 60000.0).floor() as i64, (ms % 60000.0) / 1000.0)
+    }
+}
+
 /// Compact numeric formatting for heatmap range labels (training-view.ts
 /// `fmtVal`): exponential outside a "friendly" band, else round to 3 decimals.
 pub fn fmt_val(v: f64) -> String {

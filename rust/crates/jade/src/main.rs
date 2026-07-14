@@ -36,6 +36,9 @@
 #![allow(dead_code)]
 
 mod app;
+mod asm;
+mod benchmark;
+mod debug;
 mod decorations;
 mod editor_view;
 mod format;
@@ -53,6 +56,7 @@ mod structure;
 mod theme;
 mod training;
 mod wg3d;
+mod workspace_state;
 mod workspace_tree;
 mod xp;
 

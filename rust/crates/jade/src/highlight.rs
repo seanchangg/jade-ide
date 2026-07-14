@@ -54,6 +54,27 @@ impl TokenPalette {
             annotation: 0xD4A76A,
         }
     }
+
+    /// forge-light token palette (§4.2). Mirrors `Theme::forge_light()`'s
+    /// accents (desaturated green/blue/amber on warm charcoal) so syntax stays
+    /// legible on the cream background; variable/operator/delimiter darken to
+    /// warm-charcoal grays instead of the dark theme's near-whites.
+    pub fn forge_light() -> Self {
+        TokenPalette {
+            keyword: 0x2E7D5B,      // accent (emerald, desaturated)
+            types: 0x4A6A88,        // blue-gray
+            function: 0x2F5FD0,     // periwinkle
+            string: 0x9A6700,       // amber
+            number: 0x9A6700,       // amber
+            comment: 0x8A8674,      // muted
+            variable: 0x373528,     // text (warm charcoal)
+            preprocessor: 0x3E6D5D, // light cyan
+            operator: 0x5C5A48,     // muted charcoal
+            delimiter: 0x6E6C58,    // lighter muted charcoal
+            constant: 0x9A6700,     // amber
+            annotation: 0x9A6700,   // amber
+        }
+    }
 }
 
 impl Default for TokenPalette {

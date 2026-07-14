@@ -156,6 +156,12 @@ impl OpenTab {
         self.highlights = highlight::highlight_file(&self.path, &text, self.palette);
     }
 
+    /// Swap the token palette (theme toggle, §4.2) and re-highlight this tab.
+    pub fn set_palette(&mut self, palette: TokenPalette) {
+        self.palette = palette;
+        self.rehighlight();
+    }
+
     /// Run any decoration recompute whose debounce has elapsed. Returns true if
     /// anything was recomputed (so the caller can `notify`).
     pub fn poll_decorations(&mut self, now_ms: u64) -> bool {
@@ -283,6 +289,15 @@ impl EditorState {
     pub fn switch(&mut self, index: usize) {
         if index < self.tabs.len() {
             self.active = Some(index);
+        }
+    }
+
+    /// Swap the token palette for new tabs and re-highlight every open tab
+    /// (theme toggle, §4.2).
+    pub fn set_palette(&mut self, palette: TokenPalette) {
+        self.palette = palette;
+        for tab in &mut self.tabs {
+            tab.set_palette(palette);
         }
     }
 

@@ -21,10 +21,10 @@ use std::time::{Duration, Instant};
 
 use forge_ai::{AiState, AiStatus, InfillRequest, InlineCompletionBackend};
 use forge_build::{
-    BuildEngine, BuildResult, CompileRequest, RunConfig, RunEvent, RunResult, PROBE_DYLIB,
+    AsmResult, BuildEngine, BuildResult, CompileRequest, RunConfig, RunEvent, RunResult, PROBE_DYLIB,
 };
 use forge_buffer::{Point, Selection};
-use forge_debug::{DebugEvent, LldbDriver};
+use forge_debug::{DebugEvent, LldbDriver, LocalVariable};
 use forge_lsp::{
     CompletionItem, DidChange, HoverContents, LspClient, LspEvent, LspHandle, TextDocumentSyncKind,
 };
@@ -46,7 +46,8 @@ use crate::memory_bar::{project, Level, MemoryBarState};
 use crate::output::push_output;
 use crate::panels::runtime_panel::{self, RunRecord};
 use crate::panels::{
-    code_view, file_tree, structure_panel, telemetry_sidebar, terminal_panel, training_view,
+    asm_view, code_view, debug_panel, file_tree, structure_panel, telemetry_sidebar,
+    terminal_panel, training_view,
 };
 use crate::prefs::TelemetryPrefs;
 use crate::quick_open::{self, FileEntry, KeyAction, Match, QuickOpenState};
@@ -137,6 +138,13 @@ pub enum AppEvent {
         anchor: (usize, usize),
         max_lines: usize,
     },
+    /// An `-O3 -march=native` assembly listing for request `generation` (§6 ASM
+    /// viewer). Carries the engine result (asm text + `.loc` line map). Stale
+    /// generations (superseded by a newer edit-refresh) are dropped.
+    AsmReady { generation: u64, result: AsmResult },
+    /// Lazily-fetched children of an expandable debug variable (§5.8): the lldb
+    /// expression `path` the fetch was keyed on plus the resolved `children`.
+    VarChildren { path: String, children: Vec<LocalVariable> },
 }
 
 /// Everything [`JadeApp`] needs from `main` to be constructed — kept as one
@@ -216,6 +224,15 @@ pub struct NoteResize {
     pub start_y: f32,
     pub orig_w: f32,
     pub orig_h: f32,
+}
+
+/// An in-flight inline benchmark-name input (§5.4). The buffer is prefilled with
+/// `#<run> <flags>` and committed on Enter (Esc cancels). `run_index` picks the
+/// HISTORY row's run + its recorded stats; `flags` are carried onto the entry.
+pub struct BenchNaming {
+    pub run_index: usize,
+    pub buffer: String,
+    pub flags: String,
 }
 
 pub struct JadeApp {
@@ -390,6 +407,44 @@ pub struct JadeApp {
     /// navigation can reveal a target line.
     pub code_scroll: gpui::UniformListScrollHandle,
 
+    // ── ASM viewer (§6, ⌘⇧A) ──────────────────────────────────────────────────
+    /// Whether the right-half ASM overlay is shown.
+    pub asm_visible: bool,
+    /// The current assembly listing + bidirectional line map (`None` until the
+    /// first generate_asm resolves for the active file).
+    pub asm: Option<crate::asm::AsmView>,
+    /// Monotonic asm-request generation (supersede stale / auto-refresh responses).
+    asm_gen: u64,
+    /// True while an asm generation is in flight (drives the "generating…" hint).
+    pub asm_loading: bool,
+    /// Scroll handle for the virtualized asm line list (asm→src scroll target).
+    pub asm_scroll: gpui::UniformListScrollHandle,
+
+    // ── Debug panel (§5.8) + breakpoints (§4.6) ───────────────────────────────
+    /// Structural debug session (frames / variables tree / console).
+    pub debug: crate::debug::DebugSession,
+    /// Whether the debug panel is docked (above the terminal, hiding it).
+    pub debug_visible: bool,
+    /// The `output_visible` value to restore when the debug panel hides (§5.8
+    /// "restoring prior visibility on hide").
+    debug_term_restore: Option<bool>,
+    /// Per-file breakpoint sets (gutter toggles; synced live to the driver;
+    /// persisted in the `ui` blob).
+    pub breakpoints: crate::debug::Breakpoints,
+
+    // ── Benchmarks (§5.4) ─────────────────────────────────────────────────────
+    /// Saved named benchmarks (persisted in the `ui` blob; sorted fastest-first
+    /// at render time).
+    pub benchmarks: Vec<crate::benchmark::Benchmark>,
+    /// In-flight inline benchmark-name input (`Some` while naming a saved run).
+    pub bench_naming: Option<BenchNaming>,
+    /// Focus handle for the benchmark-name input (created lazily; None headless).
+    bench_focus: Option<FocusHandle>,
+
+    // ── Per-workspace UI persistence (§1.2) ───────────────────────────────────
+    /// Monotonic ui-save generation (1500ms debounce around `workspace_state::save`).
+    ui_save_gen: u64,
+
     // ── Output panel + memory bar ─────────────────────────────────────────────
     pub output: Vec<String>,
     pub output_visible: bool,
@@ -456,6 +511,11 @@ impl JadeApp {
         let notes = crate::notes::load(&deps.workspace_root);
         let (xp_store, xp_total) = crate::xp::XpStore::load();
 
+        // Per-workspace UI blob (§1.2): tabs, panel visibility, breakpoints,
+        // benchmarks, ai toggle. Restored after a workspace opens, merging with
+        // (not clobbering) the notes the sticky-notes module owns in the same file.
+        let ui = crate::workspace_state::load(&deps.workspace_root);
+
         let mut editor = EditorState::new(TokenPalette::forge_dark());
         // Preserve the --file/--project seeding as the initially open tab: open it
         // through the real tab/highlight path so `active_file` follows the tab.
@@ -465,6 +525,21 @@ impl JadeApp {
                 active_file = editor.active_path();
             }
         }
+        // Restore persisted open tabs, skipping deleted files silently
+        // (editor-manager.ts:272-280).
+        for tab in &ui.open_tabs {
+            let p = PathBuf::from(&tab.path);
+            if p.is_file() {
+                let _ = editor.open(&p);
+            }
+        }
+        // Restore the active tab index (clamped), else follow the seeded file.
+        if let Some(idx) = ui.active_tab_index {
+            if idx >= 0 && (idx as usize) < editor.tabs.len() {
+                editor.switch(idx as usize);
+            }
+        }
+        active_file = editor.active_path().or(active_file);
 
         Self {
             server: deps.server,
@@ -513,7 +588,7 @@ impl JadeApp {
             hover_gen: 0,
             hover_target: None,
 
-            ai_completion_enabled: true,
+            ai_completion_enabled: ui.ai_completion_enabled.unwrap_or(true),
             ai_multiline: false,
             ghost: None,
             ghost_gen: 0,
@@ -556,8 +631,25 @@ impl JadeApp {
             flow_visible: false,
             code_scroll: gpui::UniformListScrollHandle::new(),
 
+            asm_visible: false,
+            asm: None,
+            asm_gen: 0,
+            asm_loading: false,
+            asm_scroll: gpui::UniformListScrollHandle::new(),
+
+            debug: crate::debug::DebugSession::new(),
+            debug_visible: false,
+            debug_term_restore: None,
+            breakpoints: crate::debug::Breakpoints::from_map(ui.breakpoints.clone()),
+
+            benchmarks: ui.benchmarks.clone(),
+            bench_naming: None,
+            bench_focus: None,
+
+            ui_save_gen: 0,
+
             output: Vec::new(),
-            output_visible: true,
+            output_visible: ui.terminal_visible.unwrap_or(true),
             mem: MemoryBarState::default(),
             sys_stats: SystemStats::default(),
             ai_status: AiStatus {
@@ -631,6 +723,10 @@ impl JadeApp {
                 anchor,
                 max_lines,
             } => self.on_ghost(generation, content, prefix, suffix, line_suffix, anchor, max_lines),
+            AppEvent::AsmReady { generation, result } => self.on_asm_ready(generation, result),
+            AppEvent::VarChildren { path, children } => {
+                self.debug.set_children(path, children);
+            }
         }
     }
 
@@ -824,20 +920,114 @@ impl JadeApp {
         });
     }
 
+    /// Populate the structural debug panel from LLDB events (§5.8): CONSOLE
+    /// (ANSI-stripped), the FRAMES list + VARIABLES tree on a stop, and the exit
+    /// status. Program output also flows to the console column.
     fn on_debug_event(&mut self, ev: DebugEvent) {
         match ev {
-            DebugEvent::Output(s) => push_output(&mut self.output, &s),
+            DebugEvent::Output(s) => self.debug.push_console(&s),
             DebugEvent::Stopped {
-                reason, file, line, ..
+                reason,
+                file,
+                line,
+                frames,
+                locals,
             } => {
-                // Full debug UI is Phase-4; a status line is enough now.
+                let refetch =
+                    self.debug.on_stopped(reason.clone(), file.clone(), line, frames, locals);
                 self.status_line(&format!("[forge] paused at {file}:{line} ({reason})"));
+                self.reveal_line(line as usize);
+                // Re-fetch children of paths that were expanded before the step so
+                // the tree keeps its shape (values changed → cache was invalidated).
+                for path in refetch {
+                    self.request_var_children(&path);
+                }
             }
             DebugEvent::Exited(code) => {
                 self.debugging = false;
+                self.debug.on_exited(code);
                 self.status_line(&format!("[forge] debug exited ({code})"));
             }
         }
+    }
+
+    /// Show the debug panel, docking it above the terminal and hiding the bottom
+    /// strip, remembering its prior visibility to restore on hide (§5.8).
+    fn show_debug(&mut self) {
+        if !self.debug_visible {
+            self.debug_term_restore = Some(self.output_visible);
+            self.debug_visible = true;
+        }
+    }
+
+    /// Hide the debug panel, restoring the terminal's prior visibility (§5.8).
+    pub fn hide_debug(&mut self) {
+        self.debug_visible = false;
+        if let Some(v) = self.debug_term_restore.take() {
+            self.output_visible = v;
+        }
+    }
+
+    // ── Debug session controls (§5.8 header buttons + F-keys) ─────────────────
+
+    /// Continue / step over / into / out. Each is a no-op without a live driver.
+    pub fn debug_continue(&mut self) {
+        self.debug.status = crate::debug::DebugStatus::Running;
+        self.run_driver(|d| Box::pin(async move { d.lock().await.continue_().await }));
+    }
+    pub fn debug_step_over(&mut self) {
+        self.run_driver(|d| Box::pin(async move { d.lock().await.step_over().await }));
+    }
+    pub fn debug_step_into(&mut self) {
+        self.run_driver(|d| Box::pin(async move { d.lock().await.step_into().await }));
+    }
+    pub fn debug_step_out(&mut self) {
+        self.run_driver(|d| Box::pin(async move { d.lock().await.step_out().await }));
+    }
+
+    /// Select a stack frame (click navigates + reveals its line, §5.8).
+    pub fn debug_select_frame(&mut self, index: usize) {
+        self.debug.select_frame(index);
+        if let Some(f) = self.debug.frames.get(index) {
+            self.reveal_line(f.line as usize);
+        }
+    }
+
+    /// Toggle a variable's expansion; lazily fetch its children on expand.
+    pub fn debug_toggle_var(&mut self, path: &str) {
+        if let Some(p) = self.debug.toggle_var(path) {
+            self.request_var_children(&p);
+        }
+    }
+
+    /// Spawn `get_var_children(path)` on the driver, forwarding the result back
+    /// onto the pump as [`AppEvent::VarChildren`].
+    fn request_var_children(&self, path: &str) {
+        let Some(driver) = self.driver.clone() else {
+            return;
+        };
+        let tx = self.app_tx.clone();
+        let path = path.to_string();
+        self.runtime.spawn(async move {
+            let children = driver.lock().await.get_var_children(&path).await;
+            let _ = tx.send(AppEvent::VarChildren { path, children });
+        });
+    }
+
+    /// Run a `&LldbDriver` async op behind the shared lock (continue/step). The
+    /// closure receives an owned `Arc` guard target; skipped when no session.
+    fn run_driver<F>(&self, f: F)
+    where
+        F: FnOnce(
+                std::sync::Arc<AsyncMutex<LldbDriver>>,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+            + Send
+            + 'static,
+    {
+        let Some(driver) = self.driver.clone() else {
+            return;
+        };
+        self.runtime.spawn(f(driver));
     }
 
     // ── Action-bar handlers (buttons AND the smoke hook call these) ───────────
@@ -972,8 +1162,10 @@ impl JadeApp {
         self.building = true;
         self.debugging = true;
         self.mem.reset();
-        self.output_visible = true;
         self.status_line("[forge] Debug build (forced -O0)...");
+        // Show the debug panel (docks above the terminal, §5.8) and mark running.
+        self.show_debug();
+        self.debug.on_running();
 
         let req = CompileRequest {
             file,
@@ -985,6 +1177,8 @@ impl JadeApp {
         let driver = self.driver.clone().expect("driver constructed above");
         let tx = self.app_tx.clone();
         let sock = self.server.socket_path().display().to_string();
+        // Breakpoints passed to the session at launch (§4.6).
+        let breakpoints = self.breakpoints.all();
         let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let ftx = tx.clone();
         self.runtime.spawn(async move {
@@ -1012,7 +1206,10 @@ impl JadeApp {
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|| ".".to_string());
                 let mut d = driver.lock().await;
-                if let Err(e) = d.start(&exe.display().to_string(), &cwd, &[], &env).await {
+                if let Err(e) = d
+                    .start(&exe.display().to_string(), &cwd, &breakpoints, &env)
+                    .await
+                {
                     let _ = tx.send(AppEvent::Debug(DebugEvent::Output(format!(
                         "lldb start failed: {e}\n"
                     ))));
@@ -1033,6 +1230,8 @@ impl JadeApp {
         self.building = false;
         self.running = false;
         self.debugging = false;
+        self.debug.status = crate::debug::DebugStatus::Idle;
+        self.hide_debug();
         self.status_line("[forge] Stopped");
     }
 
@@ -1051,13 +1250,20 @@ impl JadeApp {
         });
     }
 
-    /// Swap forge-dark / forge-light (deliverable §3).
+    /// Swap forge-dark / forge-light (deliverable §3). Also swaps the editor's
+    /// token palette so syntax highlighting re-resolves for the new theme (§4.2).
     pub fn action_theme(&mut self) {
-        self.theme = if self.theme.is_light {
-            Theme::forge_dark()
-        } else {
+        let light = !self.theme.is_light;
+        self.theme = if light {
             Theme::forge_light()
+        } else {
+            Theme::forge_dark()
         };
+        self.editor.set_palette(if light {
+            TokenPalette::forge_light()
+        } else {
+            TokenPalette::forge_dark()
+        });
     }
 
     /// Toggle the output panel visibility.
@@ -1430,7 +1636,12 @@ impl JadeApp {
                     }
                 }
                 "a" => {
-                    self.buf_move(|b, _| b.select_all(), false);
+                    // ⌘⇧A toggles the ASM viewer (§3); ⌘A selects all.
+                    if shift {
+                        self.toggle_asm(cx);
+                    } else {
+                        self.buf_move(|b, _| b.select_all(), false);
+                    }
                 }
                 "z" => {
                     if shift {
@@ -1509,6 +1720,7 @@ impl JadeApp {
         self.hover_target = None;
         self.ghost = None; // any caret move dismisses ghost text (§4.11)
         self.scroll_caret_into_view();
+        self.sync_asm_selection(); // keep the ASM cross-highlight aligned (§6)
     }
 
     /// Page up/down by the current viewport height in rows.
@@ -1567,6 +1779,10 @@ impl JadeApp {
         self.scroll_caret_into_view();
         self.schedule_ghost(cx);
         self.ensure_decoration_wake(cx);
+        // ASM viewer (§6): keep the cross-highlight aligned with the caret and
+        // auto-refresh the listing 1.5s after the edit settles while visible.
+        self.sync_asm_selection();
+        self.schedule_asm_refresh(cx);
     }
 
     /// Award XP for edits whose change inserted a newline and whose completed line
@@ -1798,6 +2014,7 @@ impl JadeApp {
             }
         };
         self.editor_selecting = selecting;
+        self.sync_asm_selection(); // source caret → asm cross-highlight (§6)
     }
 
     /// Left-drag: extend the selection head to the pointer.
@@ -2559,6 +2776,296 @@ impl JadeApp {
     }
 }
 
+// ── ASM viewer · breakpoints · benchmarks · UI persistence (Phase-5a) ─────────
+impl JadeApp {
+    // ── ASM viewer (§6) ───────────────────────────────────────────────────────
+
+    /// Toggle the right-half ASM overlay (ASM chip / ⌘⇧A). Opening kicks off a
+    /// `generate_asm` for the active file (saving first, app.ts:399); closing just
+    /// drops the overlay (the listing is kept so a re-open is instant).
+    pub fn toggle_asm(&mut self, cx: &mut Context<Self>) {
+        self.asm_visible = !self.asm_visible;
+        if self.asm_visible {
+            self.refresh_asm(cx);
+            self.sync_asm_selection();
+        }
+    }
+
+    /// (Re)generate the assembly for the active file (§6). Saves the buffer first
+    /// (so the asm matches on-screen code), then spawns `generate_asm` on the
+    /// engine, superseding any in-flight request via the generation counter.
+    fn refresh_asm(&mut self, _cx: &mut Context<Self>) {
+        let Some(file) = self.active_file.clone() else {
+            return;
+        };
+        // Save first so the assembly reflects the current buffer (app.ts:399).
+        self.editor_save();
+        self.asm_gen += 1;
+        let generation = self.asm_gen;
+        self.asm_loading = true;
+        let engine = self.engine.clone();
+        let tx = self.app_tx.clone();
+        self.runtime.spawn(async move {
+            let result = engine.generate_asm(&file, &[]).await;
+            let _ = tx.send(AppEvent::AsmReady { generation, result });
+        });
+    }
+
+    fn on_asm_ready(&mut self, generation: u64, result: AsmResult) {
+        if generation != self.asm_gen {
+            return; // superseded by a newer refresh
+        }
+        self.asm_loading = false;
+        if !result.success {
+            if let Some(e) = &result.error {
+                self.status_line(&format!("[forge] asm failed: {e}"));
+            }
+            return;
+        }
+        let mut view = crate::asm::AsmView::new(&result.asm, result.asm_to_source);
+        // Preserve/re-apply the source-line highlight for the current caret.
+        if let Some(src) = self.caret_source_line() {
+            view.select_source(src);
+        }
+        self.asm = Some(view);
+        self.sync_asm_selection();
+    }
+
+    /// The active tab's caret source line (1-based), for asm cross-highlighting.
+    fn caret_source_line(&self) -> Option<u32> {
+        self.editor.active_tab().map(|t| t.caret_point().row as u32 + 1)
+    }
+
+    /// Sync the ASM overlay's highlight to the source caret and scroll the first
+    /// mapped asm line into view (source→asm direction, §6).
+    pub fn sync_asm_selection(&mut self) {
+        if !self.asm_visible {
+            return;
+        }
+        let Some(src) = self.caret_source_line() else {
+            return;
+        };
+        let target = if let Some(view) = &mut self.asm {
+            view.select_source(src);
+            view.first_asm_row_for_source(src)
+        } else {
+            None
+        };
+        if let Some(row) = target {
+            self.asm_scroll
+                .scroll_to_item(row, gpui::ScrollStrategy::Center);
+        }
+    }
+
+    /// An asm row was clicked (§6): highlight its source counterpart and scroll
+    /// the source viewer to it (asm→src also scrolls).
+    pub fn asm_click(&mut self, asm_row0: usize) {
+        let src = self.asm.as_mut().and_then(|view| {
+            let s = view.source_for_asm(asm_row0);
+            if let Some(s) = s {
+                view.select_source(s);
+            }
+            s
+        });
+        if let Some(s) = src {
+            self.reveal_line(s as usize);
+        }
+    }
+
+    /// Auto-refresh the ASM 1.5s after a buffer edit while the overlay is visible
+    /// (§6). Debounced via a generation guard on the async wake.
+    fn schedule_asm_refresh(&mut self, cx: &mut Context<Self>) {
+        if !self.asm_visible {
+            return;
+        }
+        self.asm_gen += 1;
+        let generation = self.asm_gen;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(1500))
+                .await;
+            let _ = this.update(cx, |app, cx| {
+                // Only fire if no newer edit/toggle superseded this wake.
+                if app.asm_gen == generation && app.asm_visible {
+                    app.refresh_asm(cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    // ── Breakpoints (§4.6) ────────────────────────────────────────────────────
+
+    /// Toggle a breakpoint on the active file at 1-based `line` (gutter click).
+    /// Live-syncs the LLDB driver when a session exists, and persists the set.
+    pub fn toggle_breakpoint(&mut self, line: u32) {
+        let Some(path) = self.active_file.clone() else {
+            return;
+        };
+        let file = path.display().to_string();
+        let change = self.breakpoints.toggle(&file, line);
+        // Live-sync the driver (set_breakpoint / remove_breakpoint, §4.6).
+        if self.driver.is_some() {
+            let driver = self.driver.clone().unwrap();
+            let f = file.clone();
+            self.runtime.spawn(async move {
+                let d = driver.lock().await;
+                match change {
+                    crate::debug::BreakpointChange::Added => d.set_breakpoint(&f, line).await,
+                    crate::debug::BreakpointChange::Removed => d.remove_breakpoint(&f, line).await,
+                }
+            });
+        }
+    }
+
+    /// Whether `line` (1-based) has a breakpoint in the active file.
+    pub fn is_breakpoint(&self, line: u32) -> bool {
+        match &self.active_file {
+            Some(p) => self.breakpoints.is_set(&p.display().to_string(), line),
+            None => false,
+        }
+    }
+
+    // ── Benchmarks (§5.4) ─────────────────────────────────────────────────────
+
+    /// Begin naming a benchmark from HISTORY run `run_index` (the ⚑ flag). Shows
+    /// the inline input prefilled `#<run> <flags>` (§5.4).
+    pub fn begin_benchmark(&mut self, run_index: usize) {
+        // Current custom flags aren't wired to a UI field yet — use the last
+        // build's flags surrogate (empty for the default preset).
+        let flags = String::new();
+        self.bench_naming = Some(BenchNaming {
+            run_index,
+            buffer: crate::benchmark::default_name(run_index, &flags),
+            flags,
+        });
+    }
+
+    /// Commit the in-flight benchmark name (Enter), snapshotting the run's stats.
+    pub fn commit_benchmark(&mut self) {
+        let Some(naming) = self.bench_naming.take() else {
+            return;
+        };
+        let name = naming.buffer.trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        let rec = self.run_history.iter().find(|r| r.n == naming.run_index);
+        let (duration, peak) = match rec {
+            Some(r) => (r.duration_ms as f64, r.peak),
+            None => return,
+        };
+        self.benchmarks.push(crate::benchmark::Benchmark {
+            name,
+            flags: naming.flags,
+            duration,
+            peak_allocation: peak,
+            alloc_count: self.mem.alloc_count as u64,
+            timestamp: crate::benchmark::now_ms(),
+        });
+    }
+
+    /// Cancel the in-flight benchmark name (Esc).
+    pub fn cancel_benchmark(&mut self) {
+        self.bench_naming = None;
+    }
+
+    /// Delete a saved benchmark by index (× button).
+    pub fn delete_benchmark(&mut self, index: usize) {
+        if index < self.benchmarks.len() {
+            self.benchmarks.remove(index);
+        }
+    }
+
+    /// The latest completed run's duration (ms) — the benchmark delta baseline.
+    pub fn latest_run_ms(&self) -> Option<f64> {
+        self.run_history.last().map(|r| r.duration_ms as f64)
+    }
+
+    /// Apply one captured keystroke to the benchmark-name input. Enter commits,
+    /// Esc cancels, printable chars append, Backspace pops. Returns true if consumed.
+    pub fn bench_key(&mut self, ks: &gpui::Keystroke) -> bool {
+        if self.bench_naming.is_none() {
+            return false;
+        }
+        let m = ks.modifiers;
+        match ks.key.as_str() {
+            "enter" => self.commit_benchmark(),
+            "escape" => self.cancel_benchmark(),
+            "backspace" => {
+                if let Some(n) = &mut self.bench_naming {
+                    n.buffer.pop();
+                }
+            }
+            _ => {
+                let printable =
+                    ks.key_char.is_some() && !m.platform && !m.control && !m.alt && !m.function;
+                if printable {
+                    let ch = ks.key_char.clone().unwrap();
+                    if let Some(n) = &mut self.bench_naming {
+                        n.buffer.push_str(&ch);
+                    }
+                } else {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    // ── Per-workspace UI persistence (§1.2) ───────────────────────────────────
+
+    /// Snapshot the current UI state into the persisted `ui` blob shape.
+    fn build_ui_state(&self) -> crate::workspace_state::WorkspaceUi {
+        let open_tabs = self
+            .editor
+            .tabs
+            .iter()
+            .map(|t| crate::workspace_state::TabState {
+                path: t.path.display().to_string(),
+                is_dirty: t.buffer.is_dirty(),
+            })
+            .collect();
+        crate::workspace_state::WorkspaceUi {
+            open_tabs,
+            active_tab_index: self.editor.active.map(|i| i as i64),
+            file_tree_visible: Some(self.sidebar_tab == SidebarTab::Files),
+            terminal_visible: Some(self.output_visible),
+            memory_bar_visible: Some(true),
+            terminal_height: None,
+            breakpoints: self.breakpoints.to_map(),
+            benchmarks: self.benchmarks.clone(),
+            ai_completion_enabled: Some(self.ai_completion_enabled),
+        }
+    }
+
+    /// Persist the UI blob immediately (merge-preserving other keys). Used by the
+    /// headless smoke/tests; the GUI goes through [`schedule_ui_save`].
+    pub fn save_ui_state(&self) {
+        crate::workspace_state::save(&self.workspace_root, &self.build_ui_state());
+    }
+
+    /// Debounced UI-blob save (1500ms, `state.ts:130`). Coalesces bursts via a
+    /// generation guard, like the sticky-note save; the merge in
+    /// `workspace_state::save` preserves the sticky-notes the notes module owns.
+    /// Called from every UI mutation that changes a persisted key.
+    pub fn schedule_ui_save(&mut self, cx: &mut Context<Self>) {
+        self.ui_save_gen += 1;
+        let generation = self.ui_save_gen;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(1500))
+                .await;
+            let _ = this.update(cx, |app, _| {
+                if app.ui_save_gen == generation {
+                    app.save_ui_state();
+                }
+            });
+        })
+        .detach();
+    }
+}
+
 /// Flatten LSP hover contents to plain text (no markdown rendering yet — E2
 /// deferral). Handles the scalar / array / markup encodings.
 fn flatten_hover(hover: &forge_lsp::Hover) -> String {
@@ -2793,6 +3300,13 @@ impl Render for JadeApp {
             self.editor_focus = Some(cx.focus_handle());
         }
 
+        // Benchmark-name input focus (§5.4): focus it while naming so keystrokes
+        // reach the inline input instead of the editor/terminal.
+        let bench_handle = self.bench_focus.get_or_insert_with(|| cx.focus_handle()).clone();
+        if self.bench_naming.is_some() && !bench_handle.is_focused(window) {
+            bench_handle.focus(window, cx);
+        }
+
         let mut root = div()
             .flex()
             .flex_col()
@@ -2805,9 +3319,39 @@ impl Render for JadeApp {
             // or not a child (terminal, overlay) holds focus — key events bubble
             // to the window root when nothing else consumes them.
             .on_key_down(cx.listener(|app, ev: &KeyDownEvent, _win, cx| {
-                if ev.keystroke.key == "p" && ev.keystroke.modifiers.platform {
-                    app.toggle_quick_open();
-                    cx.notify();
+                // Global shortcuts (§3): fire whether or not a child holds focus,
+                // since unconsumed key events bubble to the window root.
+                let ks = &ev.keystroke;
+                let m = ks.modifiers;
+                match ks.key.as_str() {
+                    "p" if m.platform => {
+                        app.toggle_quick_open();
+                        cx.notify();
+                    }
+                    // ⌘⇧A toggles the ASM viewer (also handled in the focused
+                    // editor's key path; this catches the case where it isn't).
+                    "a" if m.platform && m.shift => {
+                        app.toggle_asm(cx);
+                        cx.notify();
+                    }
+                    // Debug stepping (§3): F5 continue, F10 over, F11 into, ⇧F11 out.
+                    "f5" => {
+                        app.debug_continue();
+                        cx.notify();
+                    }
+                    "f10" => {
+                        app.debug_step_over();
+                        cx.notify();
+                    }
+                    "f11" if m.shift => {
+                        app.debug_step_out();
+                        cx.notify();
+                    }
+                    "f11" => {
+                        app.debug_step_into();
+                        cx.notify();
+                    }
+                    _ => {}
                 }
             }))
             .child(action_bar(self, cx, &theme))
@@ -2821,10 +3365,14 @@ impl Render for JadeApp {
                     .p(px(6.))
                     .child(left_panel(self, cx, &theme))
                     .child(center_content(self, cx, &theme))
-                    .child(runtime_sidebar(self, cx, &theme)),
+                    .child(runtime_sidebar(self, cx, &theme, bench_handle)),
             );
 
-        if self.output_visible {
+        // Debug panel docks above the terminal, hiding it while a session is
+        // active (§5.8); else the terminal/output strip shows when visible.
+        if self.debug_visible {
+            root = root.child(debug_panel::render(self, cx));
+        } else if self.output_visible {
             root = root.child(bottom_panel(self, cx, &theme, term_handle));
         }
         let mut root = root
@@ -2916,7 +3464,7 @@ fn action_bar(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl I
             terminal_active,
             false,
             cx,
-            |a, _| {
+            |a, cx| {
                 // Show + focus the TERMINAL view, or hide the strip if it's the
                 // one already up.
                 if a.output_visible && a.bottom_view == BottomView::Terminal {
@@ -2924,6 +3472,7 @@ fn action_bar(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl I
                 } else {
                     a.set_bottom_view(BottomView::Terminal);
                 }
+                a.schedule_ui_save(cx); // terminalVisible (§1.2)
             },
         ))
         .child(action_chip(
@@ -2978,8 +3527,16 @@ fn action_bar(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl I
         .items_center()
         .gap_2()
         .child(diag_badges)
-        // ASM viewer is a Phase-4 overlay — disabled placeholder for now.
-        .child(chip("ASM", theme, false))
+        // ASM viewer (§6, ⌘⇧A): right-half overlay of the active file's assembly.
+        .child(action_chip(
+            "chip-asm",
+            "ASM".to_string(),
+            theme,
+            app.asm_visible,
+            false,
+            cx,
+            |a, cx| a.toggle_asm(cx),
+        ))
         .child(action_chip(
             "btn-build",
             build_label,
@@ -3027,7 +3584,10 @@ fn action_bar(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl I
             app.ai_completion_enabled,
             false,
             cx,
-            |a, _| a.action_toggle_ai_completion(),
+            |a, cx| {
+                a.action_toggle_ai_completion();
+                a.schedule_ui_save(cx); // aiCompletionEnabled (§1.2)
+            },
         ))
         .child(action_chip(
             "btn-ai-multi",
@@ -3153,7 +3713,8 @@ fn left_panel(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl I
 /// Center: the tab strip + read-only code viewer (deliverables §3, §5), replacing
 /// the placeholder.
 fn center_content(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl IntoElement {
-    div()
+    let mut center = div()
+        .relative()
         .flex()
         .flex_col()
         .flex_1()
@@ -3163,10 +3724,20 @@ fn center_content(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> im
         .border_color(rgb(theme.border))
         .overflow_hidden()
         .child(code_view::tab_strip(app, cx, theme))
-        .child(code_view::render(app, cx))
+        .child(code_view::render(app, cx));
+    // §6 ASM viewer: right-half overlay over the editor when toggled on.
+    if app.asm_visible {
+        center = center.child(asm_view::overlay(app, cx));
+    }
+    center
 }
 
-fn runtime_sidebar(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl IntoElement {
+fn runtime_sidebar(
+    app: &JadeApp,
+    cx: &mut Context<JadeApp>,
+    theme: &Theme,
+    bench_handle: FocusHandle,
+) -> impl IntoElement {
     let mut col = div()
         .id("runtime-sidebar")
         .flex()
@@ -3181,7 +3752,7 @@ fn runtime_sidebar(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> i
         .overflow_y_scroll();
     // RUNTIME panel sits above TRAINING, shown when toggled (§5.4).
     if app.runtime_visible {
-        col = col.child(runtime_panel::render(app, cx));
+        col = col.child(runtime_panel::render(app, bench_handle, cx));
     }
     col.child(training_view::render(app, cx))
         .child(telemetry_sidebar::render(app, cx))

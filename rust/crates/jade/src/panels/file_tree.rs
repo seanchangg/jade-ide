@@ -119,6 +119,7 @@ fn tree_row(
             app.toggle_dir(path.clone());
         } else {
             app.open_file(path.clone());
+            app.schedule_ui_save(cx); // openTabs / activeTabIndex (§1.2)
         }
         cx.notify();
     }))
