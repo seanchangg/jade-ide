@@ -4,11 +4,22 @@ Rust rewrite of the Electron/TypeScript Jade IDE. The `jade` crate is the GPUI
 app shell; the `forge-*` crates are the build/debug/telemetry/terminal/AI engines
 it wires together.
 
+## Dev loop (no bundle)
+
+The `.app` bundle is distribution-only — day-to-day you run the debug binary
+directly. From `rust/`:
+
 ```
-cargo run -p jade                    # bare window
-cargo run -p jade -- --project dir/  # open the first C++ source in a dir
+cargo dev                            # welcome screen (alias for run -p jade --)
+cargo dev --project dir/             # open a project
 cargo run -p jade -- --smoke ghost   # headless smoke check (no window)
 ```
+
+A warm incremental rebuild after editing the jade crate is ~1–2s. Dev runs are
+functionally identical to the bundle: icons are compiled into the binary and
+`fonts.rs` falls back to `scripts/resources/fonts/`, so JetBrains Mono loads
+without a bundle. For rebuild-on-save, `cargo install cargo-watch` once, then
+`cargo watch -x 'dev --project dir/'`.
 
 ## Packaging (macOS)
 
@@ -71,7 +82,8 @@ macOS monospace fallback). The loading machinery is fully in place:
   `Menlo` to `JetBrains Mono`. Every code/terminal `.font_family(..)` call site
   goes through `mono_family()`, so the whole app switches together.
 
-A dev `cargo run` (no bundle dir) is a clean no-op and keeps Menlo.
+A dev `cargo run`/`cargo dev` resolves the repo's `scripts/resources/fonts/`
+drop-in dir instead, so dev builds render with the same bundled family.
 
 ### Not done / limitations
 

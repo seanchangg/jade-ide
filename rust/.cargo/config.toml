@@ -1,0 +1,9 @@
+# Workspace-local cargo aliases (rust/ dir only).
+
+[alias]
+# `cargo dev [--project <dir>] [--file <f>]` — the lightweight dev loop:
+# incremental debug build of just the changed crates (~1-2s warm) and run,
+# no .app bundle. Dev runs load the same bundled fonts (scripts/resources/
+# fonts fallback in fonts.rs) and embedded icons as the bundle, so what you
+# see is what ships. Bundle only to cut a distributable (scripts/bundle-mac.sh).
+dev = "run -p jade --"
