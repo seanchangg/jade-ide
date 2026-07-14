@@ -30,13 +30,16 @@ use tokio::runtime::Handle;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::Mutex as AsyncMutex;
 
+use crate::editor_view::EditorState;
+use crate::highlight::TokenPalette;
 use crate::memory_bar::{project, Level, MemoryBarState};
 use crate::output::push_output;
-use crate::panels::{telemetry_sidebar, training_view};
+use crate::panels::{code_view, file_tree, telemetry_sidebar, training_view};
 use crate::prefs::TelemetryPrefs;
 use crate::registry::{key_of, TelemetryRegistry, DEFAULT_MAX_DIM};
 use crate::theme::Theme;
 use crate::training::{TensorFrame, TrainingData};
+use crate::workspace_tree::FileTree;
 
 /// The single unified event type crossing into the app pump. Every async source
 /// (deliverable §1) is one of these variants, so burst-coalescing and the
@@ -73,6 +76,9 @@ pub struct AppDeps {
     pub app_tx: UnboundedSender<AppEvent>,
     pub active_file: Option<PathBuf>,
     pub repo_root: PathBuf,
+    /// Root the file-tree panel scans (the `--project` dir, else the active
+    /// file's parent, else the repo root).
+    pub workspace_root: PathBuf,
     pub demo: bool,
 }
 
@@ -100,6 +106,12 @@ pub struct JadeApp {
     repo_root: PathBuf,
     /// LLDB driver, constructed lazily on the first Debug (deliverable §2).
     driver: Option<Arc<AsyncMutex<LldbDriver>>>,
+
+    // ── Code-viewing vertical (deliverables §1-§5) ────────────────────────────
+    /// Scanned workspace file tree (left panel). `None` if the root is unreadable.
+    pub tree: Option<FileTree>,
+    /// Open tabs + read-only highlighted viewer state (center).
+    pub editor: EditorState,
 
     // ── Build/run/debug lifecycle state ───────────────────────────────────────
     pub active_file: Option<PathBuf>,
@@ -165,6 +177,18 @@ impl JadeApp {
     /// Headless constructor (smoke hook / tests): assemble state, no pump. The
     /// caller drives `app_rx` itself and calls [`apply_app_event`](Self::apply_app_event).
     pub fn assemble(deps: AppDeps) -> Self {
+        // Scan the workspace root for the file tree (§5.1) and seed the editor.
+        let tree = Some(FileTree::scan(deps.workspace_root.clone()));
+        let mut editor = EditorState::new(TokenPalette::forge_dark());
+        // Preserve the --file/--project seeding as the initially open tab: open it
+        // through the real tab/highlight path so `active_file` follows the tab.
+        let mut active_file = deps.active_file.clone();
+        if let Some(file) = &deps.active_file {
+            if editor.open(file).is_ok() {
+                active_file = editor.active_path();
+            }
+        }
+
         Self {
             server: deps.server,
             registry: TelemetryRegistry::new(),
@@ -180,7 +204,10 @@ impl JadeApp {
             repo_root: deps.repo_root,
             driver: None,
 
-            active_file: deps.active_file,
+            tree,
+            editor,
+
+            active_file,
             building: false,
             running: false,
             debugging: false,
@@ -543,6 +570,39 @@ impl JadeApp {
         self.output_visible = !self.output_visible;
     }
 
+    // ── Code-viewing vertical (file tree + tabs + viewer) ─────────────────────
+
+    /// Open a file in the editor (deliverable §3): reads + highlights it once
+    /// (deduped by path), makes it the active tab, and points `active_file` at it
+    /// so the Build/Run target follows the front tab.
+    pub fn open_file(&mut self, path: PathBuf) {
+        match self.editor.open(&path) {
+            Ok(_) => self.active_file = self.editor.active_path(),
+            Err(e) => self.status_line(&format!("[forge] Could not open {}: {e}", path.display())),
+        }
+    }
+
+    /// Toggle a directory in the file tree (deliverable §2): lazily loads its
+    /// children on first expansion.
+    pub fn toggle_dir(&mut self, path: PathBuf) {
+        if let Some(tree) = &mut self.tree {
+            tree.toggle_dir(&path);
+        }
+    }
+
+    /// Switch the active tab; `active_file` follows.
+    pub fn switch_tab(&mut self, index: usize) {
+        self.editor.switch(index);
+        self.active_file = self.editor.active_path();
+    }
+
+    /// Close a tab (close-index logic per `editor-manager.ts:208-241`);
+    /// `active_file` follows the new active tab (or clears when none remain).
+    pub fn close_tab(&mut self, index: usize) {
+        self.editor.close(index);
+        self.active_file = self.editor.active_path();
+    }
+
     /// True once a successful build with an executable exists (Run gating).
     pub fn can_run(&self) -> bool {
         self.last_build
@@ -700,8 +760,8 @@ impl Render for JadeApp {
                     .flex_1()
                     .gap(px(6.))
                     .p(px(6.))
-                    .child(left_panel(&theme))
-                    .child(center_content(&theme))
+                    .child(left_panel(self, cx, &theme))
+                    .child(center_content(self, cx, &theme))
                     .child(runtime_sidebar(self, cx, &theme)),
             );
 
@@ -886,7 +946,8 @@ fn action_chip(
     }
 }
 
-fn left_panel(theme: &Theme) -> impl IntoElement {
+/// Left panel: the file-tree card (deliverable §2), replacing the placeholder.
+fn left_panel(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl IntoElement {
     div()
         .flex()
         .flex_col()
@@ -897,30 +958,24 @@ fn left_panel(theme: &Theme) -> impl IntoElement {
         .bg(rgb(theme.panel))
         .border_1()
         .border_color(rgb(theme.border))
-        .child(div().text_color(rgb(theme.muted)).text_xs().child("FILES"))
-        .child(
-            div()
-                .text_color(rgb(theme.muted))
-                .text_xs()
-                .child("Open a folder to get started"),
-        )
+        .overflow_hidden()
+        .child(file_tree::render(app, cx))
 }
 
-fn center_content(theme: &Theme) -> impl IntoElement {
+/// Center: the tab strip + read-only code viewer (deliverables §3, §5), replacing
+/// the placeholder.
+fn center_content(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl IntoElement {
     div()
         .flex()
+        .flex_col()
         .flex_1()
-        .items_center()
-        .justify_center()
         .rounded_lg()
         .bg(rgb(theme.bg))
         .border_1()
         .border_color(rgb(theme.border))
-        .child(
-            div()
-                .text_color(rgb(theme.muted))
-                .child("editor — center content placeholder"),
-        )
+        .overflow_hidden()
+        .child(code_view::tab_strip(app, cx, theme))
+        .child(code_view::render(app, cx))
 }
 
 fn runtime_sidebar(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl IntoElement {

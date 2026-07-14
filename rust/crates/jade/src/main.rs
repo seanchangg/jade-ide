@@ -34,7 +34,9 @@
 #![allow(dead_code)]
 
 mod app;
+mod editor_view;
 mod format;
+mod highlight;
 mod memory_bar;
 mod output;
 mod panels;
@@ -42,8 +44,9 @@ mod prefs;
 mod registry;
 mod theme;
 mod training;
+mod workspace_tree;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use forge_ai::InlineCompletionBackend;
@@ -88,6 +91,7 @@ fn main() {
     spawn_forwarders(&handle, app_tx.clone(), tel_events, &sysmon, &ai);
 
     let active_file = resolve_active_file(&args);
+    let workspace_root = resolve_workspace_root(&args, active_file.as_deref(), &root);
     let demo = args.iter().any(|a| a == "--train");
 
     println!("FORGE_TELEMETRY_SOCK={}", socket.display());
@@ -105,12 +109,19 @@ fn main() {
         app_tx,
         active_file,
         repo_root: root,
+        workspace_root,
         demo,
     };
 
     // ── Headless smoke hook (deliverable §7) ──────────────────────────────────
     if let Some(mode) = arg_value(&args, "--smoke") {
-        run_smoke(runtime, deps, app_rx, &mode);
+        if mode == "open" {
+            // `--smoke open <file>`: drive the real tab/highlight path headlessly.
+            let target = arg_value(&args, "open").map(PathBuf::from);
+            run_smoke_open(deps, target);
+        } else {
+            run_smoke(runtime, deps, app_rx, &mode);
+        }
         return;
     }
 
@@ -244,6 +255,47 @@ fn run_smoke(
             }
         }
     });
+}
+
+/// `--smoke open <file>` (deliverable §7/§8): assemble the app (which scans the
+/// tree and seeds any `--file`/`--project` tab), open `<file>` through the real
+/// tab + tree-sitter-highlight path, and print a machine-readable line proving
+/// the viewer pipeline works headlessly.
+fn run_smoke_open(deps: AppDeps, target: Option<PathBuf>) {
+    let target = match target.or_else(|| deps.active_file.clone()) {
+        Some(t) => t,
+        None => {
+            println!("[smoke] FAIL open: no file (usage: --smoke open <file>)");
+            return;
+        }
+    };
+    let mut app = JadeApp::assemble(deps);
+    app.open_file(target.clone());
+    match app.editor.active_tab() {
+        Some(tab) if tab.path == target => println!(
+            "[smoke] open {} lines={} spans={}",
+            target.display(),
+            tab.lines.len(),
+            tab.span_count()
+        ),
+        _ => println!("[smoke] FAIL open {}", target.display()),
+    }
+}
+
+/// The file tree's scan root: the `--project` dir if given, else the active
+/// file's parent directory, else the repo root.
+fn resolve_workspace_root(args: &[String], active: Option<&std::path::Path>, root: &Path) -> PathBuf {
+    if let Some(dir) = arg_value(args, "--project") {
+        return PathBuf::from(dir);
+    }
+    if let Some(f) = active {
+        if let Some(parent) = f.parent() {
+            if !parent.as_os_str().is_empty() {
+                return parent.to_path_buf();
+            }
+        }
+    }
+    root.to_path_buf()
 }
 
 /// Resolve the forge-ide checkout root: `JADE_REPO_ROOT` if set, else the

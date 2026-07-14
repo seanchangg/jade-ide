@@ -20,3 +20,9 @@ forge-ai = { path = "../forge-ai" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Read-only syntax highlighting (editor-core Step 1): the plain tree-sitter
+# runtime + the C++ grammar (also drives .metal via added Metal keywords). No
+# zed language/editor crates — a focused highlight query maps captures to the
+# forge-dark palette (§4.2).
+tree-sitter = "0.25"
+tree-sitter-cpp = "0.23"

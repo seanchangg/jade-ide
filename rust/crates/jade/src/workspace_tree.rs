@@ -1,0 +1,414 @@
+//! Workspace file-tree model (feature inventory §5.1, deliverable §1).
+//!
+//! Pure logic + filesystem scan, no GPUI. Mirrors the Electron
+//! `src/main/workspace.ts` ignore rules and sort order exactly:
+//!   - ignored dirs: `node_modules`, `.git/.svn/.hg`, build dirs incl.
+//!     `cmake-build-forge`, caches, IDE dirs (`workspace.ts:6-10`);
+//!   - ignored file extensions: `.o .obj .a .lib .so .dylib .exe .out .class
+//!     .pyc` (`workspace.ts:12-15`);
+//!   - dotfiles hidden except `.forge`; `*.dSYM` hidden; root-level extensionless
+//!     files hidden (compiled-binary heuristic, `workspace.ts:91-94`);
+//!   - directories first, then case-insensitive alphabetical (`localeCompare`).
+//!
+//! Lazy loading: the initial scan materializes **3 levels**; expanding an
+//! unloaded directory loads **1 more level** (§5.1). A directory whose children
+//! are `None` is an unloaded placeholder. No fs watching yet (Phase-4 wave 2).
+
+use std::path::{Path, PathBuf};
+
+/// Directory names never shown (`workspace.ts:6-10`).
+pub const IGNORED_DIRS: &[&str] = &[
+    "node_modules",
+    ".git",
+    ".svn",
+    ".hg",
+    ".DS_Store",
+    "build",
+    "cmake-build-debug",
+    "cmake-build-release",
+    "cmake-build-forge",
+    ".cache",
+    "__pycache__",
+    ".vscode",
+    ".idea",
+];
+
+/// File extensions never shown (`workspace.ts:12-15`), compared with the leading
+/// dot as in the TS `path.extname` check.
+pub const IGNORED_EXTENSIONS: &[&str] = &[
+    ".o", ".obj", ".a", ".lib", ".so", ".dylib", ".exe", ".out", ".class", ".pyc",
+];
+
+/// Initial scan depth (levels of entries materialized eagerly).
+pub const INITIAL_DEPTH: usize = 3;
+
+/// Source/header classification (deliverable §1) — drives the panel's
+/// accent/accent2 row coloring (§5.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtClass {
+    /// `.cpp .cc .cxx .mm .m .c` — accent-colored.
+    Source,
+    /// `.h .hpp .hxx` — accent2-colored.
+    Header,
+    /// Everything else — default text color.
+    Other,
+}
+
+/// Classify a file name by extension (deliverable §1).
+pub fn classify(name: &str) -> ExtClass {
+    let ext = name.rsplit('.').next().filter(|_| name.contains('.'));
+    match ext.map(|e| e.to_ascii_lowercase()).as_deref() {
+        Some("cpp" | "cc" | "cxx" | "mm" | "m" | "c") => ExtClass::Source,
+        Some("h" | "hpp" | "hxx") => ExtClass::Header,
+        _ => ExtClass::Other,
+    }
+}
+
+/// One node in the tree. `children == None` on a directory means "not yet loaded"
+/// (a lazy placeholder); `Some(vec)` means loaded (possibly empty). Files always
+/// have `children == None` and `is_dir == false`.
+#[derive(Debug, Clone)]
+pub struct FileNode {
+    pub name: String,
+    pub path: PathBuf,
+    pub is_dir: bool,
+    pub ext_class: ExtClass,
+    pub children: Option<Vec<FileNode>>,
+    pub expanded: bool,
+}
+
+impl FileNode {
+    /// True for a directory whose children have not been read from disk yet.
+    pub fn is_unloaded_dir(&self) -> bool {
+        self.is_dir && self.children.is_none()
+    }
+
+    /// Ensure a directory's immediate children are loaded (1 level; grandchildren
+    /// stay as unloaded placeholders). No-op for files or already-loaded dirs.
+    pub fn ensure_loaded(&mut self) {
+        if self.is_dir && self.children.is_none() {
+            self.children = Some(scan_dir(&self.path, false, 1));
+        }
+    }
+}
+
+/// The scanned workspace tree rooted at `root`.
+#[derive(Debug, Clone)]
+pub struct FileTree {
+    pub root: PathBuf,
+    pub roots: Vec<FileNode>,
+}
+
+/// A flattened, indentation-annotated row for rendering (deliverable §2).
+#[derive(Debug, Clone)]
+pub struct Row {
+    pub name: String,
+    pub path: PathBuf,
+    pub is_dir: bool,
+    pub ext_class: ExtClass,
+    /// Nesting depth (root entries = 0); the panel indents `12 + depth*16` px.
+    pub depth: usize,
+    pub expanded: bool,
+}
+
+impl FileTree {
+    /// Scan `root` to the initial depth (§5.1). Returns an empty tree on IO error.
+    pub fn scan(root: impl Into<PathBuf>) -> FileTree {
+        let root = root.into();
+        let roots = scan_dir(&root, true, INITIAL_DEPTH);
+        FileTree { root, roots }
+    }
+
+    /// Flatten the currently-visible tree (only descending into expanded dirs)
+    /// into rows with depths for rendering.
+    pub fn visible_rows(&self) -> Vec<Row> {
+        let mut out = Vec::new();
+        flatten(&self.roots, 0, &mut out);
+        out
+    }
+
+    /// Toggle a directory (by path): flip `expanded`, loading children on first
+    /// expansion. Returns true if a matching directory was found and toggled.
+    pub fn toggle_dir(&mut self, path: &Path) -> bool {
+        toggle_in(&mut self.roots, path)
+    }
+}
+
+fn flatten(nodes: &[FileNode], depth: usize, out: &mut Vec<Row>) {
+    for n in nodes {
+        out.push(Row {
+            name: n.name.clone(),
+            path: n.path.clone(),
+            is_dir: n.is_dir,
+            ext_class: n.ext_class,
+            depth,
+            expanded: n.expanded,
+        });
+        if n.is_dir && n.expanded {
+            if let Some(children) = &n.children {
+                flatten(children, depth + 1, out);
+            }
+        }
+    }
+}
+
+fn toggle_in(nodes: &mut [FileNode], path: &Path) -> bool {
+    for n in nodes.iter_mut() {
+        if n.path == path {
+            if n.is_dir {
+                n.ensure_loaded();
+                n.expanded = !n.expanded;
+            }
+            return true;
+        }
+        if n.is_dir {
+            if let Some(children) = &mut n.children {
+                if toggle_in(children, path) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Scan one directory. `is_root` enables the root-level extensionless-file rule;
+/// `load_levels` is how many levels of entries to materialize (a subdir gets its
+/// own children loaded only while `load_levels > 1`, else it's a placeholder).
+fn scan_dir(dir: &Path, is_root: bool, load_levels: usize) -> Vec<FileNode> {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+
+    // Collect (name, is_dir, path).
+    let mut entries: Vec<(String, bool, PathBuf)> = Vec::new();
+    for entry in read.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        entries.push((name, is_dir, entry.path()));
+    }
+
+    // Dirs first, then case-insensitive alphabetical (localeCompare-ish).
+    entries.sort_by(|a, b| match (a.1, b.1) {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => a
+            .0
+            .to_lowercase()
+            .cmp(&b.0.to_lowercase())
+            .then_with(|| a.0.cmp(&b.0)),
+    });
+
+    let mut nodes = Vec::new();
+    for (name, is_dir, path) in entries {
+        if !keep(&name, is_dir, is_root) {
+            continue;
+        }
+        let children = if is_dir && load_levels > 1 {
+            Some(scan_dir(&path, false, load_levels - 1))
+        } else {
+            None // file, or unloaded dir placeholder
+        };
+        nodes.push(FileNode {
+            ext_class: if is_dir { ExtClass::Other } else { classify(&name) },
+            name,
+            path,
+            is_dir,
+            children,
+            expanded: false,
+        });
+    }
+    nodes
+}
+
+/// Apply the visibility rules (`workspace.ts:90-111`). `is_root` gates the
+/// extensionless-file heuristic to the top level only.
+fn keep(name: &str, is_dir: bool, is_root: bool) -> bool {
+    if is_dir && IGNORED_DIRS.contains(&name) {
+        return false;
+    }
+    // Dotfiles hidden except `.forge`.
+    if name.starts_with('.') && name != ".forge" {
+        return false;
+    }
+    // `*.dSYM` bundles hidden.
+    if name.ends_with(".dSYM") {
+        return false;
+    }
+    // Root-level extensionless files: likely compiled binaries.
+    if is_root && !is_dir && !name.contains('.') {
+        return false;
+    }
+    // Ignored build-artifact extensions (files only).
+    if !is_dir {
+        if let Some(dot) = name.rfind('.') {
+            let ext = name[dot..].to_ascii_lowercase();
+            if IGNORED_EXTENSIONS.contains(&ext.as_str()) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    struct TempDir(PathBuf);
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    fn temp_fixture() -> TempDir {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let base = std::env::temp_dir().join(format!(
+            "jade-wt-test-{}-{}",
+            std::process::id(),
+            n
+        ));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+
+        // Kept files.
+        fs::write(base.join("main.cpp"), "int main(){}").unwrap();
+        fs::write(base.join("util.h"), "#pragma once").unwrap();
+        fs::write(base.join("notes.txt"), "hi").unwrap();
+        // Ignored: build-artifact ext, dotfile, extensionless root binary.
+        fs::write(base.join("main.o"), "").unwrap();
+        fs::write(base.join(".hidden"), "").unwrap();
+        fs::write(base.join("a.out"), "").unwrap();
+        fs::write(base.join("compiled_binary"), "").unwrap(); // extensionless @ root
+        // `.forge` dotdir is the one dotfile exception.
+        fs::create_dir_all(base.join(".forge")).unwrap();
+        fs::write(base.join(".forge").join("workspace.json"), "{}").unwrap();
+        // Ignored dirs.
+        fs::create_dir_all(base.join("node_modules")).unwrap();
+        fs::create_dir_all(base.join("cmake-build-forge")).unwrap();
+        fs::create_dir_all(base.join("app.dSYM")).unwrap();
+        // A real nested source dir.
+        fs::create_dir_all(base.join("src").join("engine")).unwrap();
+        fs::write(base.join("src").join("core.cc"), "").unwrap();
+        fs::write(base.join("src").join("engine").join("gpu.metal"), "").unwrap();
+
+        TempDir(base)
+    }
+
+    #[test]
+    fn classify_extensions() {
+        assert_eq!(classify("a.cpp"), ExtClass::Source);
+        assert_eq!(classify("a.mm"), ExtClass::Source);
+        assert_eq!(classify("a.c"), ExtClass::Source);
+        assert_eq!(classify("a.h"), ExtClass::Header);
+        assert_eq!(classify("a.hpp"), ExtClass::Header);
+        assert_eq!(classify("README.md"), ExtClass::Other);
+        assert_eq!(classify("Makefile"), ExtClass::Other);
+    }
+
+    #[test]
+    fn scan_applies_ignore_rules() {
+        let dir = temp_fixture();
+        let tree = FileTree::scan(dir.0.clone());
+        let names: Vec<&str> = tree.roots.iter().map(|n| n.name.as_str()).collect();
+
+        // Kept.
+        assert!(names.contains(&"main.cpp"));
+        assert!(names.contains(&"util.h"));
+        assert!(names.contains(&"notes.txt"));
+        assert!(names.contains(&"src"));
+        assert!(names.contains(&".forge")); // dotfile exception
+
+        // Ignored.
+        assert!(!names.contains(&"main.o"), "build artifact ext");
+        assert!(!names.contains(&".hidden"), "dotfile");
+        assert!(!names.contains(&"a.out"), "ignored ext");
+        assert!(!names.contains(&"compiled_binary"), "root extensionless");
+        assert!(!names.contains(&"node_modules"));
+        assert!(!names.contains(&"cmake-build-forge"));
+        assert!(!names.contains(&"app.dSYM"));
+    }
+
+    #[test]
+    fn dirs_first_then_alphabetical() {
+        let dir = temp_fixture();
+        let tree = FileTree::scan(dir.0.clone());
+        // First non-dot dir should precede all files. `.forge` and `src` are dirs.
+        let first_file = tree.roots.iter().position(|n| !n.is_dir).unwrap();
+        let last_dir = tree.roots.iter().rposition(|n| n.is_dir).unwrap();
+        assert!(last_dir < first_file, "all dirs come before all files");
+    }
+
+    #[test]
+    fn initial_scan_loads_three_levels() {
+        let dir = temp_fixture();
+        let tree = FileTree::scan(dir.0.clone());
+        let src = tree.roots.iter().find(|n| n.name == "src").unwrap();
+        // Level 1 (src children) loaded.
+        assert!(src.children.is_some());
+        let engine = src
+            .children
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|n| n.name == "engine")
+            .unwrap();
+        // Level 2 (engine children) loaded within the 3-level budget.
+        assert!(engine.children.is_some());
+        assert!(engine
+            .children
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|n| n.name == "gpu.metal"));
+    }
+
+    #[test]
+    fn lazy_expand_loads_one_more_level() {
+        let dir = temp_fixture();
+        // Build a deep structure beyond the initial 3 levels.
+        let deep = dir.0.join("l1").join("l2").join("l3").join("l4");
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(deep.join("deep.cpp"), "").unwrap();
+
+        let mut tree = FileTree::scan(dir.0.clone());
+        // Walk to l3 (an unloaded placeholder at the 3-level boundary).
+        // l1(0) -> l2(1) -> l3(2): l3's children should be None initially.
+        let l1 = tree.roots.iter().find(|n| n.name == "l1").unwrap();
+        let l2 = l1.children.as_ref().unwrap().iter().find(|n| n.name == "l2").unwrap();
+        let l3 = l2.children.as_ref().unwrap().iter().find(|n| n.name == "l3").unwrap();
+        assert!(l3.is_unloaded_dir(), "l3 is a lazy placeholder at depth 3");
+        let l3_path = l3.path.clone();
+
+        // Expand l3 → loads its children (l4), whose own children stay unloaded.
+        assert!(tree.toggle_dir(&l3_path));
+        let l1 = tree.roots.iter().find(|n| n.name == "l1").unwrap();
+        let l2 = l1.children.as_ref().unwrap().iter().find(|n| n.name == "l2").unwrap();
+        let l3 = l2.children.as_ref().unwrap().iter().find(|n| n.name == "l3").unwrap();
+        assert!(l3.expanded);
+        let l4 = l3.children.as_ref().unwrap().iter().find(|n| n.name == "l4").unwrap();
+        assert!(l4.is_unloaded_dir(), "l4 loaded but its children are still lazy");
+    }
+
+    #[test]
+    fn visible_rows_track_expansion() {
+        let dir = temp_fixture();
+        let mut tree = FileTree::scan(dir.0.clone());
+        let src_path = tree.roots.iter().find(|n| n.name == "src").unwrap().path.clone();
+
+        // Collapsed: src present, its children not.
+        let rows = tree.visible_rows();
+        assert!(rows.iter().any(|r| r.name == "src" && r.depth == 0));
+        assert!(!rows.iter().any(|r| r.name == "core.cc"));
+
+        // Expand src → its children appear at depth 1.
+        tree.toggle_dir(&src_path);
+        let rows = tree.visible_rows();
+        assert!(rows.iter().any(|r| r.name == "core.cc" && r.depth == 1));
+    }
+}
