@@ -44,7 +44,9 @@ mod memory_bar;
 mod output;
 mod panels;
 mod prefs;
+mod quick_open;
 mod registry;
+mod structure;
 mod theme;
 mod training;
 mod wg3d;
@@ -154,6 +156,12 @@ fn main() {
                 .map(PathBuf::from)
                 .or_else(|| deps.active_file.clone());
             run_smoke_decorations(target);
+        } else if mode == "structure" {
+            let target = arg_value(&args, "structure").map(PathBuf::from);
+            run_smoke_structure(deps, target);
+        } else if mode == "quickopen" {
+            let query = arg_value(&args, "quickopen").unwrap_or_default();
+            run_smoke_quickopen(deps, &query);
         } else {
             run_smoke(runtime, deps, app_rx, &mode);
         }
@@ -411,6 +419,47 @@ fn run_smoke_wg3d(deps: AppDeps) {
     }
 }
 
+
+/// with the total symbol count and the top-level count.
+fn run_smoke_structure(deps: AppDeps, target: Option<PathBuf>) {
+    let target = match target.or_else(|| deps.active_file.clone()) {
+        Some(t) => t,
+        None => {
+            println!("[smoke] FAIL structure: no file (usage: --smoke structure <file>)");
+            return;
+        }
+    };
+    let mut app = JadeApp::assemble(deps);
+    app.open_file(target.clone());
+    let symbols = app.active_symbols();
+    let total = structure::count(symbols);
+    let top = symbols.len();
+    println!(
+        "[smoke] structure {} symbols={} top_level={}",
+        target.display(),
+        total,
+        top
+    );
+}
+/// each with its relative-path hint when it differs from the bare name.
+fn run_smoke_quickopen(deps: AppDeps, query: &str) {
+    let root = deps.workspace_root.clone();
+    let tree = workspace_tree::FileTree::scan_full(root.clone());
+    let files = quick_open::flatten(&tree);
+    let matches = quick_open::filter(&files, query, &root);
+    println!(
+        "[smoke] quickopen query={:?} matches={} (of {} files)",
+        query,
+        matches.len(),
+        files.len()
+    );
+    for m in &matches {
+        match &m.hint {
+            Some(hint) => println!("  {}  ·  {}", m.name, hint),
+            None => println!("  {}", m.name),
+        }
+    }
+}
 
 /// machine-readable `[smoke] term ok cols=<c> rows=<r>` line.
 fn run_smoke_term(runtime: tokio::runtime::Runtime, deps: AppDeps) {

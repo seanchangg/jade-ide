@@ -126,6 +126,16 @@ impl FileTree {
         FileTree { root, roots }
     }
 
+    /// Scan `root` fully (all levels materialized), applying the same ignore
+    /// rules as [`scan`](Self::scan). Used to build the Quick Open file cache
+    /// (§5.7), which needs every openable file, not just the lazily-loaded
+    /// initial 3 levels.
+    pub fn scan_full(root: impl Into<PathBuf>) -> FileTree {
+        let root = root.into();
+        let roots = scan_dir(&root, true, usize::MAX);
+        FileTree { root, roots }
+    }
+
     /// Flatten the currently-visible tree (only descending into expanded dirs)
     /// into rows with depths for rendering.
     pub fn visible_rows(&self) -> Vec<Row> {

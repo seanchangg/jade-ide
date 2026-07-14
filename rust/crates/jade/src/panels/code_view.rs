@@ -217,6 +217,13 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> impl IntoElement {
 
                     // Always reserve a 2px left border so tinted lines don't shift.
                     row = row.border_l_2().border_color(border_col);
+                    // §4.7 structure tint is the subtle base layer; flow/exec/
+                    // error tints (stronger, semantic) take precedence when set.
+                    if row_bg.is_none() {
+                        if let Some(color) = crate::structure::line_tint(&tab.symbols, line_no) {
+                            row_bg = Some(rgba_a(color, 0.047));
+                        }
+                    }
                     if let Some(bg) = row_bg {
                         row = row.bg(bg);
                     }

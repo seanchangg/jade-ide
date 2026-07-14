@@ -26,7 +26,7 @@ use forge_debug::{DebugEvent, LldbDriver};
 use forge_sysmon::{SystemMonitor, SystemStats};
 use forge_telemetry::{Event, Kind, TelemetryServer};
 use forge_term::{GridSnapshot, TermEvent, TermId, TermManager};
-use gpui::{div, prelude::*, px, rgb, Context, FocusHandle, Window};
+use gpui::{div, prelude::*, px, rgb, Context, FocusHandle, KeyDownEvent, Window};
 use serde_json::{Map, Value};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -37,9 +37,13 @@ use crate::highlight::TokenPalette;
 use crate::memory_bar::{project, Level, MemoryBarState};
 use crate::output::push_output;
 use crate::panels::runtime_panel::{self, RunRecord};
-use crate::panels::{code_view, file_tree, telemetry_sidebar, terminal_panel, training_view};
+use crate::panels::{
+    code_view, file_tree, structure_panel, telemetry_sidebar, terminal_panel, training_view,
+};
 use crate::prefs::TelemetryPrefs;
+use crate::quick_open::{self, FileEntry, KeyAction, Match, QuickOpenState};
 use crate::registry::{key_of, TelemetryRegistry, DEFAULT_MAX_DIM};
+use crate::structure::Symbol;
 use crate::theme::Theme;
 use crate::training::{TensorFrame, TrainingData};
 use crate::wg3d::WeightGrid3D;
@@ -52,6 +56,14 @@ use crate::workspace_tree::FileTree;
 pub enum BottomView {
     Terminal,
     Output,
+}
+
+/// Which view the left sidebar shows (§5.5): the FILES tree or the STRUCTURE
+/// outline. Toggled by the sidebar tab switcher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidebarTab {
+    Files,
+    Structure,
 }
 
 /// The single unified event type crossing into the app pump. Every async source
@@ -159,6 +171,17 @@ pub struct JadeApp {
     pub tree: Option<FileTree>,
     /// Open tabs + read-only highlighted viewer state (center).
     pub editor: EditorState,
+
+    // ── Structure panel + Quick Open (Phase-4 wave 3, §5.5/§5.7) ──────────────
+    /// Which view the left sidebar shows (FILES tree vs STRUCTURE outline).
+    pub sidebar_tab: SidebarTab,
+    /// Quick Open overlay state (`Some` == open); the transient query + selection.
+    pub quick_open: Option<QuickOpenState>,
+    /// Focus handle for the Quick Open overlay (created lazily; None headless).
+    quick_open_focus: Option<FocusHandle>,
+    /// Cached flattened file list for Quick Open, per workspace root. Rebuilt on
+    /// first ⌘P and invalidated by `TreeChanged` (§5.7 "cached file list").
+    file_cache: Option<Vec<FileEntry>>,
 
     // ── Build/run/debug lifecycle state ───────────────────────────────────────
     pub active_file: Option<PathBuf>,
@@ -300,6 +323,11 @@ impl JadeApp {
             tree,
             editor,
 
+            sidebar_tab: SidebarTab::Files,
+            quick_open: None,
+            quick_open_focus: None,
+            file_cache: None,
+
             active_file,
             building: false,
             running: false,
@@ -368,6 +396,8 @@ impl JadeApp {
                 if let Some(tree) = &mut self.tree {
                     tree.refresh();
                 }
+                // Quick Open's cached file list is now stale (§5.7).
+                self.file_cache = None;
             }
         }
     }
@@ -836,6 +866,83 @@ impl JadeApp {
         self.active_file = self.editor.active_path();
     }
 
+    // ── Structure panel + Quick Open (Phase-4 wave 3) ─────────────────────────
+
+    /// Switch the left sidebar between FILES and STRUCTURE (§5.5).
+    pub fn set_sidebar_tab(&mut self, tab: SidebarTab) {
+        self.sidebar_tab = tab;
+    }
+
+    /// The active tab's tree-sitter outline (empty when no tab / non-C-family).
+    pub fn active_symbols(&self) -> &[Symbol] {
+        self.editor
+            .active_tab()
+            .map(|t| t.symbols.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Reveal a 1-based source line in the code viewer by scrolling it to center
+    /// (STRUCTURE click-to-navigate, §5.5). Same mechanism as `flow_goto`.
+    pub fn reveal_line(&mut self, line: usize) {
+        self.flow_goto(line);
+    }
+
+    /// Toggle the ⌘P Quick Open overlay (§5.7). Opening builds the file cache
+    /// lazily (per workspace); closing just drops the transient state.
+    pub fn toggle_quick_open(&mut self) {
+        if self.quick_open.is_some() {
+            self.quick_open = None;
+        } else {
+            self.ensure_file_cache();
+            self.quick_open = Some(QuickOpenState::default());
+        }
+    }
+
+    /// Close the Quick Open overlay.
+    pub fn close_quick_open(&mut self) {
+        self.quick_open = None;
+    }
+
+    /// Build the Quick Open file cache from a full workspace scan if absent
+    /// (§5.7). Reuses the `workspace_tree` scan + ignore rules.
+    fn ensure_file_cache(&mut self) {
+        if self.file_cache.is_none() {
+            let tree = FileTree::scan_full(self.workspace_root.clone());
+            self.file_cache = Some(quick_open::flatten(&tree));
+        }
+    }
+
+    /// The current Quick Open matches (filtered by the query, capped at 10). Empty
+    /// when the overlay is closed.
+    pub fn quick_open_matches(&self) -> Vec<Match> {
+        let Some(state) = &self.quick_open else {
+            return Vec::new();
+        };
+        let files = self.file_cache.as_deref().unwrap_or(&[]);
+        quick_open::filter(files, &state.query, &self.workspace_root)
+    }
+
+    /// Apply one captured keystroke to the Quick Open overlay (§5.7): printable
+    /// chars append, Backspace pops, ↑/↓ move, Enter opens, Esc closes.
+    pub fn quick_open_key(&mut self, key: &str, key_char: Option<String>, printable: bool) {
+        let matches = self.quick_open_matches();
+        let action = match self.quick_open.as_mut() {
+            Some(state) => state.on_key(key, key_char.as_deref(), printable, &matches),
+            None => return,
+        };
+        match action {
+            KeyAction::None => {}
+            KeyAction::Close => self.close_quick_open(),
+            KeyAction::Open(path) => self.quick_open_open(path),
+        }
+    }
+
+    /// Open a file from Quick Open and close the overlay.
+    pub fn quick_open_open(&mut self, path: PathBuf) {
+        self.close_quick_open();
+        self.open_file(path);
+    }
+
     /// True once a successful build with an executable exists (Run gating).
     pub fn can_run(&self) -> bool {
         self.last_build
@@ -1005,6 +1112,15 @@ impl Render for JadeApp {
             .text_color(rgb(theme.text))
             .font_family("Menlo") // JetBrains Mono isn't installed on this machine
             .text_sm()
+            // Global ⌘P: toggle Quick Open (§5.7). Root-level so it fires whether
+            // or not a child (terminal, overlay) holds focus — key events bubble
+            // to the window root when nothing else consumes them.
+            .on_key_down(cx.listener(|app, ev: &KeyDownEvent, _win, cx| {
+                if ev.keystroke.key == "p" && ev.keystroke.modifiers.platform {
+                    app.toggle_quick_open();
+                    cx.notify();
+                }
+            }))
             .child(action_bar(self, cx, &theme))
             .child(
                 // Main area: left panel | center content | right runtime sidebar.
@@ -1041,6 +1157,20 @@ impl Render for JadeApp {
                 f32::from(vp.height),
                 cx,
             );
+            root = root.child(overlay);
+        }
+
+        // §5.7 Quick Open overlay: centered over the editor area, focused so its
+        // captured-keystroke buffer receives input.
+        if self.quick_open.is_some() {
+            let focus = self
+                .quick_open_focus
+                .get_or_insert_with(|| cx.focus_handle())
+                .clone();
+            if !focus.is_focused(window) {
+                focus.focus(window, cx);
+            }
+            let overlay = crate::panels::quick_open::overlay(self, focus, cx);
             root = root.child(overlay);
         }
         root
@@ -1247,6 +1377,11 @@ fn action_chip(
 
 /// Left panel: the file-tree card (deliverable §2), replacing the placeholder.
 fn left_panel(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl IntoElement {
+    // FILES | STRUCTURE tab switcher over the tree or the symbol outline (§5.5).
+    let body = match app.sidebar_tab {
+        SidebarTab::Files => file_tree::render(app, cx).into_any_element(),
+        SidebarTab::Structure => structure_panel::render(app, cx).into_any_element(),
+    };
     div()
         .flex()
         .flex_col()
@@ -1258,7 +1393,8 @@ fn left_panel(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl I
         .border_1()
         .border_color(rgb(theme.border))
         .overflow_hidden()
-        .child(file_tree::render(app, cx))
+        .child(structure_panel::tab_switcher(app, cx, theme))
+        .child(body)
 }
 
 /// Center: the tab strip + read-only code viewer (deliverables §3, §5), replacing

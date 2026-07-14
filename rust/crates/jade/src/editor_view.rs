@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use crate::decorations::flow::{self, FlowAnalysis};
 use crate::decorations::size_annotations;
 use crate::highlight::{self, Span, TokenPalette};
+use crate::structure::{self, Symbol};
 
 /// One open, highlighted file. Read-only for now: `lines` and `highlights` are
 /// parallel (index `i` = line `i`), computed once at open time.
@@ -29,6 +30,9 @@ pub struct OpenTab {
     pub sizes: HashMap<usize, String>,
     /// Execution-flow analysis (§4.8), likewise cached at open time.
     pub flow: FlowAnalysis,
+    /// Tree-sitter symbol outline (§5.5), parsed once at open for the STRUCTURE
+    /// panel and the §4.7 per-line tints. Empty for non-C-family files.
+    pub symbols: Vec<Symbol>,
 }
 
 impl OpenTab {
@@ -48,13 +52,14 @@ impl OpenTab {
         debug_assert_eq!(lines.len(), highlights.len());
         // Decoration analysis is only meaningful for C-family/Metal sources; for
         // plain text both scanners simply yield nothing.
-        let (sizes, flow) = if highlight::is_highlightable(path) {
+        let (sizes, flow, symbols) = if highlight::is_highlightable(path) {
             (
                 size_annotations::collect_size_annotations(text),
                 flow::analyze(text),
+                structure::parse_symbols(text),
             )
         } else {
-            (HashMap::new(), FlowAnalysis::default())
+            (HashMap::new(), FlowAnalysis::default(), Vec::new())
         };
         OpenTab {
             path: path.to_path_buf(),
@@ -66,6 +71,7 @@ impl OpenTab {
             highlights,
             sizes,
             flow,
+            symbols,
         }
     }
 
@@ -176,6 +182,7 @@ mod tests {
             name: name.to_string(),
             lines: vec![String::new()],
             highlights: vec![Vec::new()],
+            symbols: Vec::new(),
             sizes: HashMap::new(),
             flow: FlowAnalysis::default(),
         }
