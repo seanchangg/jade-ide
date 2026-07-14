@@ -315,9 +315,8 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> gpui::AnyElement {
                         )
                         .child(dot),
                 );
-                // Line-number: click puts the caret at the line start
-                // (standard editor margin behavior; shift extends).
-                let ln_handle = row_handle.clone();
+                // Line-number gutter: click toggles a breakpoint on this line
+                // (§4.6 — same action as the dot margin, bigger target).
                 gutter = gutter.child(
                     div()
                         .id(("gutter-line", i))
@@ -327,11 +326,9 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> gpui::AnyElement {
                         .cursor_pointer()
                         .on_mouse_down(
                             MouseButton::Left,
-                            cx.listener(move |app: &mut JadeApp, ev: &MouseDownEvent, window, cx| {
-                                if let Some(h) = &ln_handle {
-                                    window.focus(h, cx);
-                                }
-                                app.editor_caret_to_line_start(i, ev.modifiers.shift);
+                            cx.listener(move |app: &mut JadeApp, _ev: &MouseDownEvent, _w, cx| {
+                                app.toggle_breakpoint(line_no as u32);
+                                app.save_ui_state();
                                 cx.notify();
                             }),
                         )

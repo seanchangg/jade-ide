@@ -209,7 +209,11 @@ fn variables_col(app: &JadeApp, theme: &Theme, cx: &mut Context<JadeApp>) -> imp
         .id("dbg-vars")
         .flex()
         .flex_col()
-        .flex_1() // ~1.2 share vs the console
+        .flex_1() // equal share with the console
+        // min_w(0) + x-clip: nowrap variable values otherwise refuse to
+        // shrink (flex min-width:auto) and crush the console to ~1 char.
+        .min_w(px(0.))
+        .overflow_x_hidden()
         .h_full()
         .overflow_y_scroll()
         .border_r_1()
@@ -296,6 +300,8 @@ fn console_col(app: &JadeApp, theme: &Theme) -> impl IntoElement {
         .flex()
         .flex_col()
         .flex_1()
+        .min_w(px(0.))
+        .overflow_x_hidden()
         .h_full()
         .overflow_y_scroll()
         .child(col_label("CONSOLE", theme))
