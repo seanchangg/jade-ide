@@ -167,9 +167,23 @@ fn main() {
     let active_file = resolve_active_file(&args);
     let workspace_root = resolve_workspace_root(&args, active_file.as_deref(), &root);
     let demo = args.iter().any(|a| a == "--train");
+    // "No workspace open" (inventory §2): neither --project nor --file AND no
+    // restored tabs → the welcome overlay covers the editor and the tree does
+    // NOT scan the fallback repo root.
+    let workspace_opened = resolve_workspace_opened(&args, &workspace_root);
 
     // ── FS-watch: debounced tree refresh (§5.1) ───────────────────────────────
-    let watcher = spawn_fs_watch(&workspace_root, &handle, app_tx.clone());
+    // The watcher is now owned by `JadeApp` (created in `assemble`, replaced by
+    // `open_project`) via this re-spawn closure, so opening a new folder can
+    // restart the watch on the new root. It captures the tokio Handle + the
+    // unified sender; the debounce semantics live in `spawn_fs_watch`.
+    let fs_watch: app::FsWatchSpawn = {
+        let handle = handle.clone();
+        let app_tx = app_tx.clone();
+        Arc::new(move |root: &Path| {
+            spawn_fs_watch(root, &handle, app_tx.clone()).map(|w| Box::new(w) as Box<dyn Send>)
+        })
+    };
 
     println!("FORGE_TELEMETRY_SOCK={}", socket.display());
     println!("repo root: {}", root.display());
@@ -188,6 +202,8 @@ fn main() {
         active_file,
         repo_root: root,
         workspace_root,
+        workspace_opened,
+        fs_watch,
         demo,
     };
 
@@ -228,11 +244,10 @@ fn main() {
         return;
     }
 
-    // Keep the runtime + fs-watcher alive on a background thread (GUI path).
-    std::thread::spawn(move || {
-        let _watcher = watcher; // hold the watcher for the process lifetime
-        runtime.block_on(std::future::pending::<()>())
-    });
+    // Keep the runtime alive on a background thread (GUI path). The fs-watcher is
+    // now owned by `JadeApp` (created in `assemble` via the `fs_watch` closure),
+    // so it is not held here.
+    std::thread::spawn(move || runtime.block_on(std::future::pending::<()>()));
 
     // Optionally launch the probe's test training program against ourselves.
     maybe_launch_train(&args, &socket);
@@ -853,6 +868,17 @@ fn resolve_workspace_root(args: &[String], active: Option<&std::path::Path>, roo
     root.to_path_buf()
 }
 
+/// Whether a workspace is considered "open" at launch (inventory §2): true when
+/// launched with `--project` or `--file`, else true only if the fallback root
+/// already has restored tabs in its persisted `ui` blob. When false, `main` and
+/// `JadeApp` show the welcome overlay and skip scanning the fallback repo root.
+fn resolve_workspace_opened(args: &[String], workspace_root: &Path) -> bool {
+    if arg_value(args, "--project").is_some() || arg_value(args, "--file").is_some() {
+        return true;
+    }
+    !workspace_state::load(workspace_root).open_tabs.is_empty()
+}
+
 /// Resolve the forge-ide checkout root: `JADE_REPO_ROOT` if set, else the
 /// compile-time `CARGO_MANIFEST_DIR/../../..` (jade is at `rust/crates/jade`).
 fn repo_root() -> PathBuf {
@@ -914,4 +940,44 @@ fn maybe_launch_train(args: &[String], socket: &std::path::Path) {
         .spawn()
         .expect("spawn test_train");
     println!("launched test_train with injected probe");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `--project`/`--file` force a workspace open regardless of persisted tabs.
+    #[test]
+    fn workspace_opened_with_project_or_file() {
+        let root = std::env::temp_dir();
+        assert!(resolve_workspace_opened(
+            &["--project".to_string(), "/x".to_string()],
+            &root
+        ));
+        assert!(resolve_workspace_opened(
+            &["--file".to_string(), "/x.cpp".to_string()],
+            &root
+        ));
+    }
+
+    /// Bare launch: opened iff the fallback root has restored tabs (§2).
+    #[test]
+    fn workspace_opened_follows_restored_tabs() {
+        let dir = std::env::temp_dir().join(format!("jade-wo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // No persisted tabs → welcome mode.
+        assert!(!resolve_workspace_opened(&[], &dir));
+        // Persist one open tab → workspace considered open.
+        let ui = workspace_state::WorkspaceUi {
+            open_tabs: vec![workspace_state::TabState {
+                path: "/p/a.cpp".to_string(),
+                is_dirty: false,
+            }],
+            ..Default::default()
+        };
+        workspace_state::save(&dir, &ui);
+        assert!(resolve_workspace_opened(&[], &dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

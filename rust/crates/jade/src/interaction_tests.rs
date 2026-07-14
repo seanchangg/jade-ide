@@ -79,6 +79,10 @@ fn test_deps(workspace: PathBuf) -> (AppDeps, tokio::sync::mpsc::UnboundedReceiv
         active_file: None,
         repo_root: workspace.clone(),
         workspace_root: workspace,
+        // The test workspace is "open" (it has a real tree); the fs-watch is a
+        // no-op so no notify thread runs under the determinism checker.
+        workspace_opened: true,
+        fs_watch: Arc::new(|_root| None),
         demo: false,
     };
     (deps, app_rx)
@@ -151,6 +155,91 @@ async fn click_focuses_sets_caret_and_arrows_navigate(cx: &mut TestAppContext) {
         let caret = app.editor.active_tab().unwrap().caret_point();
         assert_eq!((caret.row, caret.col), (2, 4), "caret after left left");
     });
+}
+
+/// `open_project` state transition (§2), headless via `assemble` — no GPUI
+/// context needed since `open_project` is `cx`-free. Opening folder B repoints
+/// the tree, restores B's persisted active tab, and follows `active_file`.
+#[test]
+fn open_project_transitions_state() {
+    let (dir_a, _file_a) = test_workspace();
+    let (deps, _rx) = test_deps(dir_a.clone());
+    let mut app = JadeApp::assemble(deps);
+
+    // Folder B: two source files + a persisted ui blob restoring util.cpp as the
+    // active tab plus a breakpoint, exactly like a real workspace.json.
+    let dir_b = std::env::temp_dir().join(format!("jade-openproj-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir_b);
+    std::fs::create_dir_all(&dir_b).unwrap();
+    std::fs::write(dir_b.join("alpha.cpp"), "int main(){return 0;}\n").unwrap();
+    std::fs::write(dir_b.join("util.cpp"), "int u(){return 1;}\n").unwrap();
+    let util = dir_b.join("util.cpp").display().to_string();
+    let ui = crate::workspace_state::WorkspaceUi {
+        open_tabs: vec![crate::workspace_state::TabState {
+            path: util.clone(),
+            is_dirty: false,
+        }],
+        active_tab_index: Some(0),
+        breakpoints: std::collections::HashMap::from([(util.clone(), vec![2u32])]),
+        ..Default::default()
+    };
+    crate::workspace_state::save(&dir_b, &ui);
+
+    app.open_project(dir_b.clone());
+
+    assert!(app.workspace_opened);
+    assert_eq!(app.tree.as_ref().unwrap().root, dir_b, "tree repointed to B");
+    assert_eq!(
+        app.active_file.as_deref(),
+        Some(dir_b.join("util.cpp").as_path()),
+        "restored active tab drives active_file"
+    );
+    assert!(
+        app.breakpoints.to_map().contains_key(&util),
+        "B's persisted breakpoints restored"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}
+
+/// `open_project` on a folder with no persisted tabs falls back to the first
+/// source file alphabetically (mirrors `--project`).
+#[test]
+fn open_project_falls_back_to_first_source_file() {
+    let (dir_a, _file_a) = test_workspace();
+    let (deps, _rx) = test_deps(dir_a.clone());
+    let mut app = JadeApp::assemble(deps);
+
+    let dir_b = std::env::temp_dir().join(format!("jade-openproj2-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir_b);
+    std::fs::create_dir_all(&dir_b).unwrap();
+    std::fs::write(dir_b.join("zeta.cpp"), "int z(){return 0;}\n").unwrap();
+    std::fs::write(dir_b.join("beta.cpp"), "int b(){return 0;}\n").unwrap();
+
+    app.open_project(dir_b.clone());
+    assert_eq!(
+        app.active_file.as_deref(),
+        Some(dir_b.join("beta.cpp").as_path()),
+        "first source file alphabetically opens"
+    );
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}
+
+/// Welcome mode (§2): assembled with `workspace_opened=false`, the tree is NOT
+/// scanned (no fallback repo-root scan) and there is no active file.
+#[test]
+fn no_workspace_leaves_tree_unscanned() {
+    let (dir, _file) = test_workspace();
+    let (mut deps, _rx) = test_deps(dir.clone());
+    deps.workspace_opened = false;
+    deps.active_file = None;
+    let app = JadeApp::assemble(deps);
+    assert!(!app.workspace_opened);
+    assert!(app.tree.is_none(), "welcome mode must not scan a tree");
+    assert!(app.active_file.is_none());
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[gpui::test]

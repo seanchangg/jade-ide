@@ -33,8 +33,8 @@ use forge_telemetry::{Event, Kind, TelemetryServer};
 use forge_term::{GridSnapshot, TermEvent, TermId, TermManager};
 use gpui::{
     div, hsla, prelude::*, px, rgb, Bounds, BoxShadow, ClipboardItem, Context,
-    EntityInputHandler, FocusHandle, KeyDownEvent, MouseButton, Pixels, UTF16Selection, Window,
-    WindowControlArea,
+    EntityInputHandler, FocusHandle, KeyDownEvent, MouseButton, PathPromptOptions, Pixels,
+    UTF16Selection, Window, WindowControlArea,
 };
 use serde_json::{Map, Value};
 use tokio::runtime::Handle;
@@ -148,6 +148,14 @@ pub enum AppEvent {
     VarChildren { path: String, children: Vec<LocalVariable> },
 }
 
+/// Spawns (or re-spawns) the debounced fs-watch on a root, returning an opaque
+/// keep-alive guard (the `notify` watcher, type-erased) that must be held for the
+/// watch to stay live; dropping it stops the watch. `main` supplies the real
+/// implementation (capturing the tokio Handle + unified sender); tests pass a
+/// no-op. Owned by [`JadeApp`] so [`open_project`](JadeApp::open_project) can
+/// restart the watch on a newly-opened folder (§5.1).
+pub type FsWatchSpawn = Arc<dyn Fn(&Path) -> Option<Box<dyn Send>> + Send + Sync>;
+
 /// Everything [`JadeApp`] needs from `main` to be constructed — kept as one
 /// struct so the GUI constructor and the headless smoke path share wiring.
 pub struct AppDeps {
@@ -167,6 +175,11 @@ pub struct AppDeps {
     /// Root the file-tree panel scans (the `--project` dir, else the active
     /// file's parent, else the repo root).
     pub workspace_root: PathBuf,
+    /// Whether a workspace is open at launch (inventory §2). When false the
+    /// welcome overlay covers the editor and the tree does not scan the root.
+    pub workspace_opened: bool,
+    /// Re-spawnable fs-watch (owned by `JadeApp`; restarted by `open_project`).
+    pub fs_watch: FsWatchSpawn,
     pub demo: bool,
 }
 
@@ -255,6 +268,15 @@ pub struct JadeApp {
     repo_root: PathBuf,
     /// Root the file tree scans + the cwd new terminals spawn in.
     workspace_root: PathBuf,
+    /// Whether a workspace is open (inventory §2). While false the welcome
+    /// overlay covers the editor area and the tree is empty; `open_project` flips
+    /// it true.
+    pub workspace_opened: bool,
+    /// Re-spawn hook for the fs-watch; called on startup + by `open_project`.
+    fs_watch: FsWatchSpawn,
+    /// Live fs-watch keep-alive guard (the type-erased `notify` watcher). Held so
+    /// the watch stays up; replaced (old dropped first) when a folder is opened.
+    fs_watcher: Option<Box<dyn Send>>,
     /// LLDB driver, constructed lazily on the first Debug (deliverable §2).
     driver: Option<Arc<AsyncMutex<LldbDriver>>>,
 
@@ -514,8 +536,18 @@ impl JadeApp {
     /// Headless constructor (smoke hook / tests): assemble state, no pump. The
     /// caller drives `app_rx` itself and calls [`apply_app_event`](Self::apply_app_event).
     pub fn assemble(deps: AppDeps) -> Self {
-        // Scan the workspace root for the file tree (§5.1) and seed the editor.
-        let tree = Some(FileTree::scan(deps.workspace_root.clone()));
+        let opened = deps.workspace_opened;
+        // Scan the workspace root for the file tree (§5.1) and seed the editor —
+        // but only when a workspace is open; otherwise the welcome overlay covers
+        // the editor and the tree must NOT scan the fallback repo root (§2).
+        let tree = opened.then(|| FileTree::scan(deps.workspace_root.clone()));
+        // Start the fs-watch on the open root (owned here so `open_project` can
+        // restart it). No watch until a folder is opened.
+        let fs_watcher = if opened {
+            (deps.fs_watch)(&deps.workspace_root)
+        } else {
+            None
+        };
         // clangd fallback `-I<repo>/include` when that directory exists.
         let lsp_include = {
             let inc = deps.repo_root.join("include");
@@ -572,6 +604,9 @@ impl JadeApp {
             app_tx: deps.app_tx,
             repo_root: deps.repo_root,
             workspace_root: deps.workspace_root,
+            workspace_opened: opened,
+            fs_watch: deps.fs_watch,
+            fs_watcher,
             driver: None,
 
             term: deps.term,
@@ -1320,6 +1355,108 @@ impl JadeApp {
         }
     }
 
+    /// Open Folder (inventory §2, `app.ts:768` openWorkspace): show GPUI's native
+    /// directory picker, then [`open_project`](Self::open_project) the chosen dir.
+    /// The picker returns a oneshot receiver handled on the GPUI side (via
+    /// `cx.spawn`, NOT tokio) so the resulting state update runs on the UI thread.
+    /// Kept thin — all the real work is in the unit-testable `open_project`.
+    pub fn prompt_open_project(&mut self, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Open Folder".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let dir = match receiver.await {
+                Ok(Ok(Some(paths))) => paths.into_iter().next(),
+                _ => None, // cancelled / error / empty
+            };
+            if let Some(dir) = dir {
+                let _ = this.update(cx, |app, cx| {
+                    app.open_project(dir);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Open `dir` as the workspace (inventory §2, `app.ts:812` doOpenWorkspace):
+    /// repoint the tree + build/run target, restore that folder's persisted UI
+    /// state (open tabs / breakpoints / benchmarks / sticky notes, same as
+    /// startup), open the restored/first file through the real `open_file` path,
+    /// and restart the fs-watch on the new root. `cx`-free so the state transition
+    /// is unit-testable; the dialog handler drives `cx.notify` around it.
+    pub fn open_project(&mut self, dir: PathBuf) {
+        // Leaving any prior workspace: drop its clangd session so the new root
+        // re-initializes lazily on the first file open (clangd is per-workspace).
+        self.lsp = None;
+        self.lsp_init_started = false;
+        // Close the old tabs — a fresh workspace starts from its own tab set.
+        while !self.editor.tabs.is_empty() {
+            self.editor.close(0);
+        }
+
+        self.workspace_root = dir.clone();
+        self.workspace_opened = true;
+        self.tree = Some(FileTree::scan(dir.clone()));
+        self.file_cache = None; // Quick Open cache is per-workspace (§5.7)
+        self.notes = crate::notes::load(&dir); // sticky notes for this folder (§4.9)
+
+        // Restore this folder's persisted `ui` blob (§1.2), same fields startup
+        // reads: breakpoints / benchmarks / ai toggle / terminal visibility.
+        let ui = crate::workspace_state::load(&dir);
+        self.breakpoints = crate::debug::Breakpoints::from_map(ui.breakpoints.clone());
+        self.benchmarks = ui.benchmarks.clone();
+        if let Some(v) = ui.ai_completion_enabled {
+            self.ai_completion_enabled = v;
+        }
+        self.output_visible = ui.terminal_visible.unwrap_or(true);
+
+        // Restore persisted open tabs (skipping deleted files), then the active
+        // index — else fall back to the folder's first source file so the editor
+        // isn't blank (mirrors --project's first-file pick).
+        for tab in &ui.open_tabs {
+            let p = PathBuf::from(&tab.path);
+            if p.is_file() {
+                let _ = self.editor.open(&p);
+            }
+        }
+        if let Some(idx) = ui.active_tab_index {
+            if idx >= 0 && (idx as usize) < self.editor.tabs.len() {
+                self.editor.switch(idx as usize);
+            }
+        }
+        if self.editor.active.is_none() {
+            if let Some(first) = first_source_file(&dir) {
+                let _ = self.editor.open(&first);
+            }
+        }
+        self.active_file = self.editor.active_path();
+
+        // Route the front tab through the real open path (LSP init + didOpen +
+        // highlight + editor focus). No-op when the folder had no source file.
+        if let Some(path) = self.active_file.clone() {
+            self.open_file(path);
+        }
+
+        // Restart the fs-watch on the new root (§5.1).
+        self.restart_fs_watch();
+
+        // Status line reflects the opened folder (the build/run target follows
+        // `active_file`, so both work against the new workspace immediately).
+        self.status_line(&format!("[forge] Opened {}", dir.display()));
+    }
+
+    /// Drop the old fs-watch and start a fresh one on the current root. Dropping
+    /// first releases the OS handle before the new watch registers; the debounce
+    /// semantics in `workspace_tree` are unchanged.
+    fn restart_fs_watch(&mut self) {
+        self.fs_watcher = None;
+        self.fs_watcher = (self.fs_watch)(&self.workspace_root);
+    }
+
     /// Toggle a directory in the file tree (deliverable §2): lazily loads its
     /// children on first expansion.
     pub fn toggle_dir(&mut self, path: PathBuf) {
@@ -1564,6 +1701,24 @@ impl JadeApp {
 /// Char advance of Menlo at the editor font size (mouse↔column mapping). See the
 /// note on `panels::code_view::CHAR_W`.
 use crate::panels::code_view::LINE_H;
+
+/// The first `.cpp`/`.cc`/`.mm` in `dir` alphabetically (inventory §2/§5): the
+/// fallback tab `open_project` shows when a folder has no persisted open tabs,
+/// mirroring `resolve_active_file`'s `--project` first-file pick.
+fn first_source_file(dir: &Path) -> Option<PathBuf> {
+    let mut cands: Vec<PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            matches!(
+                p.extension().and_then(|e| e.to_str()),
+                Some("cpp") | Some("cc") | Some("mm")
+            )
+        })
+        .collect();
+    cands.sort();
+    cands.into_iter().next()
+}
 
 /// clangd handles the C/C++ families; `.metal` is Metal (never clangd) and other
 /// extensions are plain text. This is the §4.4 gating with the inventory's
@@ -3385,6 +3540,12 @@ impl Render for JadeApp {
                         app.toggle_quick_open();
                         cx.notify();
                     }
+                    // ⌘⇧O / ⌘O (both unbound in the editor path) open the folder
+                    // picker (inventory §2). Fires whether or not a workspace is
+                    // already open, so you can switch folders any time.
+                    "o" if m.platform => {
+                        app.prompt_open_project(cx);
+                    }
                     // ⌘⇧A toggles the ASM viewer (also handled in the focused
                     // editor's key path; this catches the case where it isn't).
                     "a" if m.platform && m.shift => {
@@ -3706,7 +3867,25 @@ fn action_bar(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl I
             false,
             cx,
             |a, _| a.action_theme(),
-        ));
+        ))
+        // Open Folder (inventory §2, ⌘⇧O): folder-open icon at the right end of
+        // the bar; opens GPUI's native directory picker.
+        .child(
+            div()
+                .id("btn-open-folder")
+                .flex()
+                .items_center()
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .cursor_pointer()
+                .bg(rgb(theme.bg))
+                .text_color(rgb(theme.text))
+                .on_click(cx.listener(|a: &mut JadeApp, _ev, _win, cx| {
+                    a.prompt_open_project(cx);
+                }))
+                .child(crate::assets::ui_icon("folder-open", 14.)),
+        );
 
     div()
         .flex()
@@ -3852,9 +4031,10 @@ fn left_panel(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl I
 }
 
 /// Center: the tab strip + read-only code viewer (deliverables §3, §5), replacing
-/// the placeholder.
+/// the placeholder. With no workspace open (§2) the welcome overlay covers this
+/// area instead.
 fn center_content(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl IntoElement {
-    let mut center = div()
+    let base = div()
         .relative()
         .flex()
         .flex_col()
@@ -3864,7 +4044,14 @@ fn center_content(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> im
         .border_1()
         .border_color(rgb(theme.border))
         .shadow(card_shadow()) // floating-card look (§2, main.css:2342-2344)
-        .overflow_hidden()
+        .overflow_hidden();
+
+    // No workspace: the card hosts the welcome overlay instead of the editor.
+    if !app.workspace_opened {
+        return base.child(welcome_overlay(cx, theme));
+    }
+
+    let mut center = base
         .child(code_view::tab_strip(app, cx, theme))
         .child(code_view::render(app, cx));
     // §6 ASM viewer: right-half overlay over the editor when toggled on.
@@ -3872,6 +4059,78 @@ fn center_content(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> im
         center = center.child(asm_view::overlay(app, cx));
     }
     center
+}
+
+/// Welcome overlay shown when no workspace is open (inventory §2, `app.ts:54-81`):
+/// centered "Jade" title, "Open a folder to get started", an Open Folder button
+/// (outline + folder-open icon), and a shortcut-hint row. Mirrors the Electron
+/// `#welcome-overlay` styling in GPUI theme colors.
+fn welcome_overlay(cx: &mut Context<JadeApp>, theme: &Theme) -> impl IntoElement {
+    let hint = |s: &str| {
+        div()
+            .text_color(rgb(theme.muted))
+            .child(s.to_string())
+    };
+    div()
+        .flex_1()
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .items_center()
+                // welcome-title
+                .child(
+                    div()
+                        .text_color(rgb(theme.accent))
+                        .text_2xl()
+                        .child("Jade"),
+                )
+                // welcome-subtitle
+                .child(
+                    div()
+                        .mt(px(8.))
+                        .text_color(rgb(theme.muted))
+                        .text_sm()
+                        .child("Open a folder to get started"),
+                )
+                // Open Folder button (outline + folder-open icon).
+                .child(
+                    div()
+                        .id("open-folder-btn")
+                        .mt(px(24.))
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px(px(24.))
+                        .py(px(8.))
+                        .rounded_md()
+                        .border_1()
+                        .border_color(rgb(theme.border))
+                        .text_color(rgb(theme.text))
+                        .text_sm()
+                        .cursor_pointer()
+                        .on_click(cx.listener(|a: &mut JadeApp, _ev, _win, cx| {
+                            a.prompt_open_project(cx);
+                        }))
+                        .child(crate::assets::ui_icon("folder-open", 14.))
+                        .child("Open Folder"),
+                )
+                // welcome-shortcuts hint row.
+                .child(
+                    div()
+                        .mt(px(32.))
+                        .flex()
+                        .gap(px(20.))
+                        .text_xs()
+                        .child(hint("⌘B File tree"))
+                        .child(hint("⌘` Terminal"))
+                        .child(hint("⌘E Flow arrows"))
+                        .child(hint("⌘S Save")),
+                ),
+        )
 }
 
 fn runtime_sidebar(
