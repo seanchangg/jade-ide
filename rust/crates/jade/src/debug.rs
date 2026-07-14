@@ -56,6 +56,10 @@ pub struct DebugSession {
     pub children: HashMap<String, Vec<LocalVariable>>,
     /// ANSI-stripped console scrollback (§5.8 CONSOLE).
     pub console: Vec<String>,
+    /// Partial trailing line: PTY output arrives in arbitrary chunks (often a
+    /// byte at a time), so text accumulates here until a newline completes it.
+    /// Rendered live as the console's last line (prompts have no newline).
+    pub console_partial: String,
 }
 
 /// Console scrollback cap (keeps the paused-at-a-loop firehose bounded).
@@ -107,9 +111,19 @@ impl DebugSession {
         self.location = None;
     }
 
-    /// Append a console line (ANSI already stripped by [`push_console`]).
+    /// Append console output. `text` is a raw PTY CHUNK, not a line — reads
+    /// can deliver one byte at a time, and treating chunks as lines rendered
+    /// the console one character per row. Chunks accumulate in
+    /// [`console_partial`](Self::console_partial); only newline-terminated
+    /// lines move into the scrollback.
     pub fn push_console(&mut self, text: &str) {
-        crate::output::push_output(&mut self.console, text);
+        self.console_partial.push_str(&crate::output::strip_ansi(text));
+        while let Some(pos) = self.console_partial.find('\n') {
+            let rest = self.console_partial.split_off(pos + 1);
+            let line = std::mem::replace(&mut self.console_partial, rest);
+            self.console
+                .push(line.trim_end_matches(['\n', '\r']).to_string());
+        }
         if self.console.len() > CONSOLE_MAX {
             let drop = self.console.len() - CONSOLE_MAX;
             self.console.drain(0..drop);
@@ -395,5 +409,25 @@ mod tests {
         let mut s = DebugSession::new();
         s.push_console("\x1b[32mrunning\x1b[0m\n");
         assert_eq!(s.console, vec!["running".to_string()]);
+    }
+
+    #[test]
+    fn console_line_buffers_byte_sized_chunks() {
+        // PTY reads often deliver one byte per chunk; they must coalesce into
+        // lines, not render one character per row.
+        let mut s = DebugSession::new();
+        for ch in "ion to frame\n".chars() {
+            s.push_console(&ch.to_string());
+        }
+        assert_eq!(s.console, vec!["ion to frame".to_string()]);
+        // A prompt without a trailing newline stays visible as the partial.
+        s.push_console("(lldb) ");
+        assert!(s.console.len() == 1);
+        assert_eq!(s.console_partial, "(lldb) ");
+        // Multi-line chunk splits correctly, remainder kept.
+        s.push_console("run\nProcess 1 launched\npartial");
+        assert_eq!(s.console[1], "(lldb) run");
+        assert_eq!(s.console[2], "Process 1 launched");
+        assert_eq!(s.console_partial, "partial");
     }
 }

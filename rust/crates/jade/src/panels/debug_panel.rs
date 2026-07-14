@@ -295,6 +295,16 @@ fn console_col(app: &JadeApp, theme: &Theme) -> impl IntoElement {
                 .child(text),
         );
     }
+    // Live partial line (e.g. the "(lldb) " prompt — no trailing newline yet).
+    if !app.debug.console_partial.is_empty() {
+        list = list.child(
+            div()
+                .text_size(px(11.))
+                .text_color(rgb(theme.text))
+                .whitespace_nowrap()
+                .child(app.debug.console_partial.clone()),
+        );
+    }
     div()
         .id("debug-console")
         .flex()
