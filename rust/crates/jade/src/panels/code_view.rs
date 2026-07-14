@@ -233,8 +233,13 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> gpui::AnyElement {
 
                 // Gutter diagnostic dot (max severity starting on this row).
                 let diag_dot = diag_dot_color(&tab.diagnostics, i, &theme);
-                // Breakpoint on this line (§4.6) — takes visual precedence.
+                // Breakpoint on this line (§4.6) — takes visual precedence:
+                // the whole row gets a red wash + left border.
                 let has_bp = this.is_breakpoint(line_no as u32);
+                if has_bp {
+                    row_bg = Some(rgba_a(theme.red, 0.10));
+                    border_col = rgba_a(theme.red, 0.45);
+                }
 
                 // `.w_full()`: uniform_list items size to content by default, so
                 // short lines produced narrow rows and clicks to the right of
