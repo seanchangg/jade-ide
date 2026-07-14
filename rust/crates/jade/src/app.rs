@@ -3489,10 +3489,14 @@ impl Render for JadeApp {
             .child(action_bar(self, cx, &theme))
             .child(
                 // Main area: left panel | center content | right runtime sidebar.
+                // min_h(0): flex children default to min-height:auto, so tall
+                // panel content (structure outline, telemetry lists) would grow
+                // the row past the viewport and push the terminal off-screen.
                 div()
                     .flex()
                     .flex_row()
                     .flex_1()
+                    .min_h(px(0.))
                     .gap(px(6.))
                     .p(px(6.))
                     .child(left_panel(self, cx, &theme))
@@ -3906,7 +3910,16 @@ fn left_panel_inner(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> 
         .shadow(card_shadow())
         .overflow_hidden()
         .child(structure_panel::tab_switcher(app, cx, theme))
-        .child(body)
+        .child(
+            // The tree/outline scrolls inside the card (min_h(0) so the flex
+            // child can shrink instead of growing the card past the row).
+            div()
+                .id("left-panel-body")
+                .flex_1()
+                .min_h(px(0.))
+                .overflow_y_scroll()
+                .child(body),
+        )
         .into_any_element()
 }
 
@@ -4039,6 +4052,7 @@ fn runtime_sidebar(
         .gap_3()
         .w(px(280.))
         .h_full()
+        .min_h(px(0.))
         .p(px(10.))
         .rounded_lg()
         .bg(rgb(theme.panel))
