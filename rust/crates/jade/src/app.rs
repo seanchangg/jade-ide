@@ -817,8 +817,14 @@ impl JadeApp {
     }
 
     /// Toggle the RUNTIME panel (Runtime chip, §5.4).
+    /// Timer/gauge button: the TRAINING + TELEMETRY sidebar is always there;
+    /// this toggles the extra RUNTIME graphs above them, reclaiming the bottom
+    /// strip (terminal/output) for vertical room when they open.
     pub fn action_toggle_runtime(&mut self) {
         self.runtime_visible = !self.runtime_visible;
+        if self.runtime_visible {
+            self.output_visible = false;
+        }
     }
 
     /// Toggle the execution-flow decorations (Flow chip / ⌘E, §4.8).
