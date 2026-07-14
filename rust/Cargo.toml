@@ -2,8 +2,10 @@
 resolver = "2"
 members = [
     "crates/forge-telemetry",
+    "crates/forge-buffer",
     "crates/forge-build",
     "crates/forge-debug",
+    "crates/forge-lsp",
     "crates/forge-ai",
     "crates/forge-sysmon",
     "crates/forge-term",
