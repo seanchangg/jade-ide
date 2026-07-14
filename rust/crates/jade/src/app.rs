@@ -222,24 +222,6 @@ pub struct GhostState {
     pub anchor: (usize, usize),
 }
 
-/// An in-flight sticky-note header drag (§4.9). Offsets are window px.
-pub struct NoteDrag {
-    pub id: String,
-    pub start_x: f32,
-    pub start_y: f32,
-    pub orig_x: f32,
-    pub orig_y: f32,
-}
-
-/// An in-flight sticky-note resize (§4.9).
-pub struct NoteResize {
-    pub id: String,
-    pub start_x: f32,
-    pub start_y: f32,
-    pub orig_w: f32,
-    pub orig_h: f32,
-}
-
 /// An in-flight inline benchmark-name input (§5.4). The buffer is prefilled with
 /// `#<run> <flags>` and committed on Enter (Esc cancels). `run_index` picks the
 /// HISTORY row's run + its recorded stats; `flags` are carried onto the entry.
@@ -325,6 +307,14 @@ pub struct JadeApp {
     /// means caret placement and click→column mapping survive a font swap
     /// (bundled JetBrains Mono vs Menlo).
     pub editor_char_w: Arc<AtomicU32>,
+    /// Caret blink (530ms phase, Electron/macOS-style). `caret_blink_show`
+    /// is the current phase; any caret activity forces it visible and stamps
+    /// `caret_last_active` so the caret holds steady-on while typing/moving.
+    pub caret_blink_show: bool,
+    /// `now_ms()` of the last caret movement/edit.
+    pub caret_last_active: u64,
+    /// True once the 530ms blink-driver task was spawned (render, GUI only).
+    blink_task_running: bool,
     /// Visible editor row count (viewport height / line height), captured each
     /// frame, so `scroll_caret_into_view` does minimal follow-scroll.
     pub editor_rows: Arc<AtomicU32>,
@@ -371,20 +361,6 @@ pub struct JadeApp {
     pub xp: crate::xp::XpState,
     /// Global `xpTotal` persistence (`~/.config/jade/`, Electron-migrating).
     xp_store: crate::xp::XpStore,
-
-    // ── Sticky notes (§4.9) ───────────────────────────────────────────────────
-    /// All notes across files; only the active file's are shown.
-    pub notes: Vec<crate::notes::StickyNote>,
-    /// In-flight header drag.
-    pub note_drag: Option<NoteDrag>,
-    /// In-flight resize.
-    pub note_resize: Option<NoteResize>,
-    /// Id of the note whose content is being edited (captured-keystroke buffer).
-    pub note_editing: Option<String>,
-    /// Focus handle for the editing note (created lazily; None headless).
-    note_focus: Option<FocusHandle>,
-    /// Monotonic note-save generation (500ms content-save debounce).
-    note_save_gen: u64,
 
     // ── Structure panel + Quick Open (Phase-4 wave 3, §5.5/§5.7) ──────────────
     /// Which view the left sidebar shows (FILES tree vs STRUCTURE outline).
@@ -553,14 +529,12 @@ impl JadeApp {
             let inc = deps.repo_root.join("include");
             inc.is_dir().then_some(inc)
         };
-        // Editor extras (Phase-3b E3): load per-workspace sticky notes (migrating
-        // any existing Electron notes) and the global xpTotal.
-        let notes = crate::notes::load(&deps.workspace_root);
+        // Editor extras (Phase-3b E3): the global xpTotal.
         let (xp_store, xp_total) = crate::xp::XpStore::load();
 
         // Per-workspace UI blob (§1.2): tabs, panel visibility, breakpoints,
-        // benchmarks, ai toggle. Restored after a workspace opens, merging with
-        // (not clobbering) the notes the sticky-notes module owns in the same file.
+        // benchmarks, ai toggle. Restored after a workspace opens. Saves
+        // merge-preserve any stickyNotes the Electron app left in the file.
         let ui = crate::workspace_state::load(&deps.workspace_root);
 
         let mut editor = EditorState::new(TokenPalette::forge_dark());
@@ -632,6 +606,9 @@ impl JadeApp {
                 crate::panels::code_view::CHAR_W.to_bits(),
             )),
             editor_rows: Arc::new(AtomicU32::new(30)),
+            caret_blink_show: true,
+            caret_last_active: 0,
+            blink_task_running: false,
             epoch: Instant::now(),
             decoration_wake_running: false,
 
@@ -653,13 +630,6 @@ impl JadeApp {
 
             xp: crate::xp::XpState::new(xp_total),
             xp_store,
-
-            notes,
-            note_drag: None,
-            note_resize: None,
-            note_editing: None,
-            note_focus: None,
-            note_save_gen: 0,
 
             sidebar_tab: SidebarTab::Files,
             sidebar_collapsed: false,
@@ -1384,7 +1354,7 @@ impl JadeApp {
 
     /// Open `dir` as the workspace (inventory §2, `app.ts:812` doOpenWorkspace):
     /// repoint the tree + build/run target, restore that folder's persisted UI
-    /// state (open tabs / breakpoints / benchmarks / sticky notes, same as
+    /// state (open tabs / breakpoints / benchmarks, same as
     /// startup), open the restored/first file through the real `open_file` path,
     /// and restart the fs-watch on the new root. `cx`-free so the state transition
     /// is unit-testable; the dialog handler drives `cx.notify` around it.
@@ -1402,7 +1372,6 @@ impl JadeApp {
         self.workspace_opened = true;
         self.tree = Some(FileTree::scan(dir.clone()));
         self.file_cache = None; // Quick Open cache is per-workspace (§5.7)
-        self.notes = crate::notes::load(&dir); // sticky notes for this folder (§4.9)
 
         // Restore this folder's persisted `ui` blob (§1.2), same fields startup
         // reads: breakpoints / benchmarks / ai toggle / terminal visibility.
@@ -1908,10 +1877,18 @@ impl JadeApp {
     }
 
     /// Apply a cursor-only motion to the active buffer, dismiss popups, follow.
+    /// Any caret movement or edit: hold the caret solid for the next blink
+    /// window so it never flickers while typing/navigating.
+    fn caret_activity(&mut self) {
+        self.caret_last_active = self.now_ms();
+        self.caret_blink_show = true;
+    }
+
     fn buf_move(&mut self, f: impl FnOnce(&mut forge_buffer::Buffer, bool), extend: bool) {
         if let Some(tab) = self.editor.active_tab_mut() {
             f(&mut tab.buffer, extend);
         }
+        self.caret_activity();
         self.completion = None;
         self.hover = None;
         self.hover_target = None;
@@ -1954,6 +1931,7 @@ impl JadeApp {
     /// Shared post-edit bookkeeping: recompute eager decorations + arm debounces,
     /// forward an incremental `didChange`, follow the caret, wake the debounce.
     fn after_edit(&mut self, record: forge_buffer::EditRecord, cx: &mut Context<Self>) {
+        self.caret_activity();
         let now = self.now_ms();
         let payload = self.editor.active_tab_mut().map(|tab| {
             tab.on_edited(now);
@@ -2178,7 +2156,6 @@ impl JadeApp {
         clicks: usize,
     ) {
         self.dismiss_popups();
-        self.note_editing = None; // clicking into the editor blurs any note
         let text_left = f32::from_bits(self.editor_text_left.load(Ordering::Relaxed));
         let cw = self.char_w();
         let selecting = {
@@ -2220,6 +2197,7 @@ impl JadeApp {
             }
         };
         self.editor_selecting = selecting;
+        self.caret_activity();
         self.sync_asm_selection(); // source caret → asm cross-highlight (§6)
     }
 
@@ -2241,6 +2219,7 @@ impl JadeApp {
             let anchor = tab.buffer.selection().anchor;
             tab.buffer.set_selection(Selection::new(anchor, byte));
         }
+        self.caret_activity();
         self.scroll_caret_into_view();
     }
 
@@ -2253,7 +2232,6 @@ impl JadeApp {
     /// the selection there, like a plain in-text click at column 0).
     pub fn editor_caret_to_line_start(&mut self, row: usize, shift: bool) {
         self.dismiss_popups();
-        self.note_editing = None;
         let Some(tab) = self.editor.active_tab_mut() else {
             return;
         };
@@ -2265,6 +2243,7 @@ impl JadeApp {
         } else {
             tab.buffer.set_caret(byte);
         }
+        self.caret_activity();
         self.sync_asm_selection();
     }
 
@@ -2821,191 +2800,6 @@ impl JadeApp {
             .unwrap_or((0, 0, 0))
     }
 
-    // ── Sticky notes (§4.9) ───────────────────────────────────────────────────
-
-    /// Notes for the active file (the only ones shown; others `display:none`).
-    pub fn active_notes(&self) -> Vec<crate::notes::StickyNote> {
-        let Some(path) = &self.active_file else {
-            return Vec::new();
-        };
-        let fp = path.display().to_string();
-        self.notes
-            .iter()
-            .filter(|n| n.file_path == fp)
-            .cloned()
-            .collect()
-    }
-
-    /// Create a note on `line` (1-based) at mouse `(x, y)` (window px), unless one
-    /// already exists on this file+line. The new note enters edit mode.
-    pub fn create_note(&mut self, line: usize, x: f32, y: f32) {
-        let Some(path) = self.active_file.clone() else {
-            return;
-        };
-        let fp = path.display().to_string();
-        if self
-            .notes
-            .iter()
-            .any(|n| n.file_path == fp && n.anchor_line == line)
-        {
-            return; // one note per file+line
-        }
-        let note = crate::notes::StickyNote::new(fp, line, x, y);
-        self.note_editing = Some(note.id.clone());
-        self.notes.push(note);
-        self.save_notes();
-    }
-
-    /// Delete a note (× button).
-    pub fn delete_note(&mut self, id: &str) {
-        self.notes.retain(|n| n.id != id);
-        if self.note_editing.as_deref() == Some(id) {
-            self.note_editing = None;
-        }
-        self.save_notes();
-    }
-
-    /// Toggle the `index`-th checkbox in a note's content (click-to-toggle).
-    pub fn toggle_note_checkbox(&mut self, id: &str, index: usize) {
-        if let Some(n) = self.notes.iter_mut().find(|n| n.id == id) {
-            n.content = crate::notes::toggle_checkbox(&n.content, index);
-            n.touch();
-        }
-        self.save_notes();
-    }
-
-    /// Focus a note for content editing (click on its body).
-    pub fn edit_note(&mut self, id: &str) {
-        self.note_editing = Some(id.to_string());
-    }
-
-    /// Begin dragging a note by its header.
-    pub fn note_drag_start(&mut self, id: &str, mx: f32, my: f32) {
-        if let Some(n) = self.notes.iter().find(|n| n.id == id) {
-            self.note_drag = Some(NoteDrag {
-                id: id.to_string(),
-                start_x: mx,
-                start_y: my,
-                orig_x: n.x,
-                orig_y: n.y,
-            });
-        }
-    }
-
-    /// Begin resizing a note by its corner handle.
-    pub fn note_resize_start(&mut self, id: &str, mx: f32, my: f32) {
-        if let Some(n) = self.notes.iter().find(|n| n.id == id) {
-            self.note_resize = Some(NoteResize {
-                id: id.to_string(),
-                start_x: mx,
-                start_y: my,
-                orig_w: n.width,
-                orig_h: n.height,
-            });
-        }
-    }
-
-    /// Update the active drag/resize as the pointer moves (window px).
-    pub fn note_pointer_move(&mut self, mx: f32, my: f32) {
-        if let Some(d) = &self.note_drag {
-            let (id, nx, ny) = (d.id.clone(), d.orig_x + (mx - d.start_x), d.orig_y + (my - d.start_y));
-            if let Some(n) = self.notes.iter_mut().find(|n| n.id == id) {
-                n.x = nx;
-                n.y = ny;
-            }
-        } else if let Some(r) = &self.note_resize {
-            let id = r.id.clone();
-            let w = (r.orig_w + (mx - r.start_x)).max(crate::notes::MIN_W);
-            let h = (r.orig_h + (my - r.start_y)).max(crate::notes::MIN_H);
-            if let Some(n) = self.notes.iter_mut().find(|n| n.id == id) {
-                n.width = w;
-                n.height = h;
-            }
-        }
-    }
-
-    /// End any drag/resize, persisting the note's new position/size on mouseup.
-    pub fn note_pointer_up(&mut self) {
-        let ended = self.note_drag.take().map(|d| d.id).or_else(|| self.note_resize.take().map(|r| r.id));
-        if let Some(id) = ended {
-            if let Some(n) = self.notes.iter_mut().find(|n| n.id == id) {
-                n.touch();
-            }
-            self.save_notes();
-        }
-    }
-
-    /// True while a note drag or resize is in flight (drives the capture overlay).
-    pub fn note_pointer_active(&self) -> bool {
-        self.note_drag.is_some() || self.note_resize.is_some()
-    }
-
-    /// Apply one captured keystroke to the note being edited (§4.9): printable
-    /// chars append, Backspace pops a char, Enter inserts a newline, Esc blurs.
-    /// Content saves are debounced 500ms. Returns true when consumed.
-    pub fn note_key(&mut self, ks: &gpui::Keystroke, cx: &mut Context<Self>) -> bool {
-        let Some(id) = self.note_editing.clone() else {
-            return false;
-        };
-        let m = ks.modifiers;
-        match ks.key.as_str() {
-            "escape" => {
-                self.note_editing = None;
-                self.save_notes();
-                return true;
-            }
-            "backspace" => {
-                self.note_edit(&id, |c| {
-                    c.pop();
-                });
-            }
-            "enter" => self.note_edit(&id, |c| c.push('\n')),
-            _ => {
-                let printable =
-                    ks.key_char.is_some() && !m.platform && !m.control && !m.alt && !m.function;
-                if printable {
-                    let ch = ks.key_char.clone().unwrap();
-                    self.note_edit(&id, |c| c.push_str(&ch));
-                } else {
-                    return false;
-                }
-            }
-        }
-        self.schedule_note_save(cx);
-        true
-    }
-
-    fn note_edit(&mut self, id: &str, f: impl FnOnce(&mut String)) {
-        if let Some(n) = self.notes.iter_mut().find(|n| n.id == id) {
-            f(&mut n.content);
-            n.touch();
-        }
-    }
-
-    fn save_notes(&self) {
-        crate::notes::save(&self.workspace_root, &self.notes);
-    }
-
-    /// Persist note content after a 500ms quiet period (§4.9 content-save debounce).
-    fn schedule_note_save(&mut self, cx: &mut Context<Self>) {
-        self.note_save_gen += 1;
-        let generation = self.note_save_gen;
-        cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(crate::notes::SAVE_DEBOUNCE_MS))
-                .await;
-            let _ = this.update(cx, |app, _| {
-                if app.note_save_gen == generation {
-                    app.save_notes();
-                }
-            });
-        })
-        .detach();
-    }
-}
-
-// ── ASM viewer · breakpoints · benchmarks · UI persistence (Phase-5a) ─────────
-impl JadeApp {
     // ── ASM viewer (§6) ───────────────────────────────────────────────────────
 
     /// Toggle the right-half ASM overlay (ASM chip / ⌘⇧A). Opening kicks off a
@@ -3274,8 +3068,8 @@ impl JadeApp {
     }
 
     /// Debounced UI-blob save (1500ms, `state.ts:130`). Coalesces bursts via a
-    /// generation guard, like the sticky-note save; the merge in
-    /// `workspace_state::save` preserves the sticky-notes the notes module owns.
+    /// generation guard; the merge in `workspace_state::save` preserves any
+    /// stickyNotes blob the Electron app left in the same file.
     /// Called from every UI mutation that changes a persisted key.
     pub fn schedule_ui_save(&mut self, cx: &mut Context<Self>) {
         self.ui_save_gen += 1;
@@ -3528,11 +3322,37 @@ impl Render for JadeApp {
         if self.editor_focus.is_none() {
             self.editor_focus = Some(cx.focus_handle());
         }
+        // 530ms caret-blink driver (GUI only — headless assemble never renders).
+        // Toggles the phase while the editor owns focus; caret_activity() holds
+        // it solid through typing/navigation.
+        if !self.blink_task_running {
+            self.blink_task_running = true;
+            cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(530))
+                        .await;
+                    let alive = this.update(cx, |app, cx| {
+                        let idle = app.now_ms().saturating_sub(app.caret_last_active);
+                        let show = if idle < 530 { true } else { !app.caret_blink_show };
+                        if show != app.caret_blink_show {
+                            app.caret_blink_show = show;
+                            cx.notify();
+                        }
+                    });
+                    if alive.is_err() {
+                        break; // window closed
+                    }
+                }
+            })
+            .detach();
+        }
+
         // A file was just opened: hand the editor keyboard focus (open sites have
         // no Window; this render does). Skipped while an overlay owns input.
         if self.pending_editor_focus {
             self.pending_editor_focus = false;
-            if self.quick_open.is_none() && self.note_editing.is_none() {
+            if self.quick_open.is_none() {
                 if let Some(h) = &self.editor_focus {
                     h.focus(window, cx);
                 }
@@ -3642,22 +3462,6 @@ impl Render for JadeApp {
             root = root.child(overlay);
         }
 
-        // §4.9 Sticky-note overlay: absolute cards over the whole window. Focus
-        // the note handle while a note is being edited so its captured-keystroke
-        // buffer receives input.
-        {
-            let focus = self
-                .note_focus
-                .get_or_insert_with(|| cx.focus_handle())
-                .clone();
-            if self.note_editing.is_some() && !focus.is_focused(window) {
-                focus.focus(window, cx);
-            }
-            if let Some(overlay) = crate::panels::sticky_notes::overlay(self, focus, cx) {
-                root = root.child(overlay);
-            }
-        }
-
         // §5.7 Quick Open overlay: centered over the editor area, focused so its
         // captured-keystroke buffer receives input.
         if self.quick_open.is_some() {
@@ -3684,235 +3488,97 @@ fn card_shadow() -> Vec<BoxShadow> {
 }
 
 fn action_bar(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl IntoElement {
-    let file_label = app
-        .active_file
-        .as_ref()
-        .and_then(|p| p.file_name())
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "no file".to_string());
-
     let can_run = app.can_run();
     let build_label = if app.building { "Building…" } else { "Build" }.to_string();
     let run_label = if app.running { "Running…" } else { "Run" }.to_string();
     let ai_active = matches!(app.ai_status.state, AiState::Ready);
-    let ai_label = match app.ai_status.state {
-        AiState::Ready => format!("AI ● {}", app.ai_status.detail),
-        AiState::Starting => "AI … Starting".to_string(),
-        AiState::Error => format!("AI ⚠ {}", app.ai_status.detail),
-        AiState::Disabled => "AI ○ Off".to_string(),
-    };
 
-    // Left toggles: Terminal now toggles the output panel; the rest stay
-    // placeholders until Phase-4 wires the file tree / flow / runtime panels.
+    // Left cluster (screenshot ref / main.css:222-243): compact icon-only
+    // toggles — no chip boxes or labels.
     let terminal_active = app.output_visible && app.bottom_view == BottomView::Terminal;
     let toggles = div()
         .flex()
         .items_center()
-        .gap_2()
-        // Files chip toggles the left-sidebar collapse (§2; app.ts:449-459).
-        .child(action_chip(
-            "tgl-files",
-            "panel-left",
-            "Files".to_string(),
-            theme,
-            !app.sidebar_collapsed,
-            false,
-            cx,
-            |a, _| a.toggle_sidebar(),
-        ))
-        .child(action_chip(
-            "tgl-terminal",
-            "terminal",
-            "Terminal".to_string(),
-            theme,
-            terminal_active,
-            false,
-            cx,
-            |a, cx| {
-                // Show + focus the TERMINAL view, or hide the strip if it's the
-                // one already up.
-                if a.output_visible && a.bottom_view == BottomView::Terminal {
-                    a.action_toggle_output();
-                } else {
-                    a.set_bottom_view(BottomView::Terminal);
-                }
-                a.schedule_ui_save(cx); // terminalVisible (§1.2)
-            },
-        ))
-        .child(action_chip(
-            "tgl-flow",
-            "corner-down-right",
-            "Flow".to_string(),
-            theme,
-            app.flow_visible,
-            false,
-            cx,
-            |a, _| a.action_toggle_flow(),
-        ))
-        .child(action_chip(
-            "tgl-runtime",
-            "gauge",
-            "Runtime".to_string(),
-            theme,
-            app.runtime_visible,
-            false,
-            cx,
-            |a, _| a.action_toggle_runtime(),
-        ));
+        .gap_1()
+        .child(icon_btn("tgl-files", "panel-left", theme, !app.sidebar_collapsed, cx, |a, _| {
+            a.toggle_sidebar()
+        }))
+        .child(icon_btn("tgl-terminal", "terminal", theme, terminal_active, cx, |a, cx| {
+            if a.output_visible && a.bottom_view == BottomView::Terminal {
+                a.action_toggle_output();
+            } else {
+                a.set_bottom_view(BottomView::Terminal);
+            }
+            a.schedule_ui_save(cx); // terminalVisible (§1.2)
+        }))
+        .child(icon_btn("tgl-flow", "corner-down-right", theme, app.flow_visible, cx, |a, _| {
+            a.action_toggle_flow()
+        }))
+        .child(icon_btn("tgl-runtime", "gauge", theme, app.runtime_visible, cx, |a, _| {
+            a.action_toggle_runtime()
+        }));
 
+    // Diagnostic pills (always visible, zero included — screenshot center-left).
     let (errs, warns, infos) = app.active_diag_counts();
     let diag_badges = div()
         .flex()
         .items_center()
         .gap_2()
         .text_xs()
-        .when(errs > 0, |d| {
-            d.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .text_color(rgb(theme.red))
-                    .child(crate::assets::ui_icon("circle-x", 13., theme.red))
-                    .child(format!("{errs}")),
-            )
-        })
-        .when(warns > 0, |d| {
-            d.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .text_color(rgb(theme.amber))
-                    .child(crate::assets::ui_icon("triangle-alert", 13., theme.amber))
-                    .child(format!("{warns}")),
-            )
-        })
-        .when(infos > 0, |d| {
-            d.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .text_color(rgb(theme.periwinkle))
-                    .child(crate::assets::ui_icon("info", 13., theme.periwinkle))
-                    .child(format!("{infos}")),
-            )
-        });
+        .child(diag_pill("circle-x", errs, theme.red))
+        .child(diag_pill("triangle-alert", warns, theme.amber))
+        .child(diag_pill("info", infos, theme.muted));
 
     let right_group = div()
         .flex()
         .items_center()
         .gap_2()
-        .child(diag_badges)
-        // ASM viewer (§6, ⌘⇧A): right-half overlay of the active file's assembly.
-        .child(action_chip(
-            "chip-asm",
-            "code",
-            "ASM".to_string(),
-            theme,
-            app.asm_visible,
-            false,
-            cx,
-            |a, cx| a.toggle_asm(cx),
-        ))
-        .child(action_chip(
-            "btn-build",
-            "hammer",
-            build_label,
-            theme,
-            app.building,
-            app.building,
-            cx,
-            |a, _| a.action_build(),
-        ))
-        .child(action_chip(
-            "btn-run",
-            "play",
-            run_label,
-            theme,
-            app.running,
-            app.running || !can_run,
-            cx,
-            |a, _| a.action_run(),
-        ))
-        .child(action_chip(
-            "btn-debug",
-            "bug",
-            "Debug".to_string(),
-            theme,
-            app.debugging,
-            app.building,
-            cx,
-            |a, _| a.action_debug(),
-        ))
-        .child(action_chip(
-            "btn-stop",
-            "square",
-            "Stop".to_string(),
-            theme,
-            false,
-            false,
-            cx,
-            |a, _| a.action_stop(),
-        ))
-        .child(action_chip(
-            "btn-ai", "sparkles", ai_label, theme, ai_active, false, cx, |a, _| a.action_ai(),
-        ))
-        // AI ghost-text section (§4.11): toggle ghost suggestions + multiline mode.
-        // The eye/eye-off icon mirrors the Electron visibility toggle.
-        .child(action_chip(
+        // ASM viewer (§6, ⌘⇧A): plain icon+label, no box.
+        .child(flat_btn("chip-asm", "code", "ASM", theme, app.asm_visible, false, cx, |a, cx| {
+            a.toggle_asm(cx)
+        }))
+        // Build / Run: outlined accent pills (screenshot ref).
+        .child(pill_btn("btn-build", "hammer", build_label, theme.accent, theme, app.building, cx, |a, _| {
+            a.action_build()
+        }))
+        .child(pill_btn("btn-run", "play", run_label, theme.text, theme, app.running || !can_run, cx, |a, _| {
+            a.action_run()
+        }))
+        .child(flat_btn("btn-debug", "bug", "Debug", theme, app.debugging, app.building, cx, |a, _| {
+            a.action_debug()
+        }))
+        .child(flat_btn("btn-stop", "square", "Stop", theme, false, false, cx, |a, _| {
+            a.action_stop()
+        }))
+        // Trailing icon-only cluster: AI backend · ghost text · multiline ·
+        // theme · open-folder.
+        .child(icon_btn("btn-ai", "sparkles", theme, ai_active, cx, |a, _| a.action_ai()))
+        .child(icon_btn(
             "btn-ai-ghost",
             if app.ai_completion_enabled { "eye" } else { "eye-off" },
-            "Ghost".to_string(),
             theme,
             app.ai_completion_enabled,
-            false,
             cx,
             |a, cx| {
                 a.action_toggle_ai_completion();
                 a.schedule_ui_save(cx); // aiCompletionEnabled (§1.2)
             },
         ))
-        .child(action_chip(
-            "btn-ai-multi",
-            "layers",
-            if app.ai_multiline { "Multi ✓" } else { "Multi" }.to_string(),
-            theme,
-            app.ai_multiline,
-            false,
-            cx,
-            |a, _| a.action_toggle_ai_multiline(),
-        ))
-        // Theme toggle: sun in light mode, moon in dark (matches the TS btn-theme).
-        .child(action_chip(
+        .child(icon_btn("btn-ai-multi", "layers", theme, app.ai_multiline, cx, |a, _| {
+            a.action_toggle_ai_multiline()
+        }))
+        .child(icon_btn(
             "btn-theme",
             if theme.is_light { "sun" } else { "moon" },
-            "Theme".to_string(),
             theme,
-            false,
             false,
             cx,
             |a, _| a.action_theme(),
         ))
-        // Open Folder (inventory §2, ⌘⇧O): folder-open icon at the right end of
-        // the bar; opens GPUI's native directory picker.
-        .child(
-            div()
-                .id("btn-open-folder")
-                .flex()
-                .items_center()
-                .px_2()
-                .py_1()
-                .rounded_md()
-                .cursor_pointer()
-                .bg(rgb(theme.bg))
-                .text_color(rgb(theme.text))
-                .on_click(cx.listener(|a: &mut JadeApp, _ev, _win, cx| {
-                    a.prompt_open_project(cx);
-                }))
-                .child(crate::assets::ui_icon("folder-open", 14., theme.text)),
-        );
+        // Open Folder (inventory §2, ⌘⇧O): native directory picker.
+        .child(icon_btn("btn-open-folder", "folder-open", theme, false, cx, |a, cx| {
+            a.prompt_open_project(cx)
+        }));
 
     div()
         .flex()
@@ -3925,36 +3591,49 @@ fn action_bar(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl I
         .bg(rgb(theme.panel))
         .border_b_1()
         .border_color(rgb(theme.border))
-        // Window-drag region: empty parts of the bar drag the window; the chips'
-        // own click hitboxes take priority, so they stay `no-drag`
-        // (main.css:222-243 `-webkit-app-region: drag`/`no-drag`).
+        // Window-drag region: empty parts of the bar drag the window; the
+        // buttons' own click hitboxes take priority (`no-drag` equivalent).
         .window_control_area(WindowControlArea::Drag)
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap_3()
-                .child(div().text_color(rgb(theme.accent)).child("Jade"))
-                .child(toggles)
-                .child(
-                    div()
-                        .text_color(rgb(theme.muted))
-                        .text_xs()
-                        .child(file_label),
-                ),
-        )
+        .child(toggles)
+        .child(diag_badges)
         .child(right_group)
 }
 
-/// A clickable action-bar chip: a leading lucide `icon` + `label`. `active`
-/// accents the chip; `disabled` mutes it and drops the click handler. `f` is the
-/// same `action_*` method the smoke hook calls, so buttons and headless
-/// verification exercise one code path. The icon inherits the chip's text_color,
-/// so it re-tints with the active/disabled state and the current theme.
-fn action_chip(
+/// An icon-only action-bar button (no box, no label): muted at rest, accent
+/// when `active`, hover wash. 26px square hit target around a 15px glyph.
+fn icon_btn(
     id: &'static str,
     icon: &'static str,
-    label: String,
+    theme: &Theme,
+    active: bool,
+    cx: &mut Context<JadeApp>,
+    f: impl Fn(&mut JadeApp, &mut Context<JadeApp>) + 'static,
+) -> impl IntoElement {
+    let color = if active { theme.accent } else { theme.muted };
+    let hover_bg = theme.border;
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .justify_center()
+        .w(px(26.))
+        .h(px(26.))
+        .rounded_md()
+        .cursor_pointer()
+        .hover(move |s| s.bg(rgb(hover_bg)))
+        .on_click(cx.listener(move |a, _ev, _win, cx| {
+            f(a, cx);
+            cx.notify();
+        }))
+        .child(crate::assets::ui_icon(icon, 15., color))
+}
+
+/// A flat icon+label button (no border/fill): text-colored, hover wash.
+#[allow(clippy::too_many_arguments)]
+fn flat_btn(
+    id: &'static str,
+    icon: &'static str,
+    label: &'static str,
     theme: &Theme,
     active: bool,
     disabled: bool,
@@ -3968,33 +3647,91 @@ fn action_chip(
     } else {
         theme.text
     };
+    let hover_bg = theme.border;
     let el = div()
         .id(id)
         .flex()
-        .flex_row()
         .items_center()
         .gap_1()
         .px_2()
         .py_1()
         .rounded_md()
         .text_xs()
-        .bg(rgb(theme.bg))
         .text_color(rgb(color))
         .child(crate::assets::ui_icon(icon, 14., color))
         .child(label);
     if disabled {
         el
     } else {
-        // Hover affordance (§2; main.css:290-294 `.action-btn:hover`): a subtle
-        // border-wash fill + pointer cursor.
-        let hover_bg = theme.border;
         el.cursor_pointer()
             .hover(move |s| s.bg(rgb(hover_bg)))
-            .on_click(cx.listener(move |app, _ev, _win, cx| {
-                f(app, cx);
+            .on_click(cx.listener(move |a, _ev, _win, cx| {
+                f(a, cx);
                 cx.notify();
             }))
     }
+}
+
+/// An outlined pill button (Build/Run): 1px `color` border + `color` icon and
+/// text on the panel background, hover wash. `busy` mutes it and drops clicks.
+#[allow(clippy::too_many_arguments)]
+fn pill_btn(
+    id: &'static str,
+    icon: &'static str,
+    label: String,
+    color: u32,
+    theme: &Theme,
+    busy: bool,
+    cx: &mut Context<JadeApp>,
+    f: impl Fn(&mut JadeApp, &mut Context<JadeApp>) + 'static,
+) -> impl IntoElement {
+    let color = if busy { theme.muted } else { color };
+    let hover_bg = theme.border;
+    let el = div()
+        .id(id)
+        .flex()
+        .items_center()
+        .gap_1()
+        .px_3()
+        .py_1()
+        .rounded_md()
+        .border_1()
+        .border_color(rgb(color))
+        .text_xs()
+        .text_color(rgb(color))
+        .child(crate::assets::ui_icon(icon, 14., color))
+        .child(label);
+    if busy {
+        el
+    } else {
+        el.cursor_pointer()
+            .hover(move |s| s.bg(rgb(hover_bg)))
+            .on_click(cx.listener(move |a, _ev, _win, cx| {
+                f(a, cx);
+                cx.notify();
+            }))
+    }
+}
+
+/// One always-visible diagnostic pill: colored icon + count on a faint tinted
+/// capsule (screenshot ref — counts show even at zero).
+fn diag_pill(icon: &'static str, count: usize, color: u32) -> impl IntoElement {
+    div()
+        .flex()
+        .items_center()
+        .gap_1()
+        .px_2()
+        .py(px(2.))
+        .rounded_full()
+        .bg(gpui::Rgba {
+            r: ((color >> 16) & 0xff) as f32 / 255. * 0.15,
+            g: ((color >> 8) & 0xff) as f32 / 255. * 0.15,
+            b: (color & 0xff) as f32 / 255. * 0.15,
+            a: 1.0,
+        })
+        .text_color(rgb(color))
+        .child(crate::assets::ui_icon(icon, 13., color))
+        .child(format!("{count}"))
 }
 
 /// Left panel: the file-tree card (deliverable §2, floating-card look §2). When

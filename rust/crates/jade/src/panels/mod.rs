@@ -7,7 +7,6 @@ pub mod debug_panel;
 pub mod file_tree;
 pub mod quick_open;
 pub mod runtime_panel;
-pub mod sticky_notes;
 pub mod structure_panel;
 pub mod telemetry_sidebar;
 pub mod terminal_panel;

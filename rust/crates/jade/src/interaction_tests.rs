@@ -397,3 +397,68 @@ async fn click_on_visible_row_when_scrolled_does_not_scroll(cx: &mut TestAppCont
         );
     }
 }
+
+/// Clicking to the RIGHT of a line's text (inside the row, past the last char)
+/// must put the caret at that line's end; typing with the caret scrolled out of
+/// view must follow-scroll so the caret is visible again.
+#[gpui::test]
+async fn click_past_eol_and_type_follow_scroll(cx: &mut TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("jade-eol-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("main.cpp");
+    let body: String = (0..300)
+        .map(|i| format!("static int line_{i} = {i};\n"))
+        .collect();
+    std::fs::write(&file, body).unwrap();
+    let (deps, app_rx) = test_deps(dir);
+
+    let (app, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps, app_rx));
+    app.update_in(cx, |app, _window, cx| {
+        app.open_file(file.clone());
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    // Click far to the right of row 3's short text — caret must land at its EOL.
+    let cell = cx.debug_bounds("code-cell-3").expect("row 3 painted");
+    let pos = gpui::point(
+        cell.origin.x + cell.size.width - px(20.),
+        cell.origin.y + px(crate::panels::code_view::LINE_H / 2.0),
+    );
+    cx.simulate_click(pos, Modifiers::default());
+    let eol = "static int line_3 = 3;".chars().count();
+    app.update_in(cx, |app, _w, _cx| {
+        let caret = app.editor.active_tab().unwrap().caret_point();
+        assert_eq!(
+            (caret.row, caret.col),
+            (3, eol),
+            "click right of code must set caret at that line's end"
+        );
+    });
+
+    // Scroll the caret out of view (deep), then type: viewport must follow.
+    app.update_in(cx, |app, _w, cx| {
+        app.code_scroll
+            .scroll_to_item(200, gpui::ScrollStrategy::Top);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let top_before = app.update_in(cx, |app, _w, _cx| app.editor_scroll_top());
+    assert!(top_before > 100, "precondition: scrolled deep ({top_before})");
+
+    cx.simulate_input("z");
+    cx.run_until_parked();
+    let (top_after, rows, caret_row) = app.update_in(cx, |app, _w, _cx| {
+        (
+            app.editor_scroll_top(),
+            app.editor_rows.load(std::sync::atomic::Ordering::Relaxed) as usize,
+            app.editor.active_tab().unwrap().caret_point().row,
+        )
+    });
+    assert_eq!(caret_row, 3);
+    assert!(
+        top_after <= caret_row && caret_row < top_after + rows,
+        "typing out of view must scroll the caret back into view (top {top_after}, rows {rows})"
+    );
+}

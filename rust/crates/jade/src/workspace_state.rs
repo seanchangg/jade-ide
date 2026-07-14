@@ -15,12 +15,11 @@
 //! key) survive. The app arms a 1500ms debounce around it (`state.ts:130`).
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::benchmark::Benchmark;
-use crate::notes::workspace_json_path;
 
 /// One persisted open tab (Electron `TabState`, `types.ts:23-27`). `viewState`
 /// (Monaco-specific) is intentionally ignored on load and omitted on save.
@@ -74,6 +73,12 @@ const OWNED_KEYS: &[&str] = &[
 ];
 
 /// Load Jade's UI state for a workspace (`ui` key), or the default on any error.
+/// `<workspace>/.forge/workspace.json` — the shared per-workspace state file
+/// (same file the Electron app writes; saves merge-preserve foreign keys).
+fn workspace_json_path(workspace_root: &Path) -> PathBuf {
+    workspace_root.join(".forge").join("workspace.json")
+}
+
 pub fn load(workspace_root: &Path) -> WorkspaceUi {
     load_from(&workspace_json_path(workspace_root))
 }

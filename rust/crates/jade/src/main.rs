@@ -50,7 +50,6 @@ mod highlight;
 #[cfg(test)]
 mod interaction_tests;
 mod memory_bar;
-mod notes;
 mod output;
 mod panels;
 mod prefs;

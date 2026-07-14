@@ -230,7 +230,11 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> gpui::AnyElement {
                 // Breakpoint on this line (§4.6) — takes visual precedence.
                 let has_bp = this.is_breakpoint(line_no as u32);
 
-                let mut row = div().flex().flex_row().h(px(LINE_H)).items_center();
+                // `.w_full()`: uniform_list items size to content by default, so
+                // short lines produced narrow rows and clicks to the right of
+                // the code hit nothing (caret wouldn't move). Full-width rows
+                // make the whole line band clickable (cell clamps to EOL).
+                let mut row = div().flex().flex_row().w_full().h(px(LINE_H)).items_center();
 
                 if flow_visible {
                     let mut cell = div()
@@ -311,10 +315,8 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> gpui::AnyElement {
                         )
                         .child(dot),
                 );
-                // Line-number: plain click puts the caret at the line start
-                // (standard editor margin behavior); ⌥-click creates a sticky
-                // note anchored here (§4.9 — moved off plain click, which made
-                // "click left of the code" spawn notes instead of moving).
+                // Line-number: click puts the caret at the line start
+                // (standard editor margin behavior; shift extends).
                 let ln_handle = row_handle.clone();
                 gutter = gutter.child(
                     div()
@@ -326,18 +328,10 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> gpui::AnyElement {
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |app: &mut JadeApp, ev: &MouseDownEvent, window, cx| {
-                                if ev.modifiers.alt {
-                                    app.create_note(
-                                        line_no,
-                                        f32::from(ev.position.x),
-                                        f32::from(ev.position.y),
-                                    );
-                                } else {
-                                    if let Some(h) = &ln_handle {
-                                        window.focus(h, cx);
-                                    }
-                                    app.editor_caret_to_line_start(i, ev.modifiers.shift);
+                                if let Some(h) = &ln_handle {
+                                    window.focus(h, cx);
                                 }
+                                app.editor_caret_to_line_start(i, ev.modifiers.shift);
                                 cx.notify();
                             }),
                         )
@@ -358,10 +352,10 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> gpui::AnyElement {
                     .flex_row()
                     .items_center();
 
-                // Caret bar (2px accent, no blink) on the caret row — always
-                // visible on the active tab so the cursor is findable; dimmed
-                // when the editor doesn't own keyboard focus.
-                if caret_point.row == i {
+                // Caret bar (2px accent) on the caret row — blinks at the
+                // app-driven 530ms phase while focused; steady dim marker when
+                // the editor doesn't own keyboard focus (so it stays findable).
+                if caret_point.row == i && (!focused || this.caret_blink_show) {
                     cell = cell.child(
                         div()
                             .absolute()
