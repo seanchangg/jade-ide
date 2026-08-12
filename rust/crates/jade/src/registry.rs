@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 
-use forge_telemetry::Kind;
+use jade_telemetry::Kind;
 
 use crate::prefs::TelemetryPrefs;
 

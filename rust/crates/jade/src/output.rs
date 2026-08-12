@@ -1,6 +1,6 @@
 //! Output-panel model (feature inventory §6 "status lives in the terminal"):
 //! a capped scrollback of plain-text lines. The real xterm terminal is Phase-4;
-//! for now build/cmake/run/debug output and `[forge]` status lines land here as
+//! for now build/cmake/run/debug output and `[jade]` status lines land here as
 //! ANSI-stripped monospace text.
 //!
 //! Pure, unit-tested helpers — the renderer just paints the tail.
@@ -9,7 +9,7 @@
 /// is the Phase-3 brief's value — enough for a noisy cmake configure).
 pub const MAX_SCROLLBACK: usize = 2000;
 
-/// Strip ANSI escape sequences (CSI `\x1b[...m` etc.) so colored `[forge]` /
+/// Strip ANSI escape sequences (CSI `\x1b[...m` etc.) so colored `[jade]` /
 /// `[cmake]` / ASan lines render as plain text. A real terminal (Phase-4) will
 /// interpret them; here we only need readable text.
 pub fn strip_ansi(s: &str) -> String {
@@ -71,9 +71,9 @@ mod tests {
 
     #[test]
     fn strips_sgr_color_codes() {
-        // The exact `[forge]` status line shape from app.ts:1028.
-        let s = "\x1b[36m[forge]\x1b[0m \x1b[32mBuild succeeded\x1b[0m (12ms)";
-        assert_eq!(strip_ansi(s), "[forge] Build succeeded (12ms)");
+        // The exact `[jade]` status line shape from app.ts:1028.
+        let s = "\x1b[36m[jade]\x1b[0m \x1b[32mBuild succeeded\x1b[0m (12ms)";
+        assert_eq!(strip_ansi(s), "[jade] Build succeeded (12ms)");
     }
 
     #[test]
@@ -89,9 +89,9 @@ mod tests {
     #[test]
     fn push_splits_lines_and_drops_trailing_newline() {
         let mut buf = Vec::new();
-        push_output(&mut buf, "\r\n\x1b[36m[forge]\x1b[0m one\r\n");
+        push_output(&mut buf, "\r\n\x1b[36m[jade]\x1b[0m one\r\n");
         // "\r\n..." → leading empty line, then the content line.
-        assert_eq!(buf, vec!["".to_string(), "[forge] one".to_string()]);
+        assert_eq!(buf, vec!["".to_string(), "[jade] one".to_string()]);
     }
 
     #[test]

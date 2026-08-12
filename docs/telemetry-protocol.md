@@ -1,6 +1,6 @@
-# Forge Telemetry Protocol
+# Jade Telemetry Protocol
 
-This document is the **authoritative** wire specification for the Forge IDE
+This document is the **authoritative** wire specification for the Jade IDE
 telemetry channel. The probe client (the injected GPU tensor-streaming dylib)
 and any instrumented training program are built against this document.
 
@@ -11,13 +11,13 @@ and any instrumented training program are built against this document.
   it spawns via the environment variable:
 
   ```
-  FORGE_TELEMETRY_SOCK=<path>
+  JADE_TELEMETRY_SOCK=<path>
   ```
 
-  The path is `os.tmpdir() + "/forge-telemetry-<ide-pid>.sock"` but clients must
-  read it from `FORGE_TELEMETRY_SOCK` and must **not** hardcode it. If the
+  The path is `os.tmpdir() + "/jade-telemetry-<ide-pid>.sock"` but clients must
+  read it from `JADE_TELEMETRY_SOCK` and must **not** hardcode it. If the
   variable is unset/empty, telemetry is unavailable — clients should degrade
-  gracefully (fall back to the legacy `__FORGE_*` stdout lines, see below).
+  gracefully (fall back to the legacy `__JADE_*` stdout lines, see below).
 - **Framing**: newline-delimited JSON (**NDJSON**), UTF-8. One complete JSON
   object per line, terminated by `\n`. No embedded newlines inside a message.
 - **Direction**: bidirectional. Client→IDE carries discovery + data; IDE→Client
@@ -137,8 +137,8 @@ The prior magic-stdout protocol still works and feeds the **same** registry — 
 name first seen this way is auto-registered exactly like a socket `decl`:
 
 ```
-__FORGE_SCALAR|<name>|<step>|<value>|<timestamp>
-__FORGE_TIMING|<name>|<ms>|<step>
+__JADE_SCALAR|<name>|<step>|<value>|<timestamp>
+__JADE_TIMING|<name>|<ms>|<step>
 ```
 
 `build-runner.ts` parses these from the program's stdout and routes them through

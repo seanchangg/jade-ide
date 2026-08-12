@@ -1,21 +1,21 @@
 //! TERMINAL panel (feature inventory §5.2, Phase-4 wave 2).
 //!
-//! Renders a [`forge_term::GridSnapshot`] as monospace rows and forwards
+//! Renders a [`jade_term::GridSnapshot`] as monospace rows and forwards
 //! keystrokes to the PTY. The color mapping (`Named`/`Indexed` ANSI → the
-//! hardcoded forge-dark palette, `Default` → theme fg/bg, inverse-video swap)
+//! hardcoded jade-dark palette, `Default` → theme fg/bg, inverse-video swap)
 //! and the key→bytes encoding are factored into pure, unit-tested functions;
 //! the renderer is a thin projection over them.
 //!
-//! # forge-term contract (see `crates/forge-term`)
+//! # jade-term contract (see `crates/jade-term`)
 //! - on `TermEvent::Damaged` → `snapshot(id)` → repaint (cached in `JadeApp`);
 //! - on `TermEvent::Exited` → a dim `[exited <code>]` line;
 //! - `resize(cols, rows)` on panel resize (computed from pixel bounds here);
 //! - `write(bytes)` for keystrokes (this module's [`key_to_bytes`]).
 //!
-//! # Why `[forge]` status lines are NOT echoed here
-//! The TS `writeOutput` wrote to the xterm.js *display buffer*. `forge-term`
+//! # Why `[jade]` status lines are NOT echoed here
+//! The TS `writeOutput` wrote to the xterm.js *display buffer*. `jade-term`
 //! exposes only `write()`, which feeds the **PTY** (i.e. the shell's stdin), so
-//! injecting `[forge] …` text there would run it as a shell command, not print
+//! injecting `[jade] …` text there would run it as a shell command, not print
 //! it. There is no display-inject API. So build/run status lines stay in the
 //! plain output scrollback, kept as the bottom panel's OUTPUT view toggle
 //! (`app.rs`), and the TERMINAL view is a real interactive shell.
@@ -23,7 +23,7 @@
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use forge_term::{Cell, Color, GridSnapshot, TermId, TermManager};
+use jade_term::{Cell, Color, GridSnapshot, TermId, TermManager};
 use gpui::{
     canvas, div, prelude::*, px, rgb, Bounds, ClipboardItem, Context, Div, FocusHandle, FontWeight,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, ScrollDelta,
@@ -43,7 +43,7 @@ pub const CELL_H: f32 = 20.0;
 
 /// The 16 ANSI colors, ported from `TERMINAL_THEME_DARK`
 /// (`src/renderer/panels/terminal-panel.ts:13-46`). Index 0..=7 normal, 8..=15
-/// bright; the forge-dark chrome reuses editor hues so program output matches.
+/// bright; the jade-dark chrome reuses editor hues so program output matches.
 pub const ANSI_DARK: [u32; 16] = [
     0x2B2D30, // 0 black
     0xCF6B6B, // 1 red
@@ -63,7 +63,7 @@ pub const ANSI_DARK: [u32; 16] = [
     0xDFE1E5, // 15 bright white
 ];
 
-/// The 16 ANSI colors for forge-light, ported from `TERMINAL_THEME_LIGHT`
+/// The 16 ANSI colors for jade-light, ported from `TERMINAL_THEME_LIGHT`
 /// (`src/renderer/panels/terminal-panel.ts:28-40`): the same hues darkened for
 /// contrast on the cream background. Swapped in on the theme toggle (§5.2 — a
 /// canvas terminal can't read CSS vars, so the palette is chosen in code).
@@ -86,7 +86,7 @@ pub const ANSI_LIGHT: [u32; 16] = [
     0xF5F6F8, // 15 bright white
 ];
 
-/// forge-dark terminal default fg / bg (the palette's `foreground`/`background`).
+/// jade-dark terminal default fg / bg (the palette's `foreground`/`background`).
 pub const TERM_DEFAULT_FG: u32 = 0xDFE1E5;
 pub const TERM_DEFAULT_BG: u32 = 0x1E1F22;
 
@@ -112,7 +112,7 @@ pub fn resolve_color_pal(c: Color, default: u32, palette: &[u32; 16]) -> u32 {
     }
 }
 
-/// [`resolve_color_pal`] against the forge-dark palette (back-compat + tests).
+/// [`resolve_color_pal`] against the jade-dark palette (back-compat + tests).
 pub fn resolve_color(c: Color, default: u32) -> u32 {
     resolve_color_pal(c, default, &ANSI_DARK)
 }
@@ -156,7 +156,7 @@ pub fn cell_colors_pal(cell: &Cell, def_fg: u32, def_bg: u32, palette: &[u32; 16
     }
 }
 
-/// [`cell_colors_pal`] against the forge-dark palette (back-compat + tests).
+/// [`cell_colors_pal`] against the jade-dark palette (back-compat + tests).
 pub fn cell_colors(cell: &Cell, def_fg: u32, def_bg: u32) -> (u32, u32) {
     cell_colors_pal(cell, def_fg, def_bg, &ANSI_DARK)
 }
@@ -261,7 +261,7 @@ pub fn key_to_bytes(
 /// Encode clipboard text for the PTY (⌘V). Newlines become `\r` (what a
 /// terminal keyboard sends); in bracketed-paste mode the text is wrapped in
 /// `ESC [ 200~` … `ESC [ 201~` with any embedded `ESC` stripped so the paste
-/// can't forge the closing marker (or any other control sequence).
+/// can't jade the closing marker (or any other control sequence).
 pub fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
     let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
     if bracketed {
@@ -718,7 +718,7 @@ fn resize_canvas(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use forge_term::CellFlags;
+    use jade_term::CellFlags;
 
     fn cell(ch: char, fg: Color, bg: Color, inverse: bool) -> Cell {
         Cell {
@@ -902,7 +902,7 @@ mod tests {
         GridSnapshot {
             cols,
             rows: viewport.len(),
-            cursor: forge_term::Cursor { col: 0, line: 0, visible: false },
+            cursor: jade_term::Cursor { col: 0, line: 0, visible: false },
             cells: viewport.iter().map(|s| text_row(s, cols)).collect(),
             scrollback: scrollback.iter().map(|s| text_row(s, cols)).collect(),
             app_cursor: false,

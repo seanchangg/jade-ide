@@ -2,7 +2,7 @@
 //!
 //! Uses the plain `tree-sitter` runtime + the `tree-sitter-cpp` grammar directly
 //! (no zed `language`/`editor` crates). A focused, self-contained highlight query
-//! (`HIGHLIGHT_QUERY`) maps grammar captures to the forge-dark token palette
+//! (`HIGHLIGHT_QUERY`) maps grammar captures to the jade-dark token palette
 //! (feature inventory §4.2). `.metal` files are parsed with the same C++ grammar
 //! (Metal is C++-derived) plus `#any-of?` predicates that recolor the Metal
 //! keyword/type sets, and `[[...]]` attribute nodes render as amber annotations
@@ -18,7 +18,7 @@ use std::path::Path;
 
 use tree_sitter::{Query, QueryCursor, StreamingIterator};
 
-/// forge-dark token palette (§4.2). Kept independent of [`crate::theme::Theme`]
+/// jade-dark token palette (§4.2). Kept independent of [`crate::theme::Theme`]
 /// so the highlighter (and its tests) need no GPUI/theme coupling; the four
 /// syntax colors that also live in `Theme` use identical hex values.
 #[derive(Debug, Clone, Copy)]
@@ -38,7 +38,7 @@ pub struct TokenPalette {
 }
 
 impl TokenPalette {
-    pub fn forge_dark() -> Self {
+    pub fn jade_dark() -> Self {
         TokenPalette {
             keyword: 0x56B389,
             types: 0x9BB5CF,
@@ -55,11 +55,11 @@ impl TokenPalette {
         }
     }
 
-    /// forge-light token palette (§4.2). Mirrors `Theme::forge_light()`'s
+    /// jade-light token palette (§4.2). Mirrors `Theme::jade_light()`'s
     /// accents (desaturated green/blue/amber on warm charcoal) so syntax stays
     /// legible on the cream background; variable/operator/delimiter darken to
     /// warm-charcoal grays instead of the dark theme's near-whites.
-    pub fn forge_light() -> Self {
+    pub fn jade_light() -> Self {
         TokenPalette {
             keyword: 0x2E7D5B,      // accent (emerald, desaturated)
             types: 0x4A6A88,        // blue-gray
@@ -79,7 +79,7 @@ impl TokenPalette {
 
 impl Default for TokenPalette {
     fn default() -> Self {
-        Self::forge_dark()
+        Self::jade_dark()
     }
 }
 
@@ -381,7 +381,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn hl(text: &str) -> Vec<Vec<Span>> {
-        Highlighter::new_cpp(TokenPalette::forge_dark())
+        Highlighter::new_cpp(TokenPalette::jade_dark())
             .expect("query compiles")
             .highlight(text)
     }
@@ -389,7 +389,7 @@ mod tests {
     /// The static query must compile against the grammar.
     #[test]
     fn query_compiles() {
-        assert!(Highlighter::new_cpp(TokenPalette::forge_dark()).is_ok());
+        assert!(Highlighter::new_cpp(TokenPalette::jade_dark()).is_ok());
     }
 
     /// Find the color covering the byte range of `needle` on `line`.
@@ -405,7 +405,7 @@ mod tests {
     #[test]
     fn keyword_string_comment_type_number() {
         let text = "// hi\nint add(int x) {\n    const char* s = \"hi\";\n    return 42;\n}\n";
-        let p = TokenPalette::forge_dark();
+        let p = TokenPalette::jade_dark();
         let spans = hl(text);
 
         // Comment on line 0.
@@ -426,7 +426,7 @@ mod tests {
     #[test]
     fn preprocessor_and_system_string() {
         let text = "#include <vector>\n#define N 4\n";
-        let p = TokenPalette::forge_dark();
+        let p = TokenPalette::jade_dark();
         let spans = hl(text);
         // `<vector>` is a system lib string.
         assert_eq!(color_of(&spans, text, 0, "<vector>"), Some(p.string));
@@ -438,7 +438,7 @@ mod tests {
     fn metal_keywords_recolored() {
         // Parsed with the C++ grammar; `kernel`/`device` recolor via #any-of?.
         let text = "kernel void k(device float4* buf) {}\n";
-        let p = TokenPalette::forge_dark();
+        let p = TokenPalette::jade_dark();
         let h = Highlighter::new_cpp(p).unwrap();
         let spans = h.highlight(text);
         // At least one keyword-colored span exists for the Metal qualifiers.
@@ -449,7 +449,7 @@ mod tests {
     #[test]
     fn plain_text_fallback() {
         let text = "just some text\nno code here\n";
-        let spans = highlight_file(&PathBuf::from("notes.txt"), text, TokenPalette::forge_dark());
+        let spans = highlight_file(&PathBuf::from("notes.txt"), text, TokenPalette::jade_dark());
         assert_eq!(spans.len(), 3);
         assert!(spans.iter().all(|l| l.is_empty()));
     }

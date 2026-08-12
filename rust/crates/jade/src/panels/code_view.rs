@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 
-use forge_buffer::Point;
+use jade_buffer::Point;
 use gpui::{
     canvas, div, point, prelude::*, px, rgb, rgba, size, uniform_list, Bounds, ClickEvent, Context,
     ElementInputHandler, Entity, FocusHandle, HighlightStyle, KeyDownEvent,
@@ -180,7 +180,7 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> gpui::AnyElement {
                 );
                 let marked = tab.marked.as_ref().and_then(|m| {
                     editor_view::selection_on_line(
-                        forge_buffer::Selection::new(m.start, m.end),
+                        jade_buffer::Selection::new(m.start, m.end),
                         line_start,
                         line_end,
                     )
@@ -969,8 +969,8 @@ fn cell_to_style(cell: &CellStyle, theme: &Theme) -> HighlightStyle {
 
 /// The gutter dot color for the highest-severity diagnostic **starting** on row
 /// `row` (0-based), or `None`.
-fn diag_dot_color(diagnostics: &[forge_lsp::Diagnostic], row: usize, theme: &Theme) -> Option<u32> {
-    use forge_lsp::DiagnosticSeverity as S;
+fn diag_dot_color(diagnostics: &[jade_lsp::Diagnostic], row: usize, theme: &Theme) -> Option<u32> {
+    use jade_lsp::DiagnosticSeverity as S;
     // Rank: lower is more severe (Error most). Track the most-severe on the row.
     let rank = |s: S| match s {
         S::ERROR => 0,

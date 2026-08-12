@@ -4,7 +4,7 @@
 //! Everything here is deterministic and side-effect free so it can be unit-tested
 //! without a llama-server: the [`GhostCache`] (with **typed-through** hits) and the
 //! line-aware [`post_process`] pass. The app (`app.rs`) owns the debounce, the
-//! generation-counter supersede, and the `forge-ai` `/infill` call; it feeds raw
+//! generation-counter supersede, and the `jade-ai` `/infill` call; it feeds raw
 //! model output through these functions to decide what ghost run to paint.
 //!
 //! Lessons ported verbatim from JetBrains' FLCC paper (arXiv 2405.08704, cited in

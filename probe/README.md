@@ -1,15 +1,15 @@
-# forge-probe: zero-instrumentation Metal telemetry
+# jade-probe: zero-instrumentation Metal telemetry
 
-**Question investigated:** can forge-ide read GPU VRAM buffers (including
+**Question investigated:** can jade-ide read GPU VRAM buffers (including
 private, never-copied-to-CPU intermediate buffers) from a running training
-process, without the user adding `__FORGE_*` macros to their code?
+process, without the user adding `__JADE_*` macros to their code?
 
 **Answer: yes — proven working on this machine (Apple M4, macOS 25.3).**
 `make && python3 mock_server.py` reproduces the end-to-end test (PASS).
 
 ## How it works
 
-`forge_probe.dylib` is injected into the user's program at launch via
+`jade_probe.dylib` is injected into the user's program at launch via
 `DYLD_INSERT_LIBRARIES` (the IDE controls process launch in
 `build-runner.ts`, so this is one env var). It needs no code changes, no
 recompilation, and no linking in the user's project:
@@ -25,22 +25,22 @@ recompilation, and no linking in the user's project:
 3. **Automatic GPU timing** — swizzled `commit` on the command-buffer class
    attaches a completion handler reading `GPUStartTime`/`GPUEndTime`, giving
    per-command-buffer GPU timings labeled by `commandBuffer.label`. This
-   replaces manual `__FORGE_TIMING` for GPU work entirely.
+   replaces manual `__JADE_TIMING` for GPU work entirely.
 4. **VRAM readback** — for `MTLStorageModeShared`/`Managed` buffers, contents
    are read directly. For `MTLStorageModePrivate` (VRAM-only) buffers, the
    probe blits to a shared staging buffer on its own command queue, scheduled
    from the app's command-buffer *completion* handler so it never races
    in-flight GPU work. Verified byte-accurate (weights evolve step to step).
 5. **Selection control** — the probe connects to the unix socket in
-   `$FORGE_TELEMETRY_SOCK` (NDJSON, see `../docs/telemetry-protocol.md`) and
+   `$JADE_TELEMETRY_SOCK` (NDJSON, see `../docs/telemetry-protocol.md`) and
    honors IDE `{"type":"track",...}` messages: only checked buffers stream,
    downsampled (average-pooled) to `maxDim×maxDim` before base64 encoding.
-   Fallback without a socket: `FORGEJSON|`-prefixed lines on stderr;
-   `FORGE_TRACK_ALL=1` streams everything.
+   Fallback without a socket: `JADEJSON|`-prefixed lines on stderr;
+   `JADE_TRACK_ALL=1` streams everything.
 
 ## Files
 
-- `forge_probe.mm` — the probe dylib
+- `jade_probe.mm` — the probe dylib
 - `test_train.mm` — deliberately uninstrumented Metal SGD loop (private
   weights buffer, shared gradients) used to validate the probe
 - `mock_server.py` — stand-in for the IDE telemetry server; asserts the
@@ -57,7 +57,7 @@ recompilation, and no linking in the user's project:
   the probe; needs a shape/dtype hint for the same reason as above.
 - **Hardened-runtime binaries block `DYLD_INSERT_LIBRARIES`.** Irrelevant for
   local dev builds (ad-hoc signed, no hardened runtime) — which is everything
-  forge-ide compiles itself. System Python + hardened frameworks would need
+  jade-ide compiles itself. System Python + hardened frameworks would need
   the `com.apple.security.cs.allow-dyld-environment-variables` entitlement.
 - **Overhead** is bounded by design: tensor readback runs every 4th command
   buffer, only for tracked buffers, off the app's queue. Blit of a 256×256
@@ -68,10 +68,10 @@ recompilation, and no linking in the user's project:
 
 ## IDE integration (next step)
 
-In `build-runner.ts`, alongside the existing `FORGE_TELEMETRY_SOCK` env:
+In `build-runner.ts`, alongside the existing `JADE_TELEMETRY_SOCK` env:
 
 ```ts
-env.DYLD_INSERT_LIBRARIES = path.join(app.getAppPath(), 'probe', 'forge_probe.dylib');
+env.DYLD_INSERT_LIBRARIES = path.join(app.getAppPath(), 'probe', 'jade_probe.dylib');
 ```
 
 Then the telemetry sidebar's buffer checkboxes drive `track` messages, and

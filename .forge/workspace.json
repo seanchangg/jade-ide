@@ -1,0 +1,11 @@
+{
+  "ui": {
+    "openTabs": [],
+    "fileTreeVisible": true,
+    "terminalVisible": true,
+    "memoryBarVisible": true,
+    "breakpoints": {},
+    "benchmarks": [],
+    "aiCompletionEnabled": true
+  }
+}

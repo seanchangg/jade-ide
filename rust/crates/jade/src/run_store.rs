@@ -1,6 +1,6 @@
 //! Persistent run store — the "experiment tracking" layer of the research
 //! studio. Each telemetry-producing run (Run or Debug) is written to
-//! `<workspace>/.forge/runs.db` (SQLite) at process exit: its scalar series,
+//! `<workspace>/.jade/runs.db` (SQLite) at process exit: its scalar series,
 //! timer samples, memory curve, and metadata (git sha, exe, duration, exit
 //! code). The training view lists stored runs and overlays any of them on the
 //! Loss/Memory charts — generalizing the single in-memory ghost run.
@@ -73,9 +73,9 @@ pub struct RunStore {
 }
 
 impl RunStore {
-    /// Open (creating if needed) the workspace's run DB at `.forge/runs.db`.
+    /// Open (creating if needed) the workspace's run DB at `.jade/runs.db`.
     pub fn open(workspace_root: &Path) -> rusqlite::Result<Self> {
-        let dir = workspace_root.join(".forge");
+        let dir = workspace_root.join(".jade");
         let _ = std::fs::create_dir_all(&dir);
         Self::open_at(&dir.join("runs.db"))
     }
@@ -329,7 +329,7 @@ fn git_sha(root: &Path) -> Option<String> {
 /// Test seam for [`git_sha`]'s path handling without a real repo.
 #[allow(dead_code)]
 pub fn db_path(workspace_root: &Path) -> PathBuf {
-    workspace_root.join(".forge").join("runs.db")
+    workspace_root.join(".jade").join("runs.db")
 }
 
 #[cfg(test)]
@@ -445,13 +445,13 @@ mod tests {
     }
 
     #[test]
-    fn on_disk_roundtrip_creates_forge_dir() {
+    fn on_disk_roundtrip_creates_jade_dir() {
         let dir = std::env::temp_dir().join(format!("jade-runstore-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
         let mut store = RunStore::open(&dir).unwrap();
-        assert!(dir.join(".forge").join("runs.db").exists());
+        assert!(dir.join(".jade").join("runs.db").exists());
         store
             .save_run(&pending(KIND_RUN), &sample_data(), None, Some(1))
             .unwrap()

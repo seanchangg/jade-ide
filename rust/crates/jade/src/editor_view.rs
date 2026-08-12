@@ -1,6 +1,6 @@
 //! Tabs + editable buffer-backed editor state (Phase-3b E2).
 //!
-//! Each [`OpenTab`] now owns a [`forge_buffer::Buffer`] (the canonical text) plus
+//! Each [`OpenTab`] now owns a [`jade_buffer::Buffer`] (the canonical text) plus
 //! cached per-line highlight spans and decoration analyses that are recomputed as
 //! the text changes. `EditorState` keeps the tab strip semantics (dedupe by path,
 //! close-index math) from the read-only viewer; the active tab drives
@@ -27,8 +27,8 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
-use forge_buffer::{Buffer, EditRecord, LspPosition, Point, Selection};
-use forge_lsp::{CompletionItem, Diagnostic, DiagnosticSeverity, Position as LspRange};
+use jade_buffer::{Buffer, EditRecord, LspPosition, Point, Selection};
+use jade_lsp::{CompletionItem, Diagnostic, DiagnosticSeverity, Position as LspRange};
 use lsp_types::CompletionTextEdit;
 
 use crate::decorations::flow::{self, FlowAnalysis};
@@ -923,15 +923,15 @@ pub fn doc_utf16_to_byte(buffer: &Buffer, target: usize) -> usize {
 }
 
 /// Convert a buffer [`EditRecord`]'s descending utf16 changes into the LSP wire
-/// edits `forge_lsp::DidChange::Incremental` expects.
-pub fn record_to_lsp_edits(record: &EditRecord) -> Vec<forge_lsp::Utf16RangeEdit> {
+/// edits `jade_lsp::DidChange::Incremental` expects.
+pub fn record_to_lsp_edits(record: &EditRecord) -> Vec<jade_lsp::Utf16RangeEdit> {
     record
         .changes
         .iter()
-        .map(|c| forge_lsp::Utf16RangeEdit {
-            range: forge_lsp::Range {
-                start: forge_lsp::Position::new(c.start.line as u32, c.start.character as u32),
-                end: forge_lsp::Position::new(c.end.line as u32, c.end.character as u32),
+        .map(|c| jade_lsp::Utf16RangeEdit {
+            range: jade_lsp::Range {
+                start: jade_lsp::Position::new(c.start.line as u32, c.start.character as u32),
+                end: jade_lsp::Position::new(c.end.line as u32, c.end.character as u32),
             },
             text: c.new_text.clone(),
         })
@@ -987,16 +987,16 @@ pub fn find_matches_on_line(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use forge_lsp::{CompletionItem, Diagnostic, DiagnosticSeverity, Position, Range as LspR};
+    use jade_lsp::{CompletionItem, Diagnostic, DiagnosticSeverity, Position, Range as LspR};
     use lsp_types::TextEdit;
 
     fn tab_from(name: &str, text: &str) -> OpenTab {
-        OpenTab::from_text(&PathBuf::from(format!("/x/{name}")), text, TokenPalette::forge_dark())
+        OpenTab::from_text(&PathBuf::from(format!("/x/{name}")), text, TokenPalette::jade_dark())
     }
 
     #[test]
     fn open_dedupes_and_close_index() {
-        let mut e = EditorState::new(TokenPalette::forge_dark());
+        let mut e = EditorState::new(TokenPalette::jade_dark());
         e.push_tab(tab_from("a.cpp", "int a;\n"));
         e.push_tab(tab_from("b.cpp", "int b;\n"));
         assert_eq!(e.tabs.len(), 2);
@@ -1327,10 +1327,10 @@ mod perf_probe {
         let mut tab = crate::editor_view::OpenTab::from_text(
             &path,
             &text,
-            crate::highlight::TokenPalette::forge_dark(),
+            crate::highlight::TokenPalette::jade_dark(),
         );
         // Simulate 10 keystrokes at a middle line: insert char + eager bookkeeping.
-        let mid = tab.buffer.point_to_offset(forge_buffer::Point::new(500, 0));
+        let mid = tab.buffer.point_to_offset(jade_buffer::Point::new(500, 0));
         tab.buffer.set_caret(mid);
         let t0 = Instant::now();
         for i in 0..10 {
@@ -1369,7 +1369,7 @@ mod fold_tests {
 
     #[test]
     fn visible_rows_hide_folded_interior_keep_close() {
-        let mut t = OpenTab::from_text(&PathBuf::from("/x/f.cpp"), SRC, TokenPalette::forge_dark());
+        let mut t = OpenTab::from_text(&PathBuf::from("/x/f.cpp"), SRC, TokenPalette::jade_dark());
         assert_eq!(t.visible_rows().len(), t.line_count());
         t.folds.insert(0);
         let vis = t.visible_rows();
@@ -1386,7 +1386,7 @@ mod fold_tests {
 
     #[test]
     fn nested_folds_hierarchical() {
-        let mut t = OpenTab::from_text(&PathBuf::from("/x/f.cpp"), SRC, TokenPalette::forge_dark());
+        let mut t = OpenTab::from_text(&PathBuf::from("/x/f.cpp"), SRC, TokenPalette::jade_dark());
         t.folds.insert(5); // fold the namespace: hides 6..=8, keeps 9
         let vis = t.visible_rows();
         assert_eq!(vis, vec![0, 1, 2, 3, 4, 5, 9, 10]); // 10 = trailing empty line

@@ -1,5 +1,5 @@
 //! Telemetry preference persistence — the Rust analogue of the renderer's
-//! `localStorage` `forge.telemetry.*` keys (feature inventory §1.3, §5.6).
+//! `localStorage` `jade.telemetry.*` keys (feature inventory §1.3, §5.6).
 //!
 //! ## Storage
 //! One JSON file at `~/.config/jade/telemetry.json`. Read errors are swallowed
@@ -11,9 +11,9 @@
 //!
 //! | localStorage key                          | JSON location                         |
 //! |-------------------------------------------|---------------------------------------|
-//! | `forge.telemetry.enabled.<kind> <name>`   | `enabled["<kind> <name>"] : bool`     |
-//! | `forge.telemetry.shape.<kind> <name>`     | `shape["<kind> <name>"]   : "RxC"`    |
-//! | `forge.telemetry.maxdim.<kind> <name>`    | `maxdim["<kind> <name>"]  : u32`      |
+//! | `jade.telemetry.enabled.<kind> <name>`   | `enabled["<kind> <name>"] : bool`     |
+//! | `jade.telemetry.shape.<kind> <name>`     | `shape["<kind> <name>"]   : "RxC"`    |
+//! | `jade.telemetry.maxdim.<kind> <name>`    | `maxdim["<kind> <name>"]  : u32`      |
 //!
 //! `shape` values keep the exact `"RxC"` string form the TS used, so a future
 //! migration script can copy localStorage values in verbatim. The `enabled`

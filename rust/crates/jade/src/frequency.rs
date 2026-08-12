@@ -4,10 +4,10 @@
 //! **≥2 times**, **length ≥3**, that **case-insensitively prefix-match** what the
 //! user has typed, excluding the current word itself. Ranked by count (descending,
 //! ties alphabetical — the TS `sortText = (10000-count)|word`). Pure + unit-tested;
-//! `app.rs` maps the results into `forge_lsp::CompletionItem`s and merges them into
+//! `app.rs` maps the results into `jade_lsp::CompletionItem`s and merges them into
 //! the existing LSP popup (LSP wins ties; see `app.rs`).
 
-use forge_lsp::{CompletionItem, CompletionItemKind};
+use jade_lsp::{CompletionItem, CompletionItemKind};
 
 /// Min occurrences to suggest (TS `MIN_OCCURRENCES`, :7).
 pub const MIN_OCCURRENCES: usize = 2;
@@ -56,7 +56,7 @@ pub fn suggestions(buffer_text: &str, current_word: &str) -> Vec<FreqWord> {
     out
 }
 
-/// Build `forge_lsp::CompletionItem`s from ranked frequency words, tagged with
+/// Build `jade_lsp::CompletionItem`s from ranked frequency words, tagged with
 /// `detail "×N"` and a `sortText` that keeps them ordered by frequency in the
 /// merged popup (TS `sortText`, :49).
 pub fn completion_items(buffer_text: &str, current_word: &str) -> Vec<CompletionItem> {

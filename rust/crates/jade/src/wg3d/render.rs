@@ -20,7 +20,7 @@ use gpui::{
     ScrollDelta, ScrollWheelEvent, SharedString, Window,
 };
 
-use forge_telemetry::Kind;
+use jade_telemetry::Kind;
 
 use crate::app::dim_input::DimField;
 use crate::app::JadeApp;

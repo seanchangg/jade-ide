@@ -9,12 +9,12 @@
 //!     synced to the driver). [`Breakpoints::toggle`] reports whether the click
 //!     added or removed a line so the caller can `set_breakpoint`/`remove_breakpoint`.
 //!
-//! The driver crate (`forge-debug`) owns the parsing; this module owns only the
+//! The driver crate (`jade-debug`) owns the parsing; this module owns only the
 //! UI-facing bookkeeping and is unit-tested without a live lldb.
 
 use std::collections::{HashMap, HashSet};
 
-use forge_debug::{Breakpoint, LocalVariable, StackFrame};
+use jade_debug::{Breakpoint, LocalVariable, StackFrame};
 
 /// Debug status for the header status line (§5.8: running muted / paused amber
 /// bold / exited italic).
@@ -117,19 +117,19 @@ impl DebugSession {
     /// [`console_partial`](Self::console_partial); only newline-terminated
     /// lines move into the scrollback.
     ///
-    /// `__FORGE_*` instrumentation lines (interposer heap summaries, the
+    /// `__JADE_*` instrumentation lines (interposer heap summaries, the
     /// `idetools.h` alloc/scalar/timing macros) are data, not program output:
     /// they're swallowed from the console and returned for the caller to
     /// parse — the debug-path counterpart of `run`'s stdio handlers.
     pub fn push_console(&mut self, text: &str) -> Vec<String> {
-        let mut forge_lines = Vec::new();
+        let mut jade_lines = Vec::new();
         self.console_partial.push_str(&crate::output::strip_ansi(text));
         while let Some(pos) = self.console_partial.find('\n') {
             let rest = self.console_partial.split_off(pos + 1);
             let line = std::mem::replace(&mut self.console_partial, rest);
             let line = line.trim_end_matches(['\n', '\r']);
-            if line.trim_start().starts_with("__FORGE_") {
-                forge_lines.push(line.trim().to_string());
+            if line.trim_start().starts_with("__JADE_") {
+                jade_lines.push(line.trim().to_string());
             } else {
                 self.console.push(line.to_string());
             }
@@ -138,7 +138,7 @@ impl DebugSession {
             let drop = self.console.len() - CONSOLE_MAX;
             self.console.drain(0..drop);
         }
-        forge_lines
+        jade_lines
     }
 
     /// Whether a variable path is currently expanded.
@@ -463,21 +463,21 @@ mod tests {
     }
 
     #[test]
-    fn console_swallows_and_returns_forge_lines() {
+    fn console_swallows_and_returns_jade_lines() {
         let mut s = DebugSession::new();
         // Instrumentation lines never reach the console; complete lines come
         // back for the caller to parse. Byte-at-a-time delivery still works.
         let mut got = Vec::new();
-        got.extend(s.push_console("__FORGE_HEAP_SUMMARY|1|2|3|4|5|6\nhello\n"));
-        for ch in "__FORGE_INTERPOSE_ACTIVE\n".chars() {
+        got.extend(s.push_console("__JADE_HEAP_SUMMARY|1|2|3|4|5|6\nhello\n"));
+        for ch in "__JADE_INTERPOSE_ACTIVE\n".chars() {
             got.extend(s.push_console(&ch.to_string()));
         }
         assert_eq!(s.console, vec!["hello".to_string()]);
         assert_eq!(
             got,
             vec![
-                "__FORGE_HEAP_SUMMARY|1|2|3|4|5|6".to_string(),
-                "__FORGE_INTERPOSE_ACTIVE".to_string(),
+                "__JADE_HEAP_SUMMARY|1|2|3|4|5|6".to_string(),
+                "__JADE_INTERPOSE_ACTIVE".to_string(),
             ]
         );
     }

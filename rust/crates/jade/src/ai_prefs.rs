@@ -1,7 +1,7 @@
 //! Global AI preferences — the model tier and multi-line ghost mode.
 //!
 //! Old Jade persisted `aiModel` and `aiMultiline` as **global** preferences
-//! (`app.ts:296-302`, `forge.state` load/save), distinct from the per-workspace
+//! (`app.ts:296-302`, `jade.state` load/save), distinct from the per-workspace
 //! `aiCompletionEnabled` that lives in each workspace's `ui` blob
 //! ([`crate::workspace_state`]). This module mirrors that split: one JSON file at
 //! `~/.config/jade/ai.json`, loaded once at startup and rewritten whenever the
@@ -14,7 +14,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use forge_ai::AiModelId;
+use jade_ai::AiModelId;
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct AiPrefs {

@@ -1,6 +1,6 @@
 //! Jade theme palettes (docs/jade-feature-inventory.md §4.2).
 //!
-//! `forge-dark` is implemented now; `forge-light` is structured (the light
+//! `jade-dark` is implemented now; `jade-light` is structured (the light
 //! series/accent colors are the ones the Electron charts used, plus the
 //! documented cream/charcoal editor colors) so the runtime can flip themes
 //! once Phase-3 wires the theme toggle. Colors are plain `0xRRGGBB` so callers
@@ -46,10 +46,10 @@ pub struct Theme {
 }
 
 impl Theme {
-    /// forge-dark — "JetBrains New UI charcoal" (§4.2).
-    pub fn forge_dark() -> Theme {
+    /// jade-dark — "JetBrains New UI charcoal" (§4.2).
+    pub fn jade_dark() -> Theme {
         Theme {
-            name: "forge-dark",
+            name: "jade-dark",
             bg: 0x1E1F22,
             panel: 0x2B2D30,
             border: 0x35373B,
@@ -69,11 +69,11 @@ impl Theme {
         }
     }
 
-    /// forge-light — warm cream research palette (§4.2). Structured now; the
+    /// jade-light — warm cream research palette (§4.2). Structured now; the
     /// theme toggle that selects it lands with Phase-3.
-    pub fn forge_light() -> Theme {
+    pub fn jade_light() -> Theme {
         Theme {
-            name: "forge-light",
+            name: "jade-light",
             bg: 0xF4EFE2,
             panel: 0xEAE4D3,
             border: 0x000000, // used at ~8% alpha by callers
@@ -96,6 +96,6 @@ impl Theme {
 
 impl Default for Theme {
     fn default() -> Self {
-        Theme::forge_dark()
+        Theme::jade_dark()
     }
 }

@@ -21,7 +21,7 @@ REPO_ROOT="$(cd "$RUST_DIR/.." && pwd)"
 
 APP_NAME="Jade"
 VERSION="0.1.0"
-BUNDLE_ID="com.jade.ide"          # same id as the old Electron app, so macOS keeps its permissions
+BUNDLE_ID="com.jade.ide"          # new id (was com.forge.ide) — macOS asks for permissions again
 MIN_MACOS="13.0"
 
 TARGET_DIR="${CARGO_TARGET_DIR:-$RUST_DIR/target}"

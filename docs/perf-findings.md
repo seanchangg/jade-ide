@@ -6,9 +6,9 @@ problem, and the recommended fix.
 
 ## 1. build-runner.ts — one IPC message per allocation/free event (firehose)
 
-- **Location:** `src/main/build-runner.ts:58` (inside `parseForgeOutput`),
+- **Location:** `src/main/build-runner.ts:58` (inside `parseJadeOutput`),
   reached from the stdout line loop at `src/main/build-runner.ts:425-430`.
-- **Problem:** Every `__FORGE_ALLOC` / `__FORGE_FREE` line the instrumented
+- **Problem:** Every `__JADE_ALLOC` / `__JADE_FREE` line the instrumented
   program prints results in a separate `win.webContents.send(IPC.BUILD_MEMORY_EVENT, event)`
   call. During a training run these can arrive thousands per second. Each IPC
   message crosses the main→renderer boundary and wakes the renderer's

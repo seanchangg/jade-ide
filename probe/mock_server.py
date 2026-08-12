@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Stand-in for forge-ide's telemetry server: verifies the probe's socket
+"""Stand-in for jade-ide's telemetry server: verifies the probe's socket
 protocol end-to-end. Tracks only model.weights and reports what arrives."""
 import json, os, socket, subprocess, sys, threading, time
 
-SOCK = "/tmp/forge-telemetry-test.sock"
+SOCK = "/tmp/jade-telemetry-test.sock"
 if os.path.exists(SOCK):
     os.unlink(SOCK)
 
@@ -35,9 +35,9 @@ def handle(conn):
         elif t == "scalar":
             stats["scalar"] += 1
 
-env = dict(os.environ, DYLD_INSERT_LIBRARIES=os.path.abspath("forge_probe.dylib"),
-           FORGE_TELEMETRY_SOCK=SOCK)
-env.pop("FORGE_TRACK_ALL", None)  # selection must come from track messages only
+env = dict(os.environ, DYLD_INSERT_LIBRARIES=os.path.abspath("jade_probe.dylib"),
+           JADE_TELEMETRY_SOCK=SOCK)
+env.pop("JADE_TRACK_ALL", None)  # selection must come from track messages only
 proc = subprocess.Popen(["./test_train"], env=env)
 
 conn, _ = srv.accept()

@@ -11,11 +11,11 @@ use std::sync::Arc;
 use gpui::{point, px, Modifiers, TestAppContext};
 
 use crate::app::{AppDeps, JadeApp};
-use forge_ai::InlineCompletionBackend;
-use forge_build::{BuildEngine, EngineConfig};
-use forge_sysmon::SystemMonitor;
-use forge_telemetry::TelemetryServer;
-use forge_term::TermManager;
+use jade_ai::InlineCompletionBackend;
+use jade_build::{BuildEngine, EngineConfig};
+use jade_sysmon::SystemMonitor;
+use jade_telemetry::TelemetryServer;
+use jade_term::TermManager;
 
 /// A throwaway workspace with one known C++ file. Rows (0-based):
 /// 0: `int main() {`
@@ -80,7 +80,7 @@ fn test_deps(workspace: PathBuf) -> (AppDeps, tokio::sync::mpsc::UnboundedReceiv
         repo_root: workspace.clone(),
         // Prefs save into the throwaway workspace, NEVER the developer's real
         // ~/.config/jade/telemetry.json (checkbox/bundle tests call save()).
-        prefs_path: Some(workspace.join(".forge").join("telemetry-test.json")),
+        prefs_path: Some(workspace.join(".jade").join("telemetry-test.json")),
         workspace_root: workspace,
         // The test workspace is "open" (it has a real tree); the fs-watch is a
         // no-op so no notify thread runs under the determinism checker.
@@ -161,7 +161,7 @@ async fn click_focuses_sets_caret_and_arrows_navigate(cx: &mut TestAppContext) {
 }
 
 /// Run-store lifecycle, headless: a telemetry-producing run persists to
-/// `.forge/runs.db` at exit, overlays load/unload its series, empty runs are
+/// `.jade/runs.db` at exit, overlays load/unload its series, empty runs are
 /// skipped, and delete removes both the row and any live overlay. Drives the
 /// same `pending_run` → `persist_finished_run` seam `action_run`/`on_run_done`
 /// use, minus the subprocess.
@@ -207,8 +207,8 @@ fn run_lifecycle_persists_and_overlays() {
     assert!(app.stored_runs.is_empty());
     assert!(app.run_overlays.is_empty());
 
-    // The DB actually lives in the workspace's .forge dir.
-    assert!(dir.join(".forge").join("runs.db").exists());
+    // The DB actually lives in the workspace's .jade dir.
+    assert!(dir.join(".jade").join("runs.db").exists());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -218,7 +218,7 @@ fn run_lifecycle_persists_and_overlays() {
 #[test]
 fn timer_bundle_aggregates_and_persists() {
     use crate::app::AppEvent;
-    use forge_telemetry::{Event, Timing};
+    use jade_telemetry::{Event, Timing};
 
     let (dir, _file) = test_workspace();
     let (deps, _rx) = test_deps(dir.clone());
@@ -236,7 +236,7 @@ fn timer_bundle_aggregates_and_persists() {
     app.apply_app_event(timing("embedForward", 1.0, 0));
     app.apply_app_event(timing("linearForward", 2.0, 1));
     app.create_timer_group("Forward", vec!["embedForward".into(), "linearForward".into()]);
-    assert!(app.registry.is_enabled(forge_telemetry::Kind::Timer, "Forward"));
+    assert!(app.registry.is_enabled(jade_telemetry::Kind::Timer, "Forward"));
 
     // A full cycle → one summed "Forward" point; members don't chart raw.
     let before = app.training.current.timings.len();
@@ -297,7 +297,7 @@ fn timer_bundle_aggregates_and_persists() {
 #[test]
 fn prefs_seed_registry_at_startup() {
     use crate::app::AppEvent;
-    use forge_telemetry::{Event, Kind};
+    use jade_telemetry::{Event, Kind};
 
     let (dir, _file) = test_workspace();
     let decl = |name: &str| {
@@ -328,7 +328,7 @@ fn prefs_seed_registry_at_startup() {
     // …and Run shows that seeded list as-is instead of auto-launching the
     // program to rescan it — the user is mid-selection; renames are covered
     // by the panel's explicit Rescan button (same `start_discovery` path).
-    app.last_build = Some(forge_build::BuildResult {
+    app.last_build = Some(jade_build::BuildResult {
         success: true,
         executable: Some(std::path::PathBuf::from("/bin/sleep")),
         errors: Vec::new(),
@@ -357,7 +357,7 @@ fn prefs_seed_registry_at_startup() {
 #[test]
 fn stale_seeded_rows_prune_after_run() {
     use crate::app::AppEvent;
-    use forge_telemetry::{Event, Kind};
+    use jade_telemetry::{Event, Kind};
     use std::collections::HashMap;
 
     let (dir, _file) = test_workspace();
@@ -370,7 +370,7 @@ fn stale_seeded_rows_prune_after_run() {
         })
     };
     let run_done = || {
-        AppEvent::RunDone(forge_build::RunResult {
+        AppEvent::RunDone(jade_build::RunResult {
             exit_code: 0,
             duration: std::time::Duration::from_millis(5),
             executed_lines: HashMap::new(),
@@ -429,7 +429,7 @@ fn stale_seeded_rows_prune_after_run() {
 #[test]
 fn stale_joined_timer_pref_migrates_to_bundle() {
     use crate::app::AppEvent;
-    use forge_telemetry::{Event, Kind, Timing};
+    use jade_telemetry::{Event, Kind, Timing};
 
     let (dir, _file) = test_workspace();
     let decl = |name: &str| {
@@ -489,7 +489,7 @@ fn stale_joined_timer_pref_migrates_to_bundle() {
 #[test]
 fn timer_bundle_survives_restart() {
     use crate::app::AppEvent;
-    use forge_telemetry::{Event, Timing};
+    use jade_telemetry::{Event, Timing};
 
     let (dir, _file) = test_workspace();
     let timing = |name: &str, ms: f64, step: i64| {
@@ -517,7 +517,7 @@ fn timer_bundle_survives_restart() {
         "bundle def reloads from workspace.json"
     );
     assert!(
-        app.registry.is_enabled(forge_telemetry::Kind::Timer, "Forward"),
+        app.registry.is_enabled(jade_telemetry::Kind::Timer, "Forward"),
         "synthetic timer re-declared with its enabled pref"
     );
 
@@ -532,7 +532,7 @@ fn timer_bundle_survives_restart() {
     // '+', so such collisions happen) while the enabled pref survives, keeping
     // the raw series charting without a re-check.
     app.apply_app_event(AppEvent::Telemetry(Event::Decl {
-        kind: forge_telemetry::Kind::Timer,
+        kind: jade_telemetry::Kind::Timer,
         name: "Forward".to_string(),
         meta: None,
         renamed_from: None,
@@ -542,7 +542,7 @@ fn timer_bundle_survives_restart() {
         "shadowing bundle def dissolved by the real probe timer"
     );
     assert!(
-        app.registry.is_enabled(forge_telemetry::Kind::Timer, "Forward"),
+        app.registry.is_enabled(jade_telemetry::Kind::Timer, "Forward"),
         "enabled pref survives the dissolve"
     );
     assert!(
@@ -556,7 +556,7 @@ fn timer_bundle_survives_restart() {
     // they're still selecting; the header's Rescan refreshes names).
     let (deps, _rx2) = test_deps(dir.clone());
     let mut fresh = JadeApp::assemble(deps);
-    fresh.last_build = Some(forge_build::BuildResult {
+    fresh.last_build = Some(jade_build::BuildResult {
         success: true,
         executable: Some(std::path::PathBuf::from("/bin/sleep")),
         errors: Vec::new(),
@@ -571,7 +571,7 @@ fn timer_bundle_survives_restart() {
     assert!(
         !fresh
             .registry
-            .items_of_kind(forge_telemetry::Kind::Timer)
+            .items_of_kind(jade_telemetry::Kind::Timer)
             .is_empty(),
         "panel has the bundle timers to select from"
     );
@@ -584,7 +584,7 @@ fn timer_bundle_survives_restart() {
 #[gpui::test]
 async fn kernel_charts_render_per_enabled_timer(cx: &mut TestAppContext) {
     use crate::app::AppEvent;
-    use forge_telemetry::{Event, Kind, Timing};
+    use jade_telemetry::{Event, Kind, Timing};
 
     let (dir, _file) = test_workspace();
     let (deps, app_rx) = test_deps(dir);
@@ -669,7 +669,7 @@ fn test_deps_driven(
         app_tx,
         active_file: None,
         repo_root: workspace.clone(),
-        prefs_path: Some(workspace.join(".forge").join("telemetry-test.json")),
+        prefs_path: Some(workspace.join(".jade").join("telemetry-test.json")),
         workspace_root: workspace,
         workspace_opened: true,
         fs_watch: Arc::new(|_root| None),
@@ -710,7 +710,7 @@ fn pre_run_panel_discovers_then_launches() {
     assert!(app.pre_run.is_none(), "no build → no panel");
 
     // Fake a successful build of a real (instant-exit) binary.
-    app.last_build = Some(forge_build::BuildResult {
+    app.last_build = Some(jade_build::BuildResult {
         success: true,
         executable: Some(std::path::PathBuf::from("/bin/sleep")),
         errors: Vec::new(),
@@ -1038,7 +1038,7 @@ fn close_project_switches_and_removes() {
 /// on the runtime; here we assert the UI-visible selection).
 #[test]
 fn ai_menu_toggle_and_model_selection() {
-    use forge_ai::AiModelId;
+    use jade_ai::AiModelId;
     let (dir, _file) = test_workspace();
     let (deps, _rx) = test_deps(dir.clone());
     let mut app = JadeApp::assemble(deps);
@@ -1072,7 +1072,7 @@ fn ai_menu_toggle_and_model_selection() {
 /// test runtime; we assert the decision, not the process).
 #[test]
 fn sparkle_starts_idle_ai_backend() {
-    use forge_ai::AiState;
+    use jade_ai::AiState;
     let (dir, _file) = test_workspace();
     let (deps, _rx) = test_deps(dir.clone());
     let mut app = JadeApp::assemble(deps);
@@ -1122,7 +1122,7 @@ async fn ai_menu_renders(cx: &mut TestAppContext) {
 
 /// The signature hint is cleared by `dismiss_popups` (the path Escape and an
 /// editor click both funnel through). The response-parsing + generation-supersede
-/// logic is covered by `forge_lsp::active_signature_hint` and mirrors hover.
+/// logic is covered by `jade_lsp::active_signature_hint` and mirrors hover.
 #[test]
 fn signature_hint_dismisses() {
     let (dir, _file) = test_workspace();
@@ -1749,7 +1749,7 @@ async fn find_bar_tracks_edits_and_clicks_place_the_caret(cx: &mut TestAppContex
 #[gpui::test]
 async fn ghost_text_paints_on_indented_line_and_tab_accepts(cx: &mut TestAppContext) {
     use crate::app::AppEvent;
-    use forge_ai::AiState;
+    use jade_ai::AiState;
 
     let (dir, file) = test_workspace();
     let (deps, app_rx) = test_deps(dir.clone());
@@ -1827,7 +1827,7 @@ async fn ghost_text_paints_on_indented_line_and_tab_accepts(cx: &mut TestAppCont
 #[gpui::test]
 async fn ghost_word_accept_keeps_remainder(cx: &mut TestAppContext) {
     use crate::app::AppEvent;
-    use forge_ai::AiState;
+    use jade_ai::AiState;
 
     let (dir, file) = test_workspace();
     let (deps, app_rx) = test_deps(dir.clone());
@@ -1946,7 +1946,7 @@ async fn cmd_shift_c_opens_in_clion_plain_cmd_c_copies(cx: &mut TestAppContext) 
 /// paint the finite points and survive.
 #[gpui::test]
 async fn non_finite_scalars_render_without_crashing(cx: &mut TestAppContext) {
-    use forge_telemetry::Kind;
+    use jade_telemetry::Kind;
 
     let (dir, _file) = test_workspace();
     let (deps, app_rx) = test_deps(dir.clone());

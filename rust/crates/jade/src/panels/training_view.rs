@@ -13,7 +13,7 @@ use gpui::{
     Rgba, Window,
 };
 
-use forge_telemetry::Kind;
+use jade_telemetry::Kind;
 
 use crate::app::JadeApp;
 use crate::format::{fmt_val, format_avg_ms, format_bytes, is_memory_name};
@@ -194,7 +194,7 @@ mod run_section_tests {
 
     #[test]
     fn overlay_colors_cycle_reversed() {
-        let t = Theme::forge_dark();
+        let t = Theme::jade_dark();
         assert_eq!(overlay_color(&t, 0), t.series[4]);
         assert_eq!(overlay_color(&t, 4), t.series[0]);
         assert_eq!(overlay_color(&t, 5), t.series[4]); // wraps

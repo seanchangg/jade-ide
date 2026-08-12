@@ -1,5 +1,5 @@
-// test_train.mm — standalone fake "training loop" used to validate forge_probe.
-// Deliberately contains ZERO forge instrumentation: no __FORGE_ prints, no
+// test_train.mm — standalone fake "training loop" used to validate jade_probe.
+// Deliberately contains ZERO jade instrumentation: no __JADE_ prints, no
 // probe headers. Everything the probe reports must come from interposition.
 //
 // It creates a PRIVATE (VRAM-only) weight matrix, a shared gradient buffer,

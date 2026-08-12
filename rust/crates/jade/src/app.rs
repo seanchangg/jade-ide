@@ -19,21 +19,21 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use forge_ai::{AiModelId, AiState, AiStatus, InfillRequest, InlineCompletionBackend};
-use forge_build::{
+use jade_ai::{AiModelId, AiState, AiStatus, InfillRequest, InlineCompletionBackend};
+use jade_build::{
     parse_alloc_free, parse_heap_summary, parse_scalar, parse_timing, AsmResult, AtosSymbolicator,
     BuildEngine, BuildResult, CompileRequest, MemoryEvent, RunConfig, RunEvent, RunResult,
     INTERPOSE_DYLIB, PROBE_DYLIB,
 };
-use forge_buffer::{Point, Selection};
-use forge_debug::{DebugEvent, LldbDriver, LocalVariable};
-use forge_lsp::{
+use jade_buffer::{Point, Selection};
+use jade_debug::{DebugEvent, LldbDriver, LocalVariable};
+use jade_lsp::{
     active_signature_hint, CompletionItem, DidChange, HoverContents, LspClient, LspEvent, LspHandle,
     SignatureHint, TextDocumentSyncKind,
 };
-use forge_sysmon::{SystemMonitor, SystemStats};
-use forge_telemetry::{Event, Kind, TelemetryServer};
-use forge_term::{GridSnapshot, TermEvent, TermId, TermManager};
+use jade_sysmon::{SystemMonitor, SystemStats};
+use jade_telemetry::{Event, Kind, TelemetryServer};
+use jade_term::{GridSnapshot, TermEvent, TermId, TermManager};
 use gpui::{
     div, hsla, prelude::*, px, rgb, Bounds, BoxShadow, ClipboardItem, Context,
     EntityInputHandler, FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent, PathPromptOptions,
@@ -74,7 +74,7 @@ use crate::wg3d::WeightGrid3D;
 use crate::workspace_tree::FileTree;
 
 /// Which view the bottom panel shows. The TERMINAL view is a live shell; the
-/// OUTPUT view is the plain `[forge]`/build/run scrollback fallback (see
+/// OUTPUT view is the plain `[jade]`/build/run scrollback fallback (see
 /// `terminal_panel` for why status lines can't be injected into the shell grid).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BottomView {
@@ -178,7 +178,7 @@ pub enum AppEvent {
     Sys(SystemStats),
     /// An AI backend status change.
     Ai(AiStatus),
-    /// A terminal event from `forge-term` (grid damaged → re-snapshot; child
+    /// A terminal event from `jade-term` (grid damaged → re-snapshot; child
     /// exited → dim `[exited <code>]`). Phase-4 wave 2, §5.2.
     Term(TermEvent),
     /// The workspace file tree changed on disk (debounced fs-watch, §5.1) — the
@@ -350,7 +350,7 @@ pub struct JadeApp {
     pub server: Arc<TelemetryServer>,
     pub registry: TelemetryRegistry,
     pub training: TrainingData,
-    /// Persistent run store (`<workspace>/.forge/runs.db`). `None` when SQLite
+    /// Persistent run store (`<workspace>/.jade/runs.db`). `None` when SQLite
     /// couldn't open — the RUNS section hides and runs simply aren't recorded.
     pub run_store: Option<RunStore>,
     /// Cached `list_runs` result for the RUNS section (refreshed after every
@@ -519,7 +519,7 @@ pub struct JadeApp {
     lsp_sync_kind: TextDocumentSyncKind,
     /// True once initialize has been kicked off (so we do it once per workspace).
     lsp_init_started: bool,
-    /// The forge include dir passed to clangd as a fallback `-I`, if it exists.
+    /// The jade include dir passed to clangd as a fallback `-I`, if it exists.
     lsp_include: Option<PathBuf>,
     /// Autocomplete popup (E2). `Some` when visible.
     pub completion: Option<CompletionState>,
@@ -548,7 +548,7 @@ pub struct JadeApp {
     /// Multiline ghost mode (`aiMultiline`, §4.11): 6-line vs single-line.
     pub ai_multiline: bool,
     /// Managed-model tier the AI menu selects (`aiModel`): Fast/Balanced/Best.
-    /// Applied via [`forge_ai::InlineCompletionBackend::set_model`] and persisted
+    /// Applied via [`jade_ai::InlineCompletionBackend::set_model`] and persisted
     /// globally in [`ai_prefs`](Self::ai_prefs).
     pub ai_model: AiModelId,
     /// Whether the sparkle AI settings menu (completion/multiline/model) is open.
@@ -809,7 +809,7 @@ impl JadeApp {
         // merge-preserve any stickyNotes the Electron app left in the file.
         let ui = crate::workspace_state::load(&deps.workspace_root);
 
-        let mut editor = EditorState::new(TokenPalette::forge_dark());
+        let mut editor = EditorState::new(TokenPalette::jade_dark());
         // Preserve the --file/--project seeding as the initially open tab: open it
         // through the real tab/highlight path so `active_file` follows the tab.
         let mut active_file = deps.active_file.clone();
@@ -876,7 +876,7 @@ impl JadeApp {
                 Some(p) => TelemetryPrefs::load_from(p),
                 None => TelemetryPrefs::load(),
             },
-            theme: Theme::forge_dark(),
+            theme: Theme::jade_dark(),
             wg3d: WeightGrid3D::new(),
             #[cfg(target_os = "macos")]
             wg3d_gpu: None,
@@ -1146,7 +1146,7 @@ impl JadeApp {
         }
     }
 
-    /// Follow the `forge-term` contract: on `Damaged` re-snapshot the current
+    /// Follow the `jade-term` contract: on `Damaged` re-snapshot the current
     /// instance; on `Exited` record the code for the dim `[exited …]` line.
     fn on_term_event(&mut self, ev: TermEvent) {
         match ev {
@@ -1209,7 +1209,7 @@ impl JadeApp {
             }
             Err(e) => {
                 self.term_failed = true;
-                self.status_line(&format!("[forge] terminal unavailable: {e}"));
+                self.status_line(&format!("[jade] terminal unavailable: {e}"));
             }
         }
     }
@@ -1318,7 +1318,7 @@ impl JadeApp {
         self.building = false;
         let ms = res.duration.as_millis();
         if res.success {
-            self.status_line(&format!("[forge] Build succeeded ({ms}ms)"));
+            self.status_line(&format!("[jade] Build succeeded ({ms}ms)"));
             self.push_toast(ToastKind::Success, format!("Build succeeded · {ms}ms"));
         } else {
             // Count only real errors — clang's warnings ride along in `errors`
@@ -1326,9 +1326,9 @@ impl JadeApp {
             let nerr = res
                 .errors
                 .iter()
-                .filter(|e| e.severity == forge_build::Severity::Error)
+                .filter(|e| e.severity == jade_build::Severity::Error)
                 .count();
-            self.status_line(&format!("[forge] Build failed ({nerr} error(s), {ms}ms)"));
+            self.status_line(&format!("[jade] Build failed ({nerr} error(s), {ms}ms)"));
             let plural = if nerr == 1 { "error" } else { "errors" };
             self.push_toast(
                 ToastKind::Error,
@@ -1336,9 +1336,9 @@ impl JadeApp {
             );
             for e in &res.errors {
                 let tag = match e.severity {
-                    forge_build::Severity::Error => "error",
-                    forge_build::Severity::Warning => "warning",
-                    forge_build::Severity::Note => "note",
+                    jade_build::Severity::Error => "error",
+                    jade_build::Severity::Warning => "warning",
+                    jade_build::Severity::Note => "note",
                 };
                 push_output(
                     &mut self.output,
@@ -1367,12 +1367,12 @@ impl JadeApp {
         }
     }
 
-    /// Fold one `__FORGE_*` instrumentation line from the DEBUG console into
+    /// Fold one `__JADE_*` instrumentation line from the DEBUG console into
     /// app state — the LLDB-path mirror of `run.rs`'s `handle_stdout`/
     /// `handle_stderr`: alloc/free + heap summaries feed the memory bar and
     /// Memory chart; scalar/timing macro lines feed the telemetry server
     /// (probe traffic arrives over the socket and never comes through here).
-    fn apply_forge_line(&mut self, line: &str) {
+    fn apply_jade_line(&mut self, line: &str) {
         if let Some(ev) = parse_alloc_free(line) {
             let batch = MemoryEvent::AllocBatch { events: vec![ev] };
             if let Some(sample) = self.mem.apply(&batch) {
@@ -1387,7 +1387,7 @@ impl JadeApp {
         } else if let Some(t) = parse_timing(line) {
             self.server.ingest_timing(t);
         }
-        // Anything else (`__FORGE_INTERPOSE_ACTIVE`, unrecognized lines) is
+        // Anything else (`__JADE_INTERPOSE_ACTIVE`, unrecognized lines) is
         // swallowed, matching the Run path.
     }
 
@@ -1455,7 +1455,7 @@ impl JadeApp {
             let timers = self.registry.items_of_kind(Kind::Timer).len();
             let buffers = self.registry.items_of_kind(Kind::Buffer).len();
             self.status_line(&format!(
-                "[forge] Discovery done — {timers} timers, {buffers} buffers"
+                "[jade] Discovery done — {timers} timers, {buffers} buffers"
             ));
             if let Some(launch) = self.pending_launch.take() {
                 self.dispatch_launch(launch);
@@ -1507,15 +1507,15 @@ impl JadeApp {
             }
         }
         if res.exit_code == 0 {
-            self.status_line(&format!("[forge] Exited with code 0 ({ms}ms)"));
+            self.status_line(&format!("[jade] Exited with code 0 ({ms}ms)"));
         } else {
             self.status_line(&format!(
-                "[forge] Exited with code {} ({ms}ms)",
+                "[jade] Exited with code {} ({ms}ms)",
                 res.exit_code
             ));
         }
         if res.interpose_active {
-            self.status_line("[forge] Memory tracked via malloc interposer");
+            self.status_line("[jade] Memory tracked via malloc interposer");
         }
         // Push the sanitizer summary lines to the output panel (deliverable §3).
         if let Some(san) = &res.sanitizer_output {
@@ -1536,11 +1536,11 @@ impl JadeApp {
     fn on_debug_event(&mut self, ev: DebugEvent) {
         match ev {
             DebugEvent::Output(s) => {
-                // `__FORGE_*` lines the console swallowed are instrumentation
+                // `__JADE_*` lines the console swallowed are instrumentation
                 // data (see `DebugState::push_console`) — route them the same
                 // way the Run path's stdio handlers do.
                 for line in self.debug.push_console(&s) {
-                    self.apply_forge_line(&line);
+                    self.apply_jade_line(&line);
                 }
             }
             DebugEvent::Stopped {
@@ -1552,7 +1552,7 @@ impl JadeApp {
             } => {
                 let refetch =
                     self.debug.on_stopped(reason.clone(), file.clone(), line, frames, locals);
-                self.status_line(&format!("[forge] paused at {file}:{line} ({reason})"));
+                self.status_line(&format!("[jade] paused at {file}:{line} ({reason})"));
                 self.reveal_line(line as usize);
                 // Re-fetch children of paths that were expanded before the step so
                 // the tree keeps its shape (values changed → cache was invalidated).
@@ -1571,7 +1571,7 @@ impl JadeApp {
                     .as_ref()
                     .map(|p| (crate::run_store::now_epoch() - p.started_epoch).max(0) * 1000);
                 self.persist_finished_run(dur, Some(code as i64));
-                self.status_line(&format!("[forge] debug exited ({code})"));
+                self.status_line(&format!("[jade] debug exited ({code})"));
             }
         }
     }
@@ -1600,7 +1600,7 @@ impl JadeApp {
         match store.save_run(&pending, &self.training.current, duration_ms, exit_code) {
             Ok(Some(_)) => self.refresh_stored_runs(),
             Ok(None) => {} // no telemetry — not a research run
-            Err(e) => self.status_line(&format!("[forge] run store write failed: {e}")),
+            Err(e) => self.status_line(&format!("[jade] run store write failed: {e}")),
         }
     }
 
@@ -1617,7 +1617,7 @@ impl JadeApp {
         match store.load_run(id) {
             Ok(Some(data)) => self.run_overlays.push((id, data)),
             Ok(None) => self.refresh_stored_runs(), // stale row — deleted elsewhere
-            Err(e) => self.status_line(&format!("[forge] run load failed: {e}")),
+            Err(e) => self.status_line(&format!("[jade] run load failed: {e}")),
         }
     }
 
@@ -1625,7 +1625,7 @@ impl JadeApp {
     pub fn delete_stored_run(&mut self, id: i64) {
         if let Some(store) = self.run_store.as_ref() {
             if let Err(e) = store.delete_run(id) {
-                self.status_line(&format!("[forge] run delete failed: {e}"));
+                self.status_line(&format!("[jade] run delete failed: {e}"));
             }
         }
         self.run_overlays.retain(|(rid, _)| *rid != id);
@@ -1677,7 +1677,7 @@ impl JadeApp {
         // The scan's junk telemetry lands in training.current and is dropped
         // again at scan end.
         self.training.clear();
-        self.status_line("[forge] Discovering telemetry…");
+        self.status_line("[jade] Discovering telemetry…");
 
         let cfg = RunConfig {
             executable: exe,
@@ -1909,7 +1909,7 @@ impl JadeApp {
 
     fn start_build(&mut self, flags: Vec<String>, sanitize: bool, instrument: bool) -> bool {
         let Some(file) = self.active_file.clone() else {
-            self.status_line("[forge] No active file — pass --file or --project");
+            self.status_line("[jade] No active file — pass --file or --project");
             return false;
         };
         if self.building {
@@ -1926,7 +1926,7 @@ impl JadeApp {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        self.status_line(&format!("[forge] Building {name}..."));
+        self.status_line(&format!("[jade] Building {name}..."));
 
         let req = CompileRequest {
             file,
@@ -1955,7 +1955,7 @@ impl JadeApp {
     /// first); the panel's Run confirms into [`launch_run`](Self::launch_run).
     pub fn action_run(&mut self) {
         if self.last_build.is_none() {
-            self.status_line("[forge] Build first");
+            self.status_line("[jade] Build first");
             return;
         }
         if self.running || self.discovery_active {
@@ -1968,15 +1968,15 @@ impl JadeApp {
     /// confirm path. Enabled only after a successful build with an executable.
     pub fn launch_run(&mut self) {
         let Some(build) = self.last_build.as_ref() else {
-            self.status_line("[forge] Build first");
+            self.status_line("[jade] Build first");
             return;
         };
         if !build.success {
-            self.status_line("[forge] Last build failed — nothing to run");
+            self.status_line("[jade] Last build failed — nothing to run");
             return;
         }
         let Some(exe) = build.executable.clone() else {
-            self.status_line("[forge] Build produced no executable");
+            self.status_line("[jade] Build produced no executable");
             return;
         };
         if self.running {
@@ -2001,7 +2001,7 @@ impl JadeApp {
         // Launch context for the run store; consumed by `persist_finished_run`
         // in `on_run_done` (captures start time + git sha *before* the run).
         self.pending_run = Some(PendingRun::begin(name.clone(), KIND_RUN, &self.workspace_root));
-        self.status_line(&format!("[forge] Running ./{name}..."));
+        self.status_line(&format!("[jade] Running ./{name}..."));
 
         let cfg = RunConfig {
             executable: exe,
@@ -2044,7 +2044,7 @@ impl JadeApp {
     /// confirming lands in [`launch_debug`](Self::launch_debug).
     pub fn action_debug(&mut self) {
         if self.active_file.is_none() {
-            self.status_line("[forge] No active file — pass --file or --project");
+            self.status_line("[jade] No active file — pass --file or --project");
             return;
         }
         if self.building || self.debugging || self.discovery_active {
@@ -2055,7 +2055,7 @@ impl JadeApp {
 
     pub fn launch_debug(&mut self) {
         let Some(file) = self.active_file.clone() else {
-            self.status_line("[forge] No active file — pass --file or --project");
+            self.status_line("[jade] No active file — pass --file or --project");
             return;
         };
         if self.building || self.debugging {
@@ -2086,7 +2086,7 @@ impl JadeApp {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "debug".to_string());
         self.pending_run = Some(PendingRun::begin(label, KIND_DEBUG, &self.workspace_root));
-        self.status_line("[forge] Debug build (forced -O0)...");
+        self.status_line("[jade] Debug build (forced -O0)...");
         // Show the debug panel (docks above the terminal, §5.8) and mark running.
         self.show_debug();
         self.debug.on_running();
@@ -2129,8 +2129,8 @@ impl JadeApp {
                 // The malloc interposer rides along like the Run path injects
                 // it (debug builds never sanitize, so no ASan conflict) — its
                 // periodic heap summaries come back through the LLDB console
-                // and feed the Memory chart via `apply_forge_line`.
-                let mut env = vec![("FORGE_TELEMETRY_SOCK".to_string(), sock)];
+                // and feed the Memory chart via `apply_jade_line`.
+                let mut env = vec![("JADE_TELEMETRY_SOCK".to_string(), sock)];
                 let mut dylibs: Vec<&str> = Vec::new();
                 if engine.ensure_interpose_dylib() {
                     dylibs.push(INTERPOSE_DYLIB);
@@ -2172,7 +2172,7 @@ impl JadeApp {
         self.debugging = false;
         self.debug.status = crate::debug::DebugStatus::Idle;
         self.hide_debug();
-        self.status_line("[forge] Stopped");
+        self.status_line("[jade] Stopped");
     }
 
     /// Toggle the AI backend (deliverable §3): disabling kills the model server
@@ -2205,7 +2205,7 @@ impl JadeApp {
             .file_name()
             .map(|f| f.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.display().to_string());
-        self.status_line(&format!("[forge] Opening in CLion: {display}:{line}"));
+        self.status_line(&format!("[jade] Opening in CLion: {display}:{line}"));
 
         let file = path.display().to_string();
         self.runtime.spawn(async move {
@@ -2253,28 +2253,28 @@ impl JadeApp {
         });
     }
 
-    /// Swap forge-dark / forge-light (deliverable §3). Also swaps the editor's
+    /// Swap jade-dark / jade-light (deliverable §3). Also swaps the editor's
     /// token palette so syntax highlighting re-resolves for the new theme (§4.2).
     pub fn action_theme(&mut self) {
         let light = !self.theme.is_light;
         self.theme = if light {
-            Theme::forge_light()
+            Theme::jade_light()
         } else {
-            Theme::forge_dark()
+            Theme::jade_dark()
         };
         self.editor.set_palette(if light {
-            TokenPalette::forge_light()
+            TokenPalette::jade_light()
         } else {
-            TokenPalette::forge_dark()
+            TokenPalette::jade_dark()
         });
     }
 
     /// The syntax-highlight palette matching the active theme.
     fn editor_palette(&self) -> TokenPalette {
         if self.theme.is_light {
-            TokenPalette::forge_light()
+            TokenPalette::jade_light()
         } else {
-            TokenPalette::forge_dark()
+            TokenPalette::jade_dark()
         }
     }
 
@@ -2319,7 +2319,7 @@ impl JadeApp {
                 self.apply_scroll();
                 self.find_resync();
             }
-            Err(e) => self.status_line(&format!("[forge] Could not open {}: {e}", path.display())),
+            Err(e) => self.status_line(&format!("[jade] Could not open {}: {e}", path.display())),
         }
     }
 
@@ -2480,7 +2480,7 @@ impl JadeApp {
 
         // Status line reflects the opened folder (the build/run target follows
         // `active_file`, so both work against the new workspace immediately).
-        self.status_line(&format!("[forge] Opened {}", dir.display()));
+        self.status_line(&format!("[jade] Opened {}", dir.display()));
     }
 
     /// Close an open project subtab (§2). Removes `dir` from `open_projects`;
@@ -2515,7 +2515,7 @@ impl JadeApp {
                 self.open_project(next);
             }
         } else {
-            self.status_line(&format!("[forge] Closed {}", dir.display()));
+            self.status_line(&format!("[jade] Closed {}", dir.display()));
         }
     }
 
@@ -3045,7 +3045,7 @@ impl JadeApp {
                     self.timer_groups.remove(&name);
                     self.save_ui_state();
                     self.status_line(&format!(
-                        "[forge] \"{name}\" is a probe timer — dropped the shadowing bundle"
+                        "[jade] \"{name}\" is a probe timer — dropped the shadowing bundle"
                     ));
                 }
                 if out.auto_enabled {
@@ -3233,7 +3233,7 @@ impl JadeApp {
         }
         self.prefs.save();
         self.status_line(&format!(
-            "[forge] Cleared {} stale selection{} no longer reported by the probe",
+            "[jade] Cleared {} stale selection{} no longer reported by the probe",
             removed.len(),
             if removed.len() == 1 { "" } else { "s" }
         ));
@@ -3314,7 +3314,7 @@ impl JadeApp {
             self.sync_member_tracking(m);
         }
         self.save_ui_state();
-        self.status_line(&format!("[forge] Bundled {} timers as \"{name}\"", members.len()));
+        self.status_line(&format!("[jade] Bundled {} timers as \"{name}\"", members.len()));
     }
 
     /// Dissolve a bundle: members stay in the registry (and stop being tracked
@@ -3855,7 +3855,7 @@ impl JadeApp {
         self.caret_blink_show = true;
     }
 
-    fn buf_move(&mut self, f: impl FnOnce(&mut forge_buffer::Buffer, bool), extend: bool) {
+    fn buf_move(&mut self, f: impl FnOnce(&mut jade_buffer::Buffer, bool), extend: bool) {
         if let Some(tab) = self.editor.active_tab_mut() {
             f(&mut tab.buffer, extend);
         }
@@ -3895,11 +3895,11 @@ impl JadeApp {
     /// Run a text-changing buffer op on the active tab, returning its record.
     fn with_edit(
         &mut self,
-        f: impl FnOnce(&mut forge_buffer::Buffer) -> forge_buffer::EditRecord,
-    ) -> forge_buffer::EditRecord {
+        f: impl FnOnce(&mut jade_buffer::Buffer) -> jade_buffer::EditRecord,
+    ) -> jade_buffer::EditRecord {
         match self.editor.active_tab_mut() {
             Some(tab) => f(&mut tab.buffer),
-            None => forge_buffer::EditRecord {
+            None => jade_buffer::EditRecord {
                 changes: Vec::new(),
                 version: 0,
             },
@@ -3908,7 +3908,7 @@ impl JadeApp {
 
     /// Shared post-edit bookkeeping: recompute eager decorations + arm debounces,
     /// forward an incremental `didChange`, follow the caret, wake the debounce.
-    fn after_edit(&mut self, record: forge_buffer::EditRecord, cx: &mut Context<Self>) {
+    fn after_edit(&mut self, record: jade_buffer::EditRecord, cx: &mut Context<Self>) {
         self.unfold_at_caret();
         self.caret_activity();
         let now = self.now_ms();
@@ -3947,7 +3947,7 @@ impl JadeApp {
     /// Award XP for edits whose change inserted a newline and whose completed line
     /// (comments stripped) ends with `;`, ≤300 chars (§4.10). The streak scales
     /// the award and persists globally.
-    fn credit_xp(&mut self, record: &forge_buffer::EditRecord, now_ms: u64) {
+    fn credit_xp(&mut self, record: &jade_buffer::EditRecord, now_ms: u64) {
         let mut credits = 0u64;
         if let Some(tab) = self.editor.active_tab() {
             for ch in &record.changes {
@@ -4410,9 +4410,9 @@ impl JadeApp {
                     tab.buffer.mark_saved();
                 }
                 self.lsp_did_save(&path);
-                self.status_line(&format!("[forge] Saved {}", path.display()));
+                self.status_line(&format!("[jade] Saved {}", path.display()));
             }
-            Err(e) => self.status_line(&format!("[forge] Save failed: {e}")),
+            Err(e) => self.status_line(&format!("[jade] Save failed: {e}")),
         }
     }
 
@@ -4732,7 +4732,7 @@ impl JadeApp {
         let anchor = (point.row, point.col);
         self.runtime.spawn(async move {
             tokio::time::sleep(Duration::from_millis(80)).await;
-            let position = forge_lsp::Position::new(pos.line as u32, pos.character as u32);
+            let position = jade_lsp::Position::new(pos.line as u32, pos.character as u32);
             if let Ok(items) = lsp.completion(&path, position).await {
                 let _ = tx.send(AppEvent::Completion {
                     generation,
@@ -4810,7 +4810,7 @@ impl JadeApp {
         let anchor = (point.row, point.col);
         self.runtime.spawn(async move {
             tokio::time::sleep(Duration::from_millis(60)).await;
-            let position = forge_lsp::Position::new(pos.line as u32, pos.character as u32);
+            let position = jade_lsp::Position::new(pos.line as u32, pos.character as u32);
             let hint = match lsp.signature_help(&path, position).await {
                 Ok(Some(help)) => active_signature_hint(&help),
                 _ => None,
@@ -4930,7 +4930,7 @@ impl JadeApp {
     /// Select the managed-model tier (`aiModel`): updates the shown selection,
     /// persists it globally (`~/.config/jade/ai.json`), and applies it to the
     /// backend, which restarts the managed server if one is running
-    /// (`forge_ai::set_model`; a no-op when the tier is unchanged).
+    /// (`jade_ai::set_model`; a no-op when the tier is unchanged).
     pub fn set_ai_model(&mut self, id: AiModelId) {
         self.ai_model = id;
         self.ai_prefs.model = id;
@@ -4954,7 +4954,7 @@ impl JadeApp {
 
     /// (Re)compute ghost text at the caret (§4.11): serve a cache hit instantly
     /// (exact or typed-through), else debounce 120ms and request `/infill`
-    /// (forge-ai's single-flight aborts any older request). Only fires when
+    /// (jade-ai's single-flight aborts any older request). Only fires when
     /// `aiCompletionEnabled` and the backend is `Ready` at a collapsed caret.
     fn schedule_ghost(&mut self) {
         if !self.ai_completion_enabled {
@@ -5170,7 +5170,7 @@ impl JadeApp {
         let (row, col) = cell;
         self.runtime.spawn(async move {
             tokio::time::sleep(Duration::from_millis(300)).await;
-            let position = forge_lsp::Position::new(pos.line as u32, pos.character as u32);
+            let position = jade_lsp::Position::new(pos.line as u32, pos.character as u32);
             let text = match lsp.hover(&path, position).await {
                 Ok(Some(h)) => Some(flatten_hover(&h)),
                 _ => None,
@@ -5222,7 +5222,7 @@ impl JadeApp {
         };
         let tx = self.app_tx.clone();
         self.runtime.spawn(async move {
-            let position = forge_lsp::Position::new(pos.line as u32, pos.character as u32);
+            let position = jade_lsp::Position::new(pos.line as u32, pos.character as u32);
             if let Ok(locs) = lsp.definition(&path, position).await {
                 if let Some(loc) = locs.into_iter().next() {
                     let target = path_from_uri(&loc.uri);
@@ -5265,7 +5265,7 @@ impl JadeApp {
                 }
                 Err(e) => {
                     let _ = tx.send(AppEvent::BuildOutput(format!(
-                        "[forge] clangd unavailable: {e}"
+                        "[jade] clangd unavailable: {e}"
                     )));
                 }
             }
@@ -5301,7 +5301,7 @@ impl JadeApp {
                 for tab in &mut self.editor.tabs {
                     tab.lsp_opened = false;
                 }
-                self.status_line("[forge] clangd exited");
+                self.status_line("[jade] clangd exited");
             }
         }
     }
@@ -5332,7 +5332,7 @@ impl JadeApp {
     fn lsp_did_change(
         &self,
         path: &Path,
-        edits: Vec<forge_lsp::Utf16RangeEdit>,
+        edits: Vec<jade_lsp::Utf16RangeEdit>,
         full_text: String,
         version: i32,
     ) {
@@ -5401,7 +5401,7 @@ impl JadeApp {
         self.asm_loading = false;
         if !result.success {
             if let Some(e) = &result.error {
-                self.status_line(&format!("[forge] asm failed: {e}"));
+                self.status_line(&format!("[jade] asm failed: {e}"));
             }
             return;
         }
@@ -5727,7 +5727,7 @@ impl JadeApp {
 
 /// Flatten LSP hover contents to plain text (no markdown rendering yet — E2
 /// deferral). Handles the scalar / array / markup encodings.
-fn flatten_hover(hover: &forge_lsp::Hover) -> String {
+fn flatten_hover(hover: &jade_lsp::Hover) -> String {
     match &hover.contents {
         HoverContents::Scalar(m) => marked_string_text(m),
         HoverContents::Array(ms) => ms
@@ -7123,7 +7123,7 @@ fn runtime_sidebar(
 }
 
 /// Bottom panel (§5.2): a header (view toggle · new-terminal · minimize) over the
-/// live TERMINAL grid or the OUTPUT scrollback fallback. `[forge]`/build/run
+/// live TERMINAL grid or the OUTPUT scrollback fallback. `[jade]`/build/run
 /// status lines land in OUTPUT (the terminal is a real shell we can't inject
 /// display text into — see `terminal_panel`).
 fn bottom_panel(
@@ -7472,7 +7472,7 @@ mod output_jump_tests {
 
     #[test]
     fn rejects_non_diagnostic_lines() {
-        assert_eq!(parse_jump_target("[forge] Build failed (5 error(s))"), None);
+        assert_eq!(parse_jump_target("[jade] Build failed (5 error(s))"), None);
         assert_eq!(parse_jump_target("main.cpp:1:1: error: relative path"), None);
         assert_eq!(parse_jump_target("/Users/x/notes.txt: no numbers"), None);
         assert_eq!(parse_jump_target("/Users/x/a.cpp:0:1: zero line"), None);

@@ -11,7 +11,7 @@ not behavioral cloning.
 
 App identity: product name **Jade** (`app.setName('Jade')`, `src/main/main.ts:150`),
 window title "Jade", app id `com.jade.ide` (`package.json`). Repo/env vars still use
-the older "forge" prefix (`forge.*` preload API, `FORGE_*` protocol, `.forge/` state
+the older "jade" prefix (`jade.*` preload API, `JADE_*` protocol, `.jade/` state
 dir, `JADE_*` env vars for AI) — both prefixes are load-bearing.
 
 ---
@@ -21,7 +21,7 @@ dir, `JADE_*` env vars for AI) — both prefixes are load-bearing.
 Three storage tiers:
 
 ### 1.1 Global config file
-`app.getPath('userData')/forge-config.json` (`src/main/main.ts:15`), synchronous JSON
+`app.getPath('userData')/jade-config.json` (`src/main/main.ts:15`), synchronous JSON
 read/write, read errors swallowed to `{}` (`main.ts:17-32`).
 Keys routed here — `GLOBAL_KEYS` (`main.ts:122`): `workspaceRoot`, `xpTotal`,
 `theme`, `aiModel`, `aiMultiline`.
@@ -29,7 +29,7 @@ Keys routed here — `GLOBAL_KEYS` (`main.ts:122`): `workspaceRoot`, `xpTotal`,
 `lastWorkspace`, not `workspaceRoot` (asymmetric mapping, `main.ts:121-145`).
 
 ### 1.2 Per-workspace state
-`<workspaceRoot>/.forge/workspace.json` (`src/main/workspace.ts:32-33`).
+`<workspaceRoot>/.jade/workspace.json` (`src/main/workspace.ts:32-33`).
 In-memory cache, flush debounced **2000ms**, pretty-printed JSON (`workspace.ts:151-195`).
 The renderer bundles UI state into a single `'ui'` key. `PERSISTED_KEYS`
 (`src/renderer/state.ts:96-101`), autosave debounced **1500ms** (`state.ts:130-139`):
@@ -40,11 +40,11 @@ loaded only after a workspace opens (`app.ts:830`).
 
 ### 1.3 localStorage (telemetry preferences only)
 Only `telemetry-panel.ts` uses real localStorage:
-- `forge.telemetry.enabled.<kind> <name>` — checkbox state (`telemetry-panel.ts:35`)
-- `forge.telemetry.shape.<kind> <name>` — user shape hint, format `"RxC"` (`:36`)
-- `forge.telemetry.maxdim.<kind> <name>` — streaming resolution cap (`:37`)
+- `jade.telemetry.enabled.<kind> <name>` — checkbox state (`telemetry-panel.ts:35`)
+- `jade.telemetry.shape.<kind> <name>` — user shape hint, format `"RxC"` (`:36`)
+- `jade.telemetry.maxdim.<kind> <name>` — streaming resolution cap (`:37`)
 
-XP total is saved separately via `forge.state.save('xpTotal', …)`, debounced
+XP total is saved separately via `jade.state.save('xpTotal', …)`, debounced
 **2000ms** (`src/renderer/editor/xp-bar.ts:106-113`).
 
 ---
@@ -114,7 +114,7 @@ benchmark-name inputs (Enter commits, Esc cancels); Esc closes the 3D weight gri
 `src/renderer/editor/editor-manager.ts`. Open dedupes by path; Monaco model reuse;
 per-tab viewState save/restore on switch; dirty dot `●`; middle-click closes tab;
 drag-to-reorder tabs (`:296-336`); close adjusts active index; save = full-file
-write via `forge.workspace.writeFile`; LSP full-document sync on change
+write via `jade.workspace.writeFile`; LSP full-document sync on change
 (`notifyLspChange`, `:377-389` — incremental sync was an acknowledged TODO).
 `.metal` files are **not** sent to clangd (`:177-180`).
 Tab restore on workspace open skips deleted files silently (`:272-280`).
@@ -130,13 +130,13 @@ h/hpp/hxx/cu→cpp, metal→metal, mm/m→objective-c, plus json/md/py/sh/js/ts.
 
 ### 4.2 Themes `[IDENTITY — the exact palettes]`
 `src/renderer/editor/theme.ts`. Two full themes, `inherit: false`:
-- **forge-dark**: "JetBrains New UI charcoal" — editor `#1E1F22`, panels `#2B2D30`.
+- **jade-dark**: "JetBrains New UI charcoal" — editor `#1E1F22`, panels `#2B2D30`.
   Accent system: emerald `#56B389` (keywords, cursor, selection tints, gutter-added),
   periwinkle `#8DB2FF` (functions/info/modified), blue-gray `#9BB5CF` (types),
   amber `#D4A76A` (strings/numbers/warnings), red `#CF6B6B` (errors/deleted),
   muted green-gray `#6B7A72` comments. ASM: registers red, function labels bold
   emerald. Full token/editor color tables at `theme.ts:12-178`.
-- **forge-light**: research-rationale documented in-code (`theme.ts:184-197`) —
+- **jade-light**: research-rationale documented in-code (`theme.ts:184-197`) —
   warm cream `#F4EFE2` bg (not white), warm charcoal `#373528` text (~10:1, not
   21:1), desaturated green/amber accents, borders at black 8% alpha. Comments
   italic. Tables at `theme.ts:198-324`.
@@ -267,8 +267,8 @@ bursts). Context menu: New File/Folder (dirs), Rename, Delete (native
 extension. Drag & drop move (file→its parent dir targeting, drop on empty area →
 root, self-move guards). **No git status indicators.**
 Ignore lists (`workspace.ts:6-15`): node_modules, .git/.svn/.hg, build dirs incl.
-`cmake-build-forge`, caches, IDE dirs; extensions `.o .obj .a .lib .so .dylib .exe
-.out .class .pyc`; dotfiles hidden except `.forge`; `.dSYM` hidden; root-level
+`cmake-build-jade`, caches, IDE dirs; extensions `.o .obj .a .lib .so .dylib .exe
+.out .class .pyc`; dotfiles hidden except `.jade`; `.dSYM` hidden; root-level
 extensionless files hidden (compiled-binary heuristic).
 
 ### 5.2 Terminal `[COMMODITY — Zed terminal covers this]`
@@ -277,7 +277,7 @@ extensionless files hidden (compiled-binary heuristic).
 toggleable list (`≡`): rows named `zsh <id>`, duplicate (spawns new, doesn't clone)
 and delete actions. Hardcoded dark/light ANSI palettes swapped on theme change
 (canvas can't read CSS vars, `:13-46`). `writeOutput` targets instance 0 for
-`[forge]` status lines. PTY exit writes dim `[exited <code>]`. PTY creation
+`[jade]` status lines. PTY exit writes dim `[exited <code>]`. PTY creation
 returning `-1` = node-pty unavailable, degrade gracefully (`pty-manager.ts:93-124`).
 
 ### 5.3 Memory bar `[IDENTITY]`
@@ -354,8 +354,8 @@ port. Also dead: store keys `workspaceReady`, `debugPausedLine` (init-only),
   (saves first).
 - **Build/Run/Debug lifecycle**: buttons swap labels (`Building…`/`Running…`),
   spin the icon, disable during build; terminal is force-shown and receives
-  ANSI-colored `[forge]`/`[cmake]` status lines (green success / red failure / cyan
-  progress). Build errors become red Monaco markers (owner `forge-build`) and jump
+  ANSI-colored `[jade]`/`[cmake]` status lines (green success / red failure / cyan
+  progress). Build errors become red Monaco markers (owner `jade-build`) and jump
   to first error. Run wires `executedLines` into the store, records the run in
   RuntimePanel, auto-shows the runtime sidebar on first run, parses `file:line:col`
   from failing sanitizer output into `errorLine`. Debug builds with forced `-O0`.
@@ -441,11 +441,11 @@ mechanics are not. In Rust: GPUI-painted charts, Metal/wgpu instanced bars.
 
 ### 8.1 Build & run pipeline `[IDENTITY — preserve semantics exactly]`
 `src/main/build-runner.ts` (924 lines).
-- Build dir: `cmake-build-forge` (separate from CLion's). Configure cached per
+- Build dir: `cmake-build-jade` (separate from CLion's). Configure cached per
   buildDir keyed by `\x1f`-joined configure args + `CMakeCache.txt` existence;
   cache invalidated on configure failure (`:15, 418-511`).
 - Configure args: Debug build type, `CMAKE_EXPORT_COMPILE_COMMANDS=ON`,
-  `FORGE_INCLUDE_DIR`, CXX/OBJCXX/linker flags. Base cxxFlags `-g` + user flags;
+  `JADE_INCLUDE_DIR`, CXX/OBJCXX/linker flags. Base cxxFlags `-g` + user flags;
   sanitize adds `-fsanitize=address -fno-omit-frame-pointer`; instrument adds
   `-fprofile-arcs -ftest-coverage` / `--coverage`. Build: `cmake --build --parallel`.
 - **CMake File API** used to find the built executable: empty query file
@@ -455,11 +455,11 @@ mechanics are not. In Rust: GPUI-painted charts, Metal/wgpu instanced bars.
   $HOME or /): picks main.cpp/mm/cc/m near a .metal active file or first source
   alphabetically; detects ObjC and Metal shaders; generates C++17 project with
   Metal/Foundation/MPS/QuartzCore linking and a `.metal → .air → default.metallib`
-  xcrun custom-command chain; emits cyan `[forge]` notice (`:261-361`).
+  xcrun custom-command chain; emits cyan `[jade]` notice (`:261-361`).
 - Error parsing: `file:line:col: (error|warning|note)` + CMake configure error
   regexes (`:50-79`).
 - **Run** (`:561-793`): single concurrent run (previous killed);
-  `FORGE_TELEMETRY_SOCK` exported from the telemetry server; ASan env
+  `JADE_TELEMETRY_SOCK` exported from the telemetry server; ASan env
   `ASAN_OPTIONS=detect_leaks=0:print_stats=1`; **dylib injection rules**: malloc
   interposer only when NOT sanitizing, Metal probe always attempted
   (`DYLD_INSERT_LIBRARIES`, colon-joined). Stdout/stderr line-buffered with partial
@@ -474,26 +474,26 @@ mechanics are not. In Rust: GPUI-painted charts, Metal/wgpu instanced bars.
   debug labels/directives filtered; demangled via `c++filt` (5s timeout, graceful
   fallback).
 - Dylib compile-on-demand: probe `clang++ -dynamiclib -fobjc-arc -O2 -framework
-  Metal -framework Foundation` → `/tmp/forge_probe.dylib` (30s timeout); interposer
-  `clang -shared -ldl` → `/tmp/forge_interpose.dylib` (15s); recompiled on source
+  Metal -framework Foundation` → `/tmp/jade_probe.dylib` (30s timeout); interposer
+  `clang -shared -ldl` → `/tmp/jade_interpose.dylib` (15s); recompiled on source
   mtime; silent failure = feature off (`:29-48, 536-559`).
 - **Known perf issue** (docs/perf-findings.md): alloc/free events are sent one IPC
   message each — the Rust rewrite eliminates this by construction; if patching the
   Electron app first, batch flushes every 50–100ms or 500 events.
 
-### 8.2 `__FORGE_*` wire protocols `[IDENTITY — byte-for-byte]`
+### 8.2 `__JADE_*` wire protocols `[IDENTITY — byte-for-byte]`
 Pipe-delimited magic lines from instrumented programs (`build-runner.ts:83-143,
-640-677`). **stdout**: `__FORGE_ALLOC|ptr|size|file|line|ts`, `__FORGE_FREE|…`,
-`__FORGE_SCALAR|name|step|value|ts`, `__FORGE_TIMING|name|ms|step` (scalar/timing
+640-677`). **stdout**: `__JADE_ALLOC|ptr|size|file|line|ts`, `__JADE_FREE|…`,
+`__JADE_SCALAR|name|step|value|ts`, `__JADE_TIMING|name|ms|step` (scalar/timing
 routed through the telemetry registry so legacy programs appear in the sidebar).
-**stderr**: `__FORGE_TRACE|…|line|…`, `__FORGE_FUNC_ENTER|addr|…`,
-`__FORGE_FUNC_EXIT|…`, `__FORGE_HEAP_SUMMARY|totalAlloc|totalFreed|currentHeap|
-peakHeap|allocCount|freeCount`, `__FORGE_INTERPOSE_ACTIVE`. Unrecognized
-`__FORGE_*` lines are swallowed, not printed. Two stray `console.log`s on the
+**stderr**: `__JADE_TRACE|…|line|…`, `__JADE_FUNC_ENTER|addr|…`,
+`__JADE_FUNC_EXIT|…`, `__JADE_HEAP_SUMMARY|totalAlloc|totalFreed|currentHeap|
+peakHeap|allocCount|freeCount`, `__JADE_INTERPOSE_ACTIVE`. Unrecognized
+`__JADE_*` lines are swallowed, not printed. Two stray `console.log`s on the
 heap-summary path (`:176, :187`) should not be ported.
 
 ### 8.3 Telemetry server `[IDENTITY — spec in docs/telemetry-protocol.md]`
-`telemetry-server.ts`: Unix socket `os.tmpdir()/forge-telemetry-<pid>.sock`,
+`telemetry-server.ts`: Unix socket `os.tmpdir()/jade-telemetry-<pid>.sock`,
 NDJSON both ways, stale socket file deleted on start, 8MB partial-line guard,
 malformed lines silently skipped, multiple concurrent clients, `track` replay to
 new clients. Registry defaults `enabled:false, maxDim:128`; tensor frames for
@@ -508,8 +508,8 @@ re-init (`:449-477`) — the other subsystems have a latent double-registration 
 (see §10).
 
 ### 8.4 Debug driver `[COMMODITY if Zed DAP replaces it; record semantics anyway]`
-`debug-driver.ts`: interactive `lldb` CLI wrapper. Custom prompt `FORGE_LLDB> `;
-auto-confirm on; stop-line context suppressed. Injects `FORGE_TELEMETRY_SOCK` +
+`debug-driver.ts`: interactive `lldb` CLI wrapper. Custom prompt `JADE_LLDB> `;
+auto-confirm on; stop-line context suppressed. Injects `JADE_TELEMETRY_SOCK` +
 probe dylib via `target.env-vars` (**no malloc interposer while debugging**).
 Output framing: prompt match or **150ms** quiet-settle for command replies; **80ms**
 quiet window for unsolicited stops; command queue serialization; **10s** command
@@ -564,12 +564,12 @@ double-`ipcMain.handle` registration bug for all subsystems except telemetry
 
 ## 9. Native components (carry over unchanged)
 
-- `probe/forge_probe.mm` → `/tmp/forge_probe.dylib`: injected Metal probe streaming
+- `probe/jade_probe.mm` → `/tmp/jade_probe.dylib`: injected Metal probe streaming
   GPU tensors/scalars/timings over the telemetry socket.
-- `include/forge_interpose.c` → `/tmp/forge_interpose.dylib`: malloc interposer
-  emitting `__FORGE_ALLOC/FREE/HEAP_SUMMARY`.
-- `include/forge_trace.c/.cpp`: `-finstrument-functions` tracing
-  (`__FORGE_TRACE/FUNC_ENTER/FUNC_EXIT`).
+- `include/jade_interpose.c` → `/tmp/jade_interpose.dylib`: malloc interposer
+  emitting `__JADE_ALLOC/FREE/HEAP_SUMMARY`.
+- `include/jade_trace.c/.cpp`: `-finstrument-functions` tracing
+  (`__JADE_TRACE/FUNC_ENTER/FUNC_EXIT`).
 - `include/idetools.h`: user-facing instrumentation macros.
 - `probe/mock_server.py`, `probe/test_train.mm`: protocol test clients — use these
   to verify the Rust telemetry server end-to-end.

@@ -1,7 +1,7 @@
-# Forge IDE — Rust workspace
+# Jade IDE — Rust workspace
 
 Rust rewrite of the Electron/TypeScript Jade IDE. The `jade` crate is the GPUI
-app shell; the `forge-*` crates are the build/debug/telemetry/terminal/AI engines
+app shell; the `jade-*` crates are the build/debug/telemetry/terminal/AI engines
 it wires together.
 
 ## Dev loop (no bundle)

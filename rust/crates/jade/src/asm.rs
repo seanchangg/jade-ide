@@ -1,12 +1,12 @@
 //! ASM viewer model (feature inventory §6 "ASM viewer" / app.ts:304-445).
 //!
 //! Holds the `-O3 -march=native` assembly of the active file plus the
-//! bidirectional line map from `forge_build::generate_asm` (which builds it from
+//! bidirectional line map from `jade_build::generate_asm` (which builds it from
 //! the compiler's `.loc` directives). The viewer highlights, for the source
 //! caret line, every mapped asm line — and, on an asm click, scrolls + highlights
 //! the counterpart source line (asm→src also scrolls).
 //!
-//! `forge_build::AsmResult::asm_to_source` keys are **1-based filtered-asm line
+//! `jade_build::AsmResult::asm_to_source` keys are **1-based filtered-asm line
 //! numbers**; values are **1-based source lines**. This module keeps a reverse
 //! index (source line → the 0-based asm row indices) for the source→asm
 //! highlight direction, and exposes pure lookups that are unit-tested.

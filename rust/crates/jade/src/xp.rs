@@ -4,7 +4,7 @@
 //! machine (with an **injectable clock** so the 10s window is testable without
 //! real timers), and the level curve. The app owns the UI mount (tab-bar right)
 //! and the global `xpTotal` persistence; [`XpStore`] provides the load/save +
-//! Electron `forge-config.json` migration.
+//! Electron `jade-config.json` migration.
 
 use std::path::{Path, PathBuf};
 
@@ -131,7 +131,7 @@ impl XpState {
 
 /// Global `xpTotal` persistence (§1.1). Our file lives in `~/.config/jade/`
 /// (alongside `telemetry.json`); on first run it migrates the Electron app's
-/// `forge-config.json` `xpTotal` if present.
+/// `jade-config.json` `xpTotal` if present.
 pub struct XpStore {
     path: Option<PathBuf>,
 }
@@ -144,12 +144,12 @@ impl XpStore {
     }
 
     /// The Electron app's global config for migration:
-    /// `~/Library/Application Support/Jade/forge-config.json`.
+    /// `~/Library/Application Support/Jade/jade-config.json`.
     pub fn electron_config_path() -> Option<PathBuf> {
         let home = std::env::var_os("HOME")?;
         Some(
             PathBuf::from(home)
-                .join("Library/Application Support/Jade/forge-config.json"),
+                .join("Library/Application Support/Jade/jade-config.json"),
         )
     }
 
@@ -172,7 +172,7 @@ impl XpStore {
     }
 }
 
-/// Read `xpTotal` from our file, else migrate the Electron `forge-config.json`,
+/// Read `xpTotal` from our file, else migrate the Electron `jade-config.json`,
 /// else 0. Both are `{ "xpTotal": <number> }`-shaped; errors → 0.
 pub fn load_total(our_path: Option<&Path>, electron_path: Option<&Path>) -> u64 {
     if let Some(p) = our_path {
@@ -263,7 +263,7 @@ mod tests {
         let base = std::env::temp_dir().join(format!("jade-xp-test-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&base);
         let ours = base.join("xp.json");
-        let electron = base.join("forge-config.json");
+        let electron = base.join("jade-config.json");
 
         // No files → 0.
         assert_eq!(load_total(Some(&ours), Some(&electron)), 0);

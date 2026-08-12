@@ -1,0 +1,16 @@
+[package]
+name = "jade-buffer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# Standalone text rope. Chosen over zed's `rope` crate because it lives on
+# crates.io with no coupling to sum_tree / collab, and ships native UTF-16
+# code-unit conversions (len_utf16_cu / char_to_utf16_cu / utf16_cu_to_char) —
+# exactly what LSP position math needs for clangd. See the crate-level docs in
+# `lib.rs` for the full rationale.
+ropey = "1.6"
+# Grapheme-cluster segmentation for cursor motion / delete-backward so an emoji
+# or combining sequence moves/deletes as one unit.
+unicode-segmentation = "1"

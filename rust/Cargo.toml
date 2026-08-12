@@ -1,14 +1,14 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/forge-telemetry",
-    "crates/forge-buffer",
-    "crates/forge-build",
-    "crates/forge-debug",
-    "crates/forge-lsp",
-    "crates/forge-ai",
-    "crates/forge-sysmon",
-    "crates/forge-term",
+    "crates/jade-telemetry",
+    "crates/jade-buffer",
+    "crates/jade-build",
+    "crates/jade-debug",
+    "crates/jade-lsp",
+    "crates/jade-ai",
+    "crates/jade-sysmon",
+    "crates/jade-term",
     "crates/jade",
 ]
 

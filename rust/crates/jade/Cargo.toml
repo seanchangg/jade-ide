@@ -12,23 +12,23 @@ gpui = { git = "https://github.com/zed-industries/zed" }
 # font-kit is off by default and without it gpui_macos has no font provider —
 # no text renders at all (bites every standalone GPUI consumer).
 gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit"] }
-forge-telemetry = { path = "../forge-telemetry" }
-forge-build = { path = "../forge-build" }
-forge-debug = { path = "../forge-debug" }
+jade-telemetry = { path = "../jade-telemetry" }
+jade-build = { path = "../jade-build" }
+jade-debug = { path = "../jade-debug" }
 # Editor text core (E2): rope-backed Buffer, cursors, grouped undo/redo,
 # LSP-shaped incremental EditRecords, dirty tracking. Backs each OpenTab.
-forge-buffer = { path = "../forge-buffer" }
+jade-buffer = { path = "../jade-buffer" }
 # clangd LSP client (E2): diagnostics/completion/hover/definition over stdio.
-forge-lsp = { path = "../forge-lsp" }
-# The LSP domain vocabulary forge-lsp is built on. jade needs a few types
-# forge-lsp doesn't re-export (CompletionTextEdit/TextEdit for applying
-# completions); pinned to the exact version forge-lsp uses so the types unify.
+jade-lsp = { path = "../jade-lsp" }
+# The LSP domain vocabulary jade-lsp is built on. jade needs a few types
+# jade-lsp doesn't re-export (CompletionTextEdit/TextEdit for applying
+# completions); pinned to the exact version jade-lsp uses so the types unify.
 lsp-types = "0.97"
-forge-sysmon = { path = "../forge-sysmon" }
-forge-ai = { path = "../forge-ai" }
+jade-sysmon = { path = "../jade-sysmon" }
+jade-ai = { path = "../jade-ai" }
 # Headless terminal engine (PTY + alacritty grid state machine); Jade renders
 # its GridSnapshots in the bottom TERMINAL strip (Phase-4 wave 2, §5.2).
-forge-term = { path = "../forge-term" }
+jade-term = { path = "../jade-term" }
 # Cross-platform filesystem watcher for the file-tree auto-refresh (§5.1); the
 # recommended backend (FSEvents on macOS) is debounced 250ms in app wiring.
 notify = "8"
@@ -40,7 +40,7 @@ serde_json = { workspace = true }
 # Read-only syntax highlighting (editor-core Step 1): the plain tree-sitter
 # runtime + the C++ grammar (also drives .metal via added Metal keywords). No
 # zed language/editor crates — a focused highlight query maps captures to the
-# forge-dark palette (§4.2).
+# jade-dark palette (§4.2).
 tree-sitter = "0.25"
 tree-sitter-cpp = "0.23"
 # Regex-driven static analysis for the editor decoration ports (§4.5 memory
@@ -57,7 +57,7 @@ anyhow = "1"
 image = { version = "0.25", default-features = false }
 smallvec = "1"
 # Persistent run store (run_store.rs): every telemetry run's scalar/timing/
-# memory series + metadata land in <workspace>/.forge/runs.db so the training
+# memory series + metadata land in <workspace>/.jade/runs.db so the training
 # view can overlay & compare historical runs. `bundled` compiles SQLite in —
 # no system-lib version drift, same choice Zed makes for its sqlez.
 rusqlite = { version = "0.40.1", features = ["bundled"] }

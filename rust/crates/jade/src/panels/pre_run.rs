@@ -2,7 +2,7 @@
 //! picks which timers and buffers to track before the program launches.
 //!
 //! Timers default to untracked (the probe doesn't even emit samples until
-//! asked — see `forge_probe.mm`'s timer gating), so this panel is where a
+//! asked — see `jade_probe.mm`'s timer gating), so this panel is where a
 //! run's telemetry cost is decided. The list comes from the registry; when
 //! it's empty a short discovery run (`JadeApp::start_discovery`) launches the
 //! built executable for a few seconds with everything untracked, harvesting
@@ -14,7 +14,7 @@
 
 use gpui::{div, prelude::*, px, rgb, Context, FocusHandle, KeyDownEvent};
 
-use forge_telemetry::Kind;
+use jade_telemetry::Kind;
 
 use crate::app::{JadeApp, PreRunLaunch};
 use crate::theme::Theme;

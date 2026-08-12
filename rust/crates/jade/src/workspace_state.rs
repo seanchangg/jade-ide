@@ -1,7 +1,7 @@
 //! Per-workspace UI persistence (feature inventory §1.2).
 //!
 //! Jade bundles its UI state into the single `ui` key of
-//! `<workspaceRoot>/.forge/workspace.json` — the **same file and key** the
+//! `<workspaceRoot>/.jade/workspace.json` — the **same file and key** the
 //! Electron app used (`state.ts:96-139`), so an existing workspace opens with its
 //! tabs, breakpoints, and benchmarks intact.
 //!
@@ -82,10 +82,10 @@ const OWNED_KEYS: &[&str] = &[
 ];
 
 /// Load Jade's UI state for a workspace (`ui` key), or the default on any error.
-/// `<workspace>/.forge/workspace.json` — the shared per-workspace state file
+/// `<workspace>/.jade/workspace.json` — the shared per-workspace state file
 /// (same file the Electron app writes; saves merge-preserve foreign keys).
 fn workspace_json_path(workspace_root: &Path) -> PathBuf {
-    workspace_root.join(".forge").join("workspace.json")
+    workspace_root.join(".jade").join("workspace.json")
 }
 
 pub fn load(workspace_root: &Path) -> WorkspaceUi {
@@ -156,7 +156,7 @@ mod tests {
     fn tmp(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("jade-ws-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        dir.join(".forge").join("workspace.json")
+        dir.join(".jade").join("workspace.json")
     }
 
     #[test]

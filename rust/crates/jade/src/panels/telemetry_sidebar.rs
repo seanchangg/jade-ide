@@ -12,7 +12,7 @@
 
 use gpui::{div, prelude::*, px, rgb, Context, KeyDownEvent, SharedString};
 
-use forge_telemetry::Kind;
+use jade_telemetry::Kind;
 
 use crate::app::dim_input::{display_value, DimField};
 use crate::app::JadeApp;

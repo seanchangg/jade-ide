@@ -2,7 +2,7 @@
 //! visualization (Rust rewrite of the Electron/TypeScript app).
 //!
 //! This binary wires the telemetry server + the four engine crates
-//! (`forge-build` / `forge-debug` / `forge-sysmon` / `forge-ai`) into the GPUI
+//! (`jade-build` / `jade-debug` / `jade-sysmon` / `jade-ai`) into the GPUI
 //! window shell (`app::JadeApp`). Every async source is bridged onto one unified
 //! [`app::AppEvent`] channel (see `app.rs`), so the pump coalesces bursts in one
 //! place.
@@ -17,10 +17,10 @@
 //!
 //! Repo root (for the engine's native-source dirs) is resolved at runtime from
 //! `JADE_REPO_ROOT`, falling back to `CARGO_MANIFEST_DIR/../../..` (the
-//! forge-ide checkout the binary was built from).
+//! jade-ide checkout the binary was built from).
 //!
 //! Module map:
-//!   theme       — forge-dark/forge-light palettes (§4.2)
+//!   theme       — jade-dark/jade-light palettes (§4.2)
 //!   format      — value formatting ported from the TS renderer
 //!   prefs       — telemetry preference persistence
 //!   registry    — discovered-item model + auto-check rule (§5.6)
@@ -71,11 +71,11 @@ mod xp;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use forge_ai::InlineCompletionBackend;
-use forge_build::{BuildEngine, EngineConfig};
-use forge_sysmon::SystemMonitor;
-use forge_telemetry::{Event, TelemetryServer};
-use forge_term::TermManager;
+use jade_ai::InlineCompletionBackend;
+use jade_build::{BuildEngine, EngineConfig};
+use jade_sysmon::SystemMonitor;
+use jade_telemetry::{Event, TelemetryServer};
+use jade_term::TermManager;
 use gpui::{
     point, px, size, App, AppContext, Bounds, KeyBinding, TitlebarOptions,
     WindowBackgroundAppearance, WindowBounds, WindowOptions,
@@ -183,7 +183,7 @@ fn main() {
     // resolved allocation sites). The probe's decl meta carries the exe path,
     // so the empty fallback only matters for probes that omit it; Run/Debug
     // re-install with the freshly built executable.
-    server.set_symbolicator(Arc::new(forge_build::AtosSymbolicator::new(
+    server.set_symbolicator(Arc::new(jade_build::AtosSymbolicator::new(
         std::path::PathBuf::new(),
     )));
 
@@ -240,7 +240,7 @@ fn main() {
         })
     };
 
-    println!("FORGE_TELEMETRY_SOCK={}", socket.display());
+    println!("JADE_TELEMETRY_SOCK={}", socket.display());
     println!("repo root: {}", root.display());
     if let Some(f) = &active_file {
         println!("active file: {}", f.display());
@@ -557,7 +557,7 @@ fn spawn_fs_watch(
 
 /// `--smoke term` (Phase-4 wave 2): create a real terminal with cwd = workspace
 /// root, type `printf hello-jade-term`, and poll snapshots until the text shows
-/// up in the grid (forge-term's own integration-test pattern). Prints a
+/// up in the grid (jade-term's own integration-test pattern). Prints a
 /// `--smoke wg3d` (deliverable §7): instantiate the 3D weight-grid module,
 /// feed 70 synthetic frames of a 32×32 buffer through its ring (asserting the
 /// ring caps at 64), project the default framed camera, and print a
@@ -780,7 +780,7 @@ fn run_smoke(
                 .and_then(|b| {
                     b.errors
                         .iter()
-                        .find(|e| e.severity == forge_build::Severity::Error)
+                        .find(|e| e.severity == jade_build::Severity::Error)
                         .or_else(|| b.errors.first())
                 })
                 .map(|e| e.message.clone())
@@ -949,7 +949,7 @@ fn run_smoke_ghost() {
 /// open a file with an error, await the first diagnostics event, and print a
 /// machine-readable line. Skips gracefully when clangd is unavailable.
 fn run_smoke_lsp(runtime: tokio::runtime::Runtime, _deps: AppDeps, dir: Option<PathBuf>) {
-    use forge_lsp::{LspClient, LspEvent};
+    use jade_lsp::{LspClient, LspEvent};
     runtime.block_on(async move {
         // Build a throwaway project (or use the passed dir) with a known error.
         let root = match dir {
@@ -1100,7 +1100,7 @@ fn resolve_workspace_opened(args: &[String], workspace_root: &Path) -> bool {
     !workspace_state::load(workspace_root).open_tabs.is_empty()
 }
 
-/// Resolve the forge-ide checkout root: `JADE_REPO_ROOT` if set, else the
+/// Resolve the jade-ide checkout root: `JADE_REPO_ROOT` if set, else the
 /// compile-time `CARGO_MANIFEST_DIR/../../..` (jade is at `rust/crates/jade`).
 fn repo_root() -> PathBuf {
     if let Some(r) = std::env::var_os("JADE_REPO_ROOT") {
@@ -1148,14 +1148,14 @@ fn maybe_launch_train(args: &[String], socket: &std::path::Path) {
         return;
     };
     let dylib = dir
-        .join("forge_probe.dylib")
+        .join("jade_probe.dylib")
         .canonicalize()
         .expect("probe dylib");
     std::process::Command::new(dir.join("test_train"))
         .current_dir(&dir)
         .env("DYLD_INSERT_LIBRARIES", dylib)
-        .env("FORGE_TELEMETRY_SOCK", socket)
-        .env_remove("FORGE_TRACK_ALL")
+        .env("JADE_TELEMETRY_SOCK", socket)
+        .env_remove("JADE_TRACK_ALL")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()

@@ -1,0 +1,16 @@
+[package]
+name = "jade-term"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Headless terminal engine (PTY + terminal state machine) for Jade. Ports the spawn semantics of src/main/pty-manager.ts; a GPUI panel renders GridSnapshots in a later phase."
+
+[dependencies]
+# alacritty_terminal is the grid/state-machine + PTY layer that Zed itself uses.
+# 0.26 bundles a Unix PTY (rustix-openpty) and an event loop that reads the PTY,
+# drives the VTE parser, and reports child-exit race-free via SIGCHLD.
+alacritty_terminal = "0.26.0"
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync"] }

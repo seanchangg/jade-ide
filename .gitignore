@@ -7,7 +7,7 @@ probe/test_train
 probe/probe.log
 
 # CMake build dirs created by the IDE itself
-cmake-build-forge/
+cmake-build-jade/
 
 # macOS
 .DS_Store
@@ -16,7 +16,7 @@ cmake-build-forge/
 .claude/settings.local.json
 
 # Local IDE state
-.forge/
+.jade/
 
 # Separate git repository (github.com/seanchangg/sprite-100m)
 ml/

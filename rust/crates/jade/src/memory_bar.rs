@@ -2,15 +2,15 @@
 //!
 //! The bottom strip shows SYS MEM · HEAP · PEAK · PRESSURE (5-dot gauge) on the
 //! left and CPU% · GPU% on the right. HEAP/PEAK/leaks come from program memory
-//! events ([`forge_build::MemoryEvent`]); SYS MEM and PRESSURE fall back to
-//! OS-level [`forge_sysmon::SystemStats`] until (and, since we have no
+//! events ([`jade_build::MemoryEvent`]); SYS MEM and PRESSURE fall back to
+//! OS-level [`jade_sysmon::SystemStats`] until (and, since we have no
 //! program-level pressure signal, after) program data exists.
 //!
 //! Threshold classification is factored into pure, unit-tested functions so the
 //! renderer only maps a [`Level`] to a color.
 
-use forge_build::{AllocKind, MemoryEvent};
-use forge_sysmon::SystemStats;
+use jade_build::{AllocKind, MemoryEvent};
+use jade_sysmon::SystemStats;
 
 use crate::format::format_bytes;
 
@@ -274,7 +274,7 @@ pub fn project(mem: &MemoryBarState, sys: &SystemStats) -> MemoryBarView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use forge_build::AllocEvent;
+    use jade_build::AllocEvent;
 
     fn alloc(size: i64, file: &str, line: u32) -> AllocEvent {
         AllocEvent {

@@ -3,10 +3,10 @@
 //! Pure logic + filesystem scan, no GPUI. Mirrors the Electron
 //! `src/main/workspace.ts` ignore rules and sort order exactly:
 //!   - ignored dirs: `node_modules`, `.git/.svn/.hg`, build dirs incl.
-//!     `cmake-build-forge`, caches, IDE dirs (`workspace.ts:6-10`);
+//!     `cmake-build-jade`, caches, IDE dirs (`workspace.ts:6-10`);
 //!   - ignored file extensions: `.o .obj .a .lib .so .dylib .exe .out .class
 //!     .pyc` (`workspace.ts:12-15`);
-//!   - dotfiles hidden except `.forge`; `*.dSYM` hidden; root-level extensionless
+//!   - dotfiles hidden except `.jade`; `*.dSYM` hidden; root-level extensionless
 //!     files hidden (compiled-binary heuristic, `workspace.ts:91-94`);
 //!   - directories first, then files grouped by file kind ([`FileKind::rank`])
 //!     and case-insensitive alphabetical inside each group.
@@ -34,7 +34,7 @@ pub const IGNORED_DIRS: &[&str] = &[
     "build",
     "cmake-build-debug",
     "cmake-build-release",
-    "cmake-build-forge",
+    "cmake-build-jade",
     ".cache",
     "__pycache__",
     ".vscode",
@@ -307,7 +307,7 @@ fn reexpand(nodes: &mut [FileNode], path: &Path) -> bool {
 /// True if a changed path is one the tree would display — i.e. no path component
 /// is an ignored directory / hidden dotfile / `.dSYM` bundle, and the leaf's
 /// extension is not an ignored build-artifact type. Used to drop the FSEvents
-/// bursts that build artifacts (`.o`, `cmake-build-forge/…`) generate (§5.1).
+/// bursts that build artifacts (`.o`, `cmake-build-jade/…`) generate (§5.1).
 pub fn is_watch_relevant(path: &Path) -> bool {
     let mut comps = path.components().peekable();
     while let Some(comp) = comps.next() {
@@ -327,7 +327,7 @@ pub fn is_watch_relevant(path: &Path) -> bool {
         if IGNORED_DIRS.contains(&name.as_ref()) {
             return false;
         }
-        if name.starts_with('.') && name != ".forge" {
+        if name.starts_with('.') && name != ".jade" {
             return false;
         }
         if name.ends_with(".dSYM") {
@@ -483,8 +483,8 @@ fn keep(name: &str, is_dir: bool, is_root: bool) -> bool {
     if is_dir && IGNORED_DIRS.contains(&name) {
         return false;
     }
-    // Dotfiles hidden except `.forge`.
-    if name.starts_with('.') && name != ".forge" {
+    // Dotfiles hidden except `.jade`.
+    if name.starts_with('.') && name != ".jade" {
         return false;
     }
     // `*.dSYM` bundles hidden.
@@ -541,12 +541,12 @@ mod tests {
         fs::write(base.join(".hidden"), "").unwrap();
         fs::write(base.join("a.out"), "").unwrap();
         fs::write(base.join("compiled_binary"), "").unwrap(); // extensionless @ root
-        // `.forge` dotdir is the one dotfile exception.
-        fs::create_dir_all(base.join(".forge")).unwrap();
-        fs::write(base.join(".forge").join("workspace.json"), "{}").unwrap();
+        // `.jade` dotdir is the one dotfile exception.
+        fs::create_dir_all(base.join(".jade")).unwrap();
+        fs::write(base.join(".jade").join("workspace.json"), "{}").unwrap();
         // Ignored dirs.
         fs::create_dir_all(base.join("node_modules")).unwrap();
-        fs::create_dir_all(base.join("cmake-build-forge")).unwrap();
+        fs::create_dir_all(base.join("cmake-build-jade")).unwrap();
         fs::create_dir_all(base.join("app.dSYM")).unwrap();
         // A real nested source dir.
         fs::create_dir_all(base.join("src").join("engine")).unwrap();
@@ -614,7 +614,7 @@ mod tests {
         assert!(names.contains(&"util.h"));
         assert!(names.contains(&"notes.txt"));
         assert!(names.contains(&"src"));
-        assert!(names.contains(&".forge")); // dotfile exception
+        assert!(names.contains(&".jade")); // dotfile exception
 
         // Ignored.
         assert!(!names.contains(&"main.o"), "build artifact ext");
@@ -622,7 +622,7 @@ mod tests {
         assert!(!names.contains(&"a.out"), "ignored ext");
         assert!(!names.contains(&"compiled_binary"), "root extensionless");
         assert!(!names.contains(&"node_modules"));
-        assert!(!names.contains(&"cmake-build-forge"));
+        assert!(!names.contains(&"cmake-build-jade"));
         assert!(!names.contains(&"app.dSYM"));
     }
 
@@ -630,7 +630,7 @@ mod tests {
     fn dirs_first_then_alphabetical() {
         let dir = temp_fixture();
         let tree = FileTree::scan(dir.0.clone());
-        // First non-dot dir should precede all files. `.forge` and `src` are dirs.
+        // First non-dot dir should precede all files. `.jade` and `src` are dirs.
         let first_file = tree.roots.iter().position(|n| !n.is_dir).unwrap();
         let last_dir = tree.roots.iter().rposition(|n| n.is_dir).unwrap();
         assert!(last_dir < first_file, "all dirs come before all files");
@@ -710,9 +710,9 @@ mod tests {
         // Kept.
         assert!(is_watch_relevant(&root.join("src/main.cpp")));
         assert!(is_watch_relevant(&root.join("util.h")));
-        assert!(is_watch_relevant(&root.join(".forge/workspace.json"))); // exception
+        assert!(is_watch_relevant(&root.join(".jade/workspace.json"))); // exception
         // Dropped: ignored dir component, build-artifact ext, dotfile, dSYM.
-        assert!(!is_watch_relevant(&root.join("cmake-build-forge/out.o")));
+        assert!(!is_watch_relevant(&root.join("cmake-build-jade/out.o")));
         assert!(!is_watch_relevant(&root.join("node_modules/x/index.js")));
         assert!(!is_watch_relevant(&root.join("src/main.o")));
         assert!(!is_watch_relevant(&root.join(".git/HEAD")));
