@@ -20,22 +20,25 @@
 //! plain output scrollback, kept as the bottom panel's OUTPUT view toggle
 //! (`app.rs`), and the TERMINAL view is a real interactive shell.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use forge_term::{Cell, Color, GridSnapshot, TermId, TermManager};
 use gpui::{
-    canvas, div, prelude::*, px, rgb, Bounds, Context, Div, FocusHandle, FontWeight, MouseButton,
-    Pixels,
+    canvas, div, prelude::*, px, rgb, Bounds, ClipboardItem, Context, Div, FocusHandle, FontWeight,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, ScrollDelta,
+    ScrollWheelEvent,
 };
 
 use crate::app::JadeApp;
 
-/// Cell metrics used to derive cols×rows from the rendered pixel bounds. Height
-/// matches the per-row line height; width is a constant close to Menlo's 'M'
-/// advance at this size (measuring per-frame isn't worth a text-system round
-/// trip for a character-addressed grid).
-pub const CELL_W: f32 = 8.0;
+/// Terminal font size; cell width is measured from the real glyph advance at
+/// this size (see [`render`]), so the PTY's cols always match what fits.
+pub const FONT_SIZE: f32 = 12.0;
+/// Fallback cell width if the text system can't resolve the mono font
+/// (Menlo/JetBrains Mono 'M' advance at 12px ≈ 7.2px).
+pub const CELL_W: f32 = 7.2;
+/// Cell height == the per-row line height.
 pub const CELL_H: f32 = 20.0;
 
 /// The 16 ANSI colors, ported from `TERMINAL_THEME_DARK`
@@ -171,12 +174,26 @@ pub struct KeyMods {
 /// Encode a GPUI keystroke into the bytes to `write()` to the PTY. Returns
 /// `None` for keys that shouldn't reach the shell (cmd-chords, unmapped keys).
 ///
-/// - Enter → `\r`, Backspace → `0x7f`, Tab → `\t`, Escape → `0x1b`, Space → ` `.
-/// - Arrows → CSI (`ESC [ A/B/C/D`); Home/End → `ESC [ H/F`.
+/// - Enter → `\r`; Shift/Option+Enter → `ESC \r` (Ink/Claude Code reads that
+///   as "insert newline" instead of "submit").
+/// - Backspace → `0x7f`, Tab → `\t`, Escape → `0x1b`, Space → ` `.
+/// - Shift+Tab → `ESC [ Z` (backtab — Claude Code cycles modes with it).
+/// - Option+Backspace → `ESC 0x7f` (delete word); Ctrl+Space → NUL.
+/// - Arrows/Home/End → CSI (`ESC [ A…`), or SS3 (`ESC O A…`) when the app
+///   switched on DECCKM (`app_cursor`, e.g. full-screen TUIs). With
+///   Shift/Option/Ctrl held they use the xterm modified form
+///   (`ESC [ 1 ; m A…`, m = 1 + shift·1 + alt·2 + ctrl·4).
+/// - Delete → `ESC [ 3~` (`ESC [ 3 ; m ~` modified); PageUp/PageDown →
+///   `ESC [ 5~`/`ESC [ 6~`.
 /// - Ctrl+letter → the C0 control code (`Ctrl+C` → `0x03`).
 /// - Otherwise the printable `key_char` (which already reflects Shift), else a
 ///   single-character `key`.
-pub fn key_to_bytes(key: &str, key_char: Option<&str>, mods: KeyMods) -> Option<Vec<u8>> {
+pub fn key_to_bytes(
+    key: &str,
+    key_char: Option<&str>,
+    mods: KeyMods,
+    app_cursor: bool,
+) -> Option<Vec<u8>> {
     // cmd-chords (copy/paste/etc.) are app-level, not shell input.
     if mods.platform {
         return None;
@@ -190,18 +207,40 @@ pub fn key_to_bytes(key: &str, key_char: Option<&str>, mods: KeyMods) -> Option<
         }
     }
 
+    // DECCKM: cursor keys switch from CSI to SS3 encoding.
+    let pre = if app_cursor { b'O' } else { b'[' };
+    // xterm modifier parameter: 1 + shift·1 + alt·2 + ctrl·4 (1 = no modifier).
+    let modc = 1 + (mods.shift as u8) + ((mods.alt as u8) << 1) + ((mods.control as u8) << 2);
     match key {
+        "enter" if mods.shift || mods.alt => return Some(b"\x1b\r".to_vec()),
         "enter" => return Some(vec![b'\r']),
+        "backspace" if mods.alt => return Some(vec![0x1b, 0x7f]),
         "backspace" => return Some(vec![0x7f]),
+        "tab" if mods.shift => return Some(b"\x1b[Z".to_vec()),
         "tab" => return Some(vec![b'\t']),
         "escape" => return Some(vec![0x1b]),
+        "space" if mods.control => return Some(vec![0x00]),
         "space" => return Some(vec![b' ']),
-        "up" => return Some(b"\x1b[A".to_vec()),
-        "down" => return Some(b"\x1b[B".to_vec()),
-        "right" => return Some(b"\x1b[C".to_vec()),
-        "left" => return Some(b"\x1b[D".to_vec()),
-        "home" => return Some(b"\x1b[H".to_vec()),
-        "end" => return Some(b"\x1b[F".to_vec()),
+        "up" | "down" | "right" | "left" | "home" | "end" => {
+            let ch = match key {
+                "up" => b'A',
+                "down" => b'B',
+                "right" => b'C',
+                "left" => b'D',
+                "home" => b'H',
+                _ => b'F',
+            };
+            // Modified cursor keys always use the CSI form, even under DECCKM.
+            return Some(if modc > 1 {
+                format!("\x1b[1;{}{}", modc, ch as char).into_bytes()
+            } else {
+                vec![0x1b, pre, ch]
+            });
+        }
+        "delete" if modc > 1 => return Some(format!("\x1b[3;{modc}~").into_bytes()),
+        "delete" => return Some(b"\x1b[3~".to_vec()),
+        "pageup" => return Some(b"\x1b[5~".to_vec()),
+        "pagedown" => return Some(b"\x1b[6~".to_vec()),
         _ => {}
     }
 
@@ -219,6 +258,103 @@ pub fn key_to_bytes(key: &str, key_char: Option<&str>, mods: KeyMods) -> Option<
     None
 }
 
+/// Encode clipboard text for the PTY (⌘V). Newlines become `\r` (what a
+/// terminal keyboard sends); in bracketed-paste mode the text is wrapped in
+/// `ESC [ 200~` … `ESC [ 201~` with any embedded `ESC` stripped so the paste
+/// can't forge the closing marker (or any other control sequence).
+pub fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
+    let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
+    if bracketed {
+        let clean: String = normalized.chars().filter(|&c| c != '\x1b').collect();
+        let mut out = b"\x1b[200~".to_vec();
+        out.extend_from_slice(clean.as_bytes());
+        out.extend_from_slice(b"\x1b[201~");
+        out
+    } else {
+        normalized.into_bytes()
+    }
+}
+
+/// A mouse selection over the terminal grid, in logical (row, col) cells of the
+/// combined `scrollback ++ viewport` buffer (row 0 = oldest scrollback line).
+/// `anchor` is where the drag started, `head` where it currently is; either may
+/// come first in the buffer. Both endpoints are inclusive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TermSelection {
+    pub anchor: (usize, usize),
+    pub head: (usize, usize),
+}
+
+impl TermSelection {
+    /// (start, end) in buffer order, both inclusive.
+    pub fn ordered(&self) -> ((usize, usize), (usize, usize)) {
+        if self.anchor <= self.head {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
+    }
+
+    /// The inclusive column range this selection covers on logical `row` (a row
+    /// of `cols` cells), or `None` when the row is outside the selection.
+    /// Interior rows of a multi-row selection are covered edge to edge.
+    pub fn row_range(&self, row: usize, cols: usize) -> Option<(usize, usize)> {
+        let (a, b) = self.ordered();
+        if row < a.0 || row > b.0 || cols == 0 {
+            return None;
+        }
+        let c0 = if row == a.0 { a.1 } else { 0 };
+        let c1 = if row == b.0 { b.1.min(cols - 1) } else { cols - 1 };
+        (c0 <= c1).then_some((c0, c1))
+    }
+}
+
+/// Extract the selected cells as plain text: one line per logical row, each
+/// trimmed of trailing whitespace (grid rows are space-padded to `cols`), joined
+/// with `\n`.
+pub fn selection_text(snap: &GridSnapshot, sel: &TermSelection) -> String {
+    let n = snap.scrollback.len();
+    let (a, b) = sel.ordered();
+    let mut lines = Vec::new();
+    for row in a.0..=b.0 {
+        let cells = if row < n {
+            snap.scrollback.get(row)
+        } else {
+            snap.cells.get(row - n)
+        };
+        let Some(cells) = cells else { break };
+        let Some((c0, c1)) = sel.row_range(row, cells.len()) else { continue };
+        let line: String = cells[c0..=c1].iter().map(|c| c.ch).collect();
+        lines.push(line.trim_end().to_string());
+    }
+    lines.join("\n")
+}
+
+/// Map a mouse position (already relative to the grid origin) to the logical
+/// (row, col) cell under it, clamped to the `rows`×`cols` window starting at
+/// logical row `top`.
+pub fn hit_cell(x: f32, y: f32, cell_w: f32, top: usize, rows: usize, cols: usize) -> (usize, usize) {
+    let col = ((x / cell_w).floor().max(0.0) as usize).min(cols.saturating_sub(1));
+    let disp = ((y / CELL_H).floor().max(0.0) as usize).min(rows.saturating_sub(1));
+    (top + disp, col)
+}
+
+/// Selection wash strength: the selected cells' bg is blended 25% toward the
+/// theme accent (the editor uses a 15% accent wash; the terminal needs a bit
+/// more to read over colored program output).
+const SEL_ALPHA: f32 = 0.25;
+
+/// Blend `over` onto `base` (both `0xRRGGBB`) at alpha `a`, returning opaque
+/// `0xRRGGBB` (runs render solid colors, so the wash is pre-composited).
+fn blend(base: u32, over: u32, a: f32) -> u32 {
+    let ch = |shift: u32| {
+        let b = ((base >> shift) & 0xff) as f32;
+        let o = ((over >> shift) & 0xff) as f32;
+        (b + (o - b) * a) as u32 & 0xff
+    };
+    (ch(16) << 16) | (ch(8) << 8) | ch(0)
+}
+
 /// A maximal run of adjacent cells sharing fg/bg/weight — rendered as one span
 /// so a row is a handful of divs, not one-per-column.
 struct Run {
@@ -228,10 +364,20 @@ struct Run {
     bold: bool,
 }
 
-fn row_runs(cells: &[Cell], def_fg: u32, def_bg: u32, palette: &[u32; 16]) -> Vec<Run> {
+fn row_runs(
+    cells: &[Cell],
+    def_fg: u32,
+    def_bg: u32,
+    palette: &[u32; 16],
+    sel: Option<(usize, usize)>,
+    sel_tint: u32,
+) -> Vec<Run> {
     let mut runs: Vec<Run> = Vec::new();
-    for cell in cells {
-        let (fg, bg) = cell_colors_pal(cell, def_fg, def_bg, palette);
+    for (i, cell) in cells.iter().enumerate() {
+        let (fg, mut bg) = cell_colors_pal(cell, def_fg, def_bg, palette);
+        if sel.is_some_and(|(c0, c1)| i >= c0 && i <= c1) {
+            bg = blend(bg, sel_tint, SEL_ALPHA);
+        }
         let bold = cell.flags.bold;
         match runs.last_mut() {
             Some(r) if r.fg == fg && r.bg == bg && r.bold == bold => r.text.push(cell.ch),
@@ -248,11 +394,22 @@ fn row_runs(cells: &[Cell], def_fg: u32, def_bg: u32, palette: &[u32; 16]) -> Ve
 
 /// Render the terminal body: a resize-measuring canvas underlay plus the grid
 /// rows. Focusable so `on_key_down` reaches [`key_to_bytes`] → `write()`.
-pub fn render(app: &JadeApp, handle: FocusHandle, _cx: &mut Context<JadeApp>) -> impl IntoElement {
+pub fn render(app: &JadeApp, handle: FocusHandle, cx: &mut Context<JadeApp>) -> impl IntoElement {
     let theme = app.theme.clone();
     let def_fg = theme.text;
     let def_bg = theme.bg;
     let palette = ansi_palette(theme.is_light);
+
+    // Measure the mono font's real advance so the cols reported to the PTY
+    // match what the rows actually render at (a hardcoded width drifts per
+    // font, and TUIs right-align/rule against the reported width).
+    let font = gpui::font(crate::fonts::mono_family());
+    let font_id = cx.text_system().resolve_font(&font);
+    let cell_w = cx
+        .text_system()
+        .advance(font_id, px(FONT_SIZE), 'M')
+        .map(|a| f32::from(a.width))
+        .unwrap_or(CELL_W);
 
     let body = div()
         .id("terminal-body")
@@ -263,23 +420,65 @@ pub fn render(app: &JadeApp, handle: FocusHandle, _cx: &mut Context<JadeApp>) ->
         .bg(rgb(theme.bg))
         .track_focus(&handle)
         .font_family(crate::fonts::mono_family())
-        .text_size(px(12.))
+        .text_size(px(FONT_SIZE))
         .line_height(px(CELL_H));
 
-    // Focus on click so keystrokes flow to this panel.
+    // Focus on click so keystrokes flow to this panel, and start a mouse
+    // selection at the cell under the cursor (drag extends it, ⌘C copies).
     let focus = handle.clone();
-    let body = body.on_mouse_down(
+    let origin_down = app.term_origin.clone();
+    let body = body.cursor_text().on_mouse_down(
         MouseButton::Left,
-        move |_ev, window, cx| {
+        cx.listener(move |app: &mut JadeApp, ev: &MouseDownEvent, window, cx| {
             window.focus(&focus, cx);
-        },
+            if let Some(cell) = cell_at(app, &origin_down, cell_w, ev.position) {
+                app.term_sel = Some(TermSelection { anchor: cell, head: cell });
+                app.term_sel_dragging = true;
+                cx.notify();
+            }
+        }),
     );
 
-    // Keystrokes → PTY bytes (captures the manager + id; no app state needed).
-    let manager = app.term.clone();
-    let key_id = app.term_id;
-    let body = body.on_key_down(move |ev, _window, _cx| {
-        let Some(id) = key_id else { return };
+    // Drag extends the selection head; releasing the button ends the drag, and
+    // a plain click (no movement past the start cell) leaves no selection.
+    let origin_move = app.term_origin.clone();
+    let body = body.on_mouse_move(cx.listener(
+        move |app: &mut JadeApp, ev: &MouseMoveEvent, _w, cx| {
+            if !app.term_sel_dragging {
+                return;
+            }
+            if ev.pressed_button != Some(MouseButton::Left) {
+                app.term_sel_dragging = false;
+                return;
+            }
+            let cell = cell_at(app, &origin_move, cell_w, ev.position);
+            if let (Some(cell), Some(sel)) = (cell, app.term_sel.as_mut()) {
+                if sel.head != cell {
+                    sel.head = cell;
+                    cx.notify();
+                }
+            }
+        },
+    ));
+    let body = body.on_mouse_up(
+        MouseButton::Left,
+        cx.listener(|app: &mut JadeApp, _ev: &MouseUpEvent, _w, cx| {
+            if app.term_sel_dragging {
+                app.term_sel_dragging = false;
+                if app.term_sel.is_some_and(|s| s.anchor == s.head) {
+                    app.term_sel = None;
+                }
+                cx.notify();
+            }
+        }),
+    );
+
+    // Keystrokes → PTY bytes. The terminal modes ride along from the latest
+    // snapshot: DECCKM flips the arrow-key encoding, bracketed paste wraps ⌘V
+    // payloads. Any keystroke also pins the view back to the live bottom (like
+    // every terminal: typing jumps you out of scrollback).
+    let body = body.on_key_down(cx.listener(|app: &mut JadeApp, ev: &gpui::KeyDownEvent, _window, cx| {
+        let Some(id) = app.term_id else { return };
         let ks = &ev.keystroke;
         let mods = KeyMods {
             control: ks.modifiers.control,
@@ -287,17 +486,115 @@ pub fn render(app: &JadeApp, handle: FocusHandle, _cx: &mut Context<JadeApp>) ->
             shift: ks.modifiers.shift,
             platform: ks.modifiers.platform,
         };
-        if let Some(bytes) = key_to_bytes(&ks.key, ks.key_char.as_deref(), mods) {
-            manager.write(id, &bytes);
+        let bracketed = app.term_snapshot.as_ref().is_some_and(|s| s.bracketed_paste);
+        let app_cursor = app.term_snapshot.as_ref().is_some_and(|s| s.app_cursor);
+        // ⌘C copies the mouse selection (Ctrl+C stays the shell interrupt).
+        if mods.platform && ks.key == "c" {
+            if let (Some(sel), Some(snap)) = (app.term_sel, app.term_snapshot.as_ref()) {
+                let text = selection_text(snap, &sel);
+                if !text.is_empty() {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                }
+            }
+            return;
         }
-    });
+        // ⌘V pastes into the shell (Claude Code and any REPL need this).
+        if mods.platform && ks.key == "v" {
+            if let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) {
+                app.term.write(id, &paste_bytes(&text, bracketed));
+                app.term_scroll_back = 0;
+                app.term_sel = None;
+                cx.notify();
+            }
+            return;
+        }
+        if let Some(bytes) = key_to_bytes(&ks.key, ks.key_char.as_deref(), mods, app_cursor) {
+            app.term.write(id, &bytes);
+            app.term_scroll_back = 0;
+            app.term_sel = None;
+            cx.notify();
+        }
+    }));
+
+    // Scroll wheel walks up/down through the scrollback window. One wheel line
+    // is one grid row; clamped to the available scrollback at render time.
+    let scroll_max = app
+        .term_snapshot
+        .as_ref()
+        .map(|s| s.scrollback.len())
+        .unwrap_or(0);
+    let body = body.on_scroll_wheel(cx.listener(move |app: &mut JadeApp, ev: &ScrollWheelEvent, _w, cx| {
+        let dy = match ev.delta {
+            ScrollDelta::Lines(p) => p.y,
+            ScrollDelta::Pixels(p) => f32::from(p.y) / CELL_H,
+        };
+        // Wheel-up (positive dy) reveals older lines; wheel-down returns to live.
+        let rows = dy.round() as i64;
+        let next = (app.term_scroll_back as i64 + rows).clamp(0, scroll_max as i64);
+        if next != app.term_scroll_back as i64 {
+            app.term_scroll_back = next as usize;
+            cx.notify();
+        }
+    }));
 
     // Resize underlay: derive cols×rows from bounds, resize only on change.
-    let resize = resize_canvas(app.term.clone(), app.term_id, app.term_last_size.clone());
+    let resize = resize_canvas(
+        app.term.clone(),
+        app.term_id,
+        app.term_last_size.clone(),
+        app.term_origin.clone(),
+        cell_w,
+    );
 
     let mut grid = div().absolute().top_0().left_0().flex().flex_col();
+    let mut cursor_block = None;
     if let Some(snap) = &app.term_snapshot {
-        grid = render_grid(grid, snap, def_fg, def_bg, palette);
+        // Window `rows` display lines out of `scrollback ++ cells`, offset up
+        // from the live bottom by `term_scroll_back` (clamped). At offset 0 the
+        // window is exactly the viewport; scrolling up reveals scrollback.
+        let n = snap.scrollback.len();
+        let rows = snap.rows;
+        let back = app.term_scroll_back.min(n);
+        // Logical index of the first displayed row (0 = oldest scrollback line).
+        let top = n.saturating_sub(back);
+        grid = render_window(
+            grid,
+            snap,
+            top,
+            rows,
+            def_fg,
+            def_bg,
+            palette,
+            app.term_sel,
+            theme.accent,
+        );
+        // Block cursor: fg-colored cell with the covered glyph in bg color.
+        // Ink/Claude Code position the real cursor in the input box; without
+        // this there is no visible caret at all. Its display row shifts down by
+        // the scrollback offset, and it hides once scrolled off the top.
+        if snap.cursor.visible && !app.term_exited {
+            let cur = snap.cursor;
+            let disp_row = cur.line as isize + back as isize;
+            if disp_row >= 0 && (disp_row as usize) < rows {
+                let ch = snap
+                    .cells
+                    .get(cur.line)
+                    .and_then(|row| row.get(cur.col))
+                    .map(|c| c.ch)
+                    .unwrap_or(' ');
+                cursor_block = Some(
+                    div()
+                        .absolute()
+                        .left(px(cur.col as f32 * cell_w))
+                        .top(px(disp_row as f32 * CELL_H))
+                        .w(px(cell_w))
+                        .h(px(CELL_H))
+                        .bg(rgb(def_fg))
+                        .text_color(rgb(def_bg))
+                        .child(ch.to_string()),
+                );
+            }
+        }
     }
     if app.term_exited {
         let code = app
@@ -311,22 +608,71 @@ pub fn render(app: &JadeApp, handle: FocusHandle, _cx: &mut Context<JadeApp>) ->
         );
     }
 
-    body.child(resize).child(grid)
+    body.child(resize).child(grid).children(cursor_block)
 }
 
-fn render_grid(mut grid: Div, snap: &GridSnapshot, def_fg: u32, def_bg: u32, palette: &[u32; 16]) -> Div {
-    for row in &snap.cells {
-        let runs = row_runs(row, def_fg, def_bg, palette);
+/// Map a window-space mouse position to the logical cell under it, using the
+/// grid origin the resize canvas recorded (`term_origin`) and the same window
+/// placement math as the renderer. `None` before the first snapshot.
+fn cell_at(
+    app: &JadeApp,
+    origin: &Arc<AtomicU64>,
+    cell_w: f32,
+    pos: gpui::Point<Pixels>,
+) -> Option<(usize, usize)> {
+    let snap = app.term_snapshot.as_ref()?;
+    let packed = origin.load(Ordering::Relaxed);
+    let ox = f32::from_bits((packed >> 32) as u32);
+    let oy = f32::from_bits(packed as u32);
+    let n = snap.scrollback.len();
+    let top = n - app.term_scroll_back.min(n);
+    Some(hit_cell(
+        f32::from(pos.x) - ox,
+        f32::from(pos.y) - oy,
+        cell_w,
+        top,
+        snap.rows,
+        snap.cols,
+    ))
+}
+
+/// Render `count` display rows starting at logical index `top` of the combined
+/// `scrollback ++ cells` buffer (0 = oldest scrollback line). Rows past the end
+/// of the viewport render blank (the buffer never has fewer than the viewport).
+/// Cells inside `sel` get their bg washed toward `sel_tint` (see [`SEL_ALPHA`]).
+#[allow(clippy::too_many_arguments)]
+fn render_window(
+    mut grid: Div,
+    snap: &GridSnapshot,
+    top: usize,
+    count: usize,
+    def_fg: u32,
+    def_bg: u32,
+    palette: &[u32; 16],
+    sel: Option<TermSelection>,
+    sel_tint: u32,
+) -> Div {
+    let n = snap.scrollback.len();
+    for i in 0..count {
+        let idx = top + i;
+        let row = if idx < n {
+            snap.scrollback.get(idx)
+        } else {
+            snap.cells.get(idx - n)
+        };
         let mut line = div().flex().flex_row().h(px(CELL_H)).items_center();
-        for r in runs {
-            let mut span = div().text_color(rgb(r.fg)).child(r.text);
-            if r.bg != def_bg {
-                span = span.bg(rgb(r.bg));
+        if let Some(row) = row {
+            let row_sel = sel.and_then(|s| s.row_range(idx, row.len()));
+            for r in row_runs(row, def_fg, def_bg, palette, row_sel, sel_tint) {
+                let mut span = div().text_color(rgb(r.fg)).child(r.text);
+                if r.bg != def_bg {
+                    span = span.bg(rgb(r.bg));
+                }
+                if r.bold {
+                    span = span.font_weight(FontWeight::BOLD);
+                }
+                line = line.child(span);
             }
-            if r.bold {
-                span = span.font_weight(FontWeight::BOLD);
-            }
-            line = line.child(span);
         }
         grid = grid.child(line);
     }
@@ -337,17 +683,25 @@ fn resize_canvas(
     manager: Arc<TermManager>,
     id: Option<TermId>,
     last: Arc<AtomicU32>,
+    origin: Arc<AtomicU64>,
+    cell_w: f32,
 ) -> impl IntoElement {
     canvas(
         move |_, _, _| {},
         move |bounds: Bounds<Pixels>, _, _window, _| {
+            // Record the grid origin in window px so the mouse-selection
+            // listeners can map event positions to cells (the canvas fills the
+            // body, and the grid is painted from its top-left).
+            let ox = f32::from(bounds.origin.x).to_bits() as u64;
+            let oy = f32::from(bounds.origin.y).to_bits() as u64;
+            origin.store((ox << 32) | oy, Ordering::Relaxed);
             let Some(id) = id else { return };
             let w = f32::from(bounds.size.width);
             let h = f32::from(bounds.size.height);
             if w <= 0.0 || h <= 0.0 {
                 return;
             }
-            let cols = ((w / CELL_W).floor() as u16).max(2);
+            let cols = ((w / cell_w).floor() as u16).max(2);
             let rows = ((h / CELL_H).floor() as u16).max(2);
             let packed = ((cols as u32) << 16) | rows as u32;
             // Resize only when the derived geometry actually changed, so the
@@ -412,20 +766,58 @@ mod tests {
     #[test]
     fn key_encoding_specials() {
         let m = KeyMods::default();
-        assert_eq!(key_to_bytes("enter", Some("\n"), m), Some(vec![b'\r']));
-        assert_eq!(key_to_bytes("backspace", None, m), Some(vec![0x7f]));
-        assert_eq!(key_to_bytes("tab", Some("\t"), m), Some(vec![b'\t']));
-        assert_eq!(key_to_bytes("escape", None, m), Some(vec![0x1b]));
-        assert_eq!(key_to_bytes("space", Some(" "), m), Some(vec![b' ']));
+        assert_eq!(key_to_bytes("enter", Some("\n"), m, false), Some(vec![b'\r']));
+        assert_eq!(key_to_bytes("backspace", None, m, false), Some(vec![0x7f]));
+        assert_eq!(key_to_bytes("tab", Some("\t"), m, false), Some(vec![b'\t']));
+        assert_eq!(key_to_bytes("escape", None, m, false), Some(vec![0x1b]));
+        assert_eq!(key_to_bytes("space", Some(" "), m, false), Some(vec![b' ']));
+        assert_eq!(key_to_bytes("delete", None, m, false), Some(b"\x1b[3~".to_vec()));
+        assert_eq!(key_to_bytes("pageup", None, m, false), Some(b"\x1b[5~".to_vec()));
+        assert_eq!(key_to_bytes("pagedown", None, m, false), Some(b"\x1b[6~".to_vec()));
+    }
+
+    #[test]
+    fn key_encoding_modified_specials() {
+        let shift = KeyMods { shift: true, ..Default::default() };
+        let alt = KeyMods { alt: true, ..Default::default() };
+        let ctrl = KeyMods { control: true, ..Default::default() };
+        // Shift+Tab is backtab (CSI Z) — Claude Code cycles its modes with it.
+        assert_eq!(key_to_bytes("tab", None, shift, false), Some(b"\x1b[Z".to_vec()));
+        // Option+Backspace deletes the previous word (ESC DEL).
+        assert_eq!(key_to_bytes("backspace", None, alt, false), Some(vec![0x1b, 0x7f]));
+        // Ctrl+Space is NUL (readline set-mark, tmux default prefix alt).
+        assert_eq!(key_to_bytes("space", None, ctrl, false), Some(vec![0x00]));
+        // Modified arrows use the xterm form, even under DECCKM.
+        assert_eq!(key_to_bytes("up", None, shift, false), Some(b"\x1b[1;2A".to_vec()));
+        assert_eq!(key_to_bytes("left", None, alt, true), Some(b"\x1b[1;3D".to_vec()));
+        assert_eq!(key_to_bytes("right", None, ctrl, false), Some(b"\x1b[1;5C".to_vec()));
+        let ctrl_shift = KeyMods { control: true, shift: true, ..Default::default() };
+        assert_eq!(key_to_bytes("end", None, ctrl_shift, false), Some(b"\x1b[1;6F".to_vec()));
+        // Modified forward-delete.
+        assert_eq!(key_to_bytes("delete", None, shift, false), Some(b"\x1b[3;2~".to_vec()));
+    }
+
+    #[test]
+    fn shift_or_alt_enter_is_newline() {
+        // Ink/Claude Code treat ESC CR as "insert newline, don't submit".
+        let shift = KeyMods { shift: true, ..Default::default() };
+        let alt = KeyMods { alt: true, ..Default::default() };
+        assert_eq!(key_to_bytes("enter", Some("\n"), shift, false), Some(b"\x1b\r".to_vec()));
+        assert_eq!(key_to_bytes("enter", Some("\n"), alt, false), Some(b"\x1b\r".to_vec()));
     }
 
     #[test]
     fn key_encoding_arrows() {
         let m = KeyMods::default();
-        assert_eq!(key_to_bytes("up", None, m), Some(b"\x1b[A".to_vec()));
-        assert_eq!(key_to_bytes("down", None, m), Some(b"\x1b[B".to_vec()));
-        assert_eq!(key_to_bytes("right", None, m), Some(b"\x1b[C".to_vec()));
-        assert_eq!(key_to_bytes("left", None, m), Some(b"\x1b[D".to_vec()));
+        assert_eq!(key_to_bytes("up", None, m, false), Some(b"\x1b[A".to_vec()));
+        assert_eq!(key_to_bytes("down", None, m, false), Some(b"\x1b[B".to_vec()));
+        assert_eq!(key_to_bytes("right", None, m, false), Some(b"\x1b[C".to_vec()));
+        assert_eq!(key_to_bytes("left", None, m, false), Some(b"\x1b[D".to_vec()));
+        // DECCKM (application cursor keys) switches to SS3.
+        assert_eq!(key_to_bytes("up", None, m, true), Some(b"\x1bOA".to_vec()));
+        assert_eq!(key_to_bytes("down", None, m, true), Some(b"\x1bOB".to_vec()));
+        assert_eq!(key_to_bytes("home", None, m, true), Some(b"\x1bOH".to_vec()));
+        assert_eq!(key_to_bytes("end", None, m, true), Some(b"\x1bOF".to_vec()));
     }
 
     #[test]
@@ -434,19 +826,30 @@ mod tests {
             control: true,
             ..Default::default()
         };
-        assert_eq!(key_to_bytes("c", Some("c"), ctrl), Some(vec![0x03])); // Ctrl+C
-        assert_eq!(key_to_bytes("d", Some("d"), ctrl), Some(vec![0x04])); // Ctrl+D
+        assert_eq!(key_to_bytes("c", Some("c"), ctrl, false), Some(vec![0x03])); // Ctrl+C
+        assert_eq!(key_to_bytes("d", Some("d"), ctrl, false), Some(vec![0x04])); // Ctrl+D
 
         let m = KeyMods::default();
-        assert_eq!(key_to_bytes("a", Some("a"), m), Some(b"a".to_vec()));
-        assert_eq!(key_to_bytes("!", Some("!"), m), Some(b"!".to_vec())); // shifted char
+        assert_eq!(key_to_bytes("a", Some("a"), m, false), Some(b"a".to_vec()));
+        assert_eq!(key_to_bytes("!", Some("!"), m, false), Some(b"!".to_vec())); // shifted char
 
         // cmd-chords are not shell input.
         let cmd = KeyMods {
             platform: true,
             ..Default::default()
         };
-        assert_eq!(key_to_bytes("c", Some("c"), cmd), None);
+        assert_eq!(key_to_bytes("c", Some("c"), cmd, false), None);
+    }
+
+    #[test]
+    fn paste_encoding() {
+        // Plain paste: newlines become CR, like a terminal keyboard.
+        assert_eq!(paste_bytes("ab\ncd\r\nef", false), b"ab\rcd\ref".to_vec());
+        // Bracketed paste wraps and strips embedded ESC (marker forgery).
+        assert_eq!(
+            paste_bytes("hi\x1b[201~there\n!", true),
+            b"\x1b[200~hi[201~there\r!\x1b[201~".to_vec()
+        );
     }
 
     #[test]
@@ -456,10 +859,93 @@ mod tests {
             cell('b', Color::Named(1), Color::Default, false),
             cell('c', Color::Named(2), Color::Default, false),
         ];
-        let runs = row_runs(&cells, TERM_DEFAULT_FG, TERM_DEFAULT_BG, &ANSI_DARK);
+        let runs = row_runs(&cells, TERM_DEFAULT_FG, TERM_DEFAULT_BG, &ANSI_DARK, None, 0);
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[0].text, "ab");
         assert_eq!(runs[1].text, "c");
+    }
+
+    #[test]
+    fn selection_splits_runs_with_washed_bg() {
+        let cells = vec![
+            cell('a', Color::Default, Color::Default, false),
+            cell('b', Color::Default, Color::Default, false),
+            cell('c', Color::Default, Color::Default, false),
+        ];
+        let tint = 0x56B389;
+        let runs = row_runs(
+            &cells,
+            TERM_DEFAULT_FG,
+            TERM_DEFAULT_BG,
+            &ANSI_DARK,
+            Some((1, 1)),
+            tint,
+        );
+        // 'a' | selected 'b' | 'c' — the selected run's bg is the blend.
+        assert_eq!(runs.len(), 3);
+        assert_eq!(runs[0].bg, TERM_DEFAULT_BG);
+        assert_eq!(runs[1].bg, blend(TERM_DEFAULT_BG, tint, SEL_ALPHA));
+        assert_ne!(runs[1].bg, TERM_DEFAULT_BG);
+        assert_eq!(runs[2].bg, TERM_DEFAULT_BG);
+    }
+
+    fn text_row(s: &str, cols: usize) -> Vec<Cell> {
+        let mut row: Vec<Cell> = s
+            .chars()
+            .map(|ch| cell(ch, Color::Default, Color::Default, false))
+            .collect();
+        row.resize(cols, cell(' ', Color::Default, Color::Default, false));
+        row
+    }
+
+    fn snap_with(scrollback: &[&str], viewport: &[&str], cols: usize) -> GridSnapshot {
+        GridSnapshot {
+            cols,
+            rows: viewport.len(),
+            cursor: forge_term::Cursor { col: 0, line: 0, visible: false },
+            cells: viewport.iter().map(|s| text_row(s, cols)).collect(),
+            scrollback: scrollback.iter().map(|s| text_row(s, cols)).collect(),
+            app_cursor: false,
+            bracketed_paste: false,
+        }
+    }
+
+    #[test]
+    fn selection_row_range() {
+        // Backwards drag (head before anchor) normalizes.
+        let sel = TermSelection { anchor: (2, 3), head: (0, 5) };
+        assert_eq!(sel.row_range(0, 10), Some((5, 9))); // first row: head col → edge
+        assert_eq!(sel.row_range(1, 10), Some((0, 9))); // interior: full width
+        assert_eq!(sel.row_range(2, 10), Some((0, 3))); // last row: edge → anchor col
+        assert_eq!(sel.row_range(3, 10), None); // outside
+        // Single-row selection.
+        let sel = TermSelection { anchor: (1, 4), head: (1, 2) };
+        assert_eq!(sel.row_range(1, 10), Some((2, 4)));
+    }
+
+    #[test]
+    fn selection_text_spans_scrollback_and_viewport() {
+        let snap = snap_with(&["old line"], &["hello world", "second"], 12);
+        // From scrollback col 4 through viewport row 0 col 4 (inclusive).
+        let sel = TermSelection { anchor: (0, 4), head: (1, 4) };
+        assert_eq!(selection_text(&snap, &sel), "line\nhello");
+        // Trailing pad cells are trimmed on full-width interior rows.
+        let sel = TermSelection { anchor: (0, 0), head: (2, 5) };
+        assert_eq!(selection_text(&snap, &sel), "old line\nhello world\nsecond");
+        // Backwards drag yields the same text.
+        let rev = TermSelection { anchor: (2, 5), head: (0, 0) };
+        assert_eq!(selection_text(&snap, &rev), "old line\nhello world\nsecond");
+    }
+
+    #[test]
+    fn hit_cell_maps_and_clamps() {
+        // 8px cells, 20px rows, window starting at logical row 10, 24×80 grid.
+        assert_eq!(hit_cell(0.0, 0.0, 8.0, 10, 24, 80), (10, 0));
+        assert_eq!(hit_cell(17.0, 45.0, 8.0, 10, 24, 80), (12, 2));
+        // Negative (above/left of the grid) clamps to the window start.
+        assert_eq!(hit_cell(-5.0, -5.0, 8.0, 10, 24, 80), (10, 0));
+        // Past the right/bottom edge clamps to the last cell.
+        assert_eq!(hit_cell(10_000.0, 10_000.0, 8.0, 10, 24, 80), (33, 79));
     }
 
     #[test]

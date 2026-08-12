@@ -110,13 +110,26 @@ impl GhostCache {
 /// Post-process raw model output into the ghost text to paint, or `None` to
 /// suppress it (TS `postProcess`, :53-73). Steps, in order:
 ///   1. strip `\r`,
-///   2. truncate at the first blank line (`\n[ \t]*\n`),
-///   3. cap to `max_lines` lines,
-///   4. strip trailing whitespace,
-///   5. drop a trailing duplicate of the trimmed text after the cursor,
-///   6. suppress if only whitespace remains.
+///   2. drop leading blank lines (so a suggestion the model prefixed with an
+///      empty line still shows real content on the ghost's first row),
+///   3. truncate at the first blank line (`\n[ \t]*\n`),
+///   4. cap to `max_lines` lines,
+///   5. strip trailing whitespace,
+///   6. drop a trailing duplicate of the trimmed text after the cursor,
+///   7. suppress if only whitespace remains.
 pub fn post_process(raw: &str, line_suffix: &str, max_lines: usize) -> Option<String> {
     let mut text: String = raw.replace('\r', "");
+
+    // Drop leading whitespace-only lines. Right after Enter, FIM models often
+    // emit a blank line before their code; without this the ghost's first
+    // rendered line would be empty and read as "no suggestion".
+    while let Some(nl) = text.find('\n') {
+        if text[..nl].trim().is_empty() {
+            text.drain(..=nl);
+        } else {
+            break;
+        }
+    }
 
     // Stop at the first blank line — beyond it the model is usually rambling.
     if let Some(idx) = find_blank_line(&text) {
@@ -143,6 +156,14 @@ pub fn post_process(raw: &str, line_suffix: &str, max_lines: usize) -> Option<St
         text = text.trim_end().to_string();
     }
 
+    // Degenerate repetition (`1000000000000…`, a small-model decode failure)
+    // means the whole candidate is garbage — drop it entirely, mirroring
+    // FLCC's post-decode low-score candidate elimination (arXiv 2405.08704).
+    // Whitespace runs are exempt: indentation legitimately repeats.
+    if has_char_run(&text, 12) {
+        return None;
+    }
+
     // Suppress empty (JS `text.trim() ? text : null` — returns the *untrimmed*
     // text when non-empty, preserving any leading indentation).
     if text.trim().is_empty() {
@@ -150,6 +171,30 @@ pub fn post_process(raw: &str, line_suffix: &str, max_lines: usize) -> Option<St
     } else {
         Some(text)
     }
+}
+
+/// True when `s` contains a run of at least `n` identical consecutive
+/// non-whitespace chars (the repetition-blowup detector for [`post_process`]).
+fn has_char_run(s: &str, n: usize) -> bool {
+    let mut prev = None;
+    let mut run = 0usize;
+    for c in s.chars() {
+        if c.is_whitespace() {
+            prev = None;
+            run = 0;
+            continue;
+        }
+        if Some(c) == prev {
+            run += 1;
+            if run >= n {
+                return true;
+            }
+        } else {
+            prev = Some(c);
+            run = 1;
+        }
+    }
+    false
 }
 
 /// The byte index of the first `\n[ \t]*\n` blank-line separator (the position of
@@ -173,6 +218,47 @@ fn find_blank_line(s: &str) -> Option<usize> {
     None
 }
 
+/// The prefix of `text` a word-level partial accept inserts (JetBrains FLCC's
+/// "insert inline proposal word", Ctrl/Alt+Right): leading horizontal
+/// whitespace plus either one identifier run (`alnum`/`_`) or one run of other
+/// symbols. A leading newline is accepted alone (the break itself is the
+/// "word"). Returns the whole text when there is nothing left to split.
+pub fn first_word(text: &str) -> &str {
+    #[derive(PartialEq)]
+    enum S {
+        LeadWs,
+        Word,
+        Symbols,
+    }
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    let mut state = S::LeadWs;
+    for (i, c) in text.char_indices() {
+        match state {
+            S::LeadWs => {
+                if c == '\n' {
+                    return &text[..i + 1];
+                } else if c == ' ' || c == '\t' {
+                } else if is_word(c) {
+                    state = S::Word;
+                } else {
+                    state = S::Symbols;
+                }
+            }
+            S::Word => {
+                if !is_word(c) {
+                    return &text[..i];
+                }
+            }
+            S::Symbols => {
+                if is_word(c) || c.is_whitespace() {
+                    return &text[..i];
+                }
+            }
+        }
+    }
+    text
+}
+
 /// Take the last `max` chars of `s` (prefix cap, TS `fullPrefix.slice(-MAX)`).
 pub fn cap_prefix(s: &str, max: usize) -> String {
     let n = s.chars().count();
@@ -185,6 +271,31 @@ pub fn cap_prefix(s: &str, max: usize) -> String {
 /// Take the first `max` chars of `s` (suffix cap, TS `fullSuffix.slice(0, MAX)`).
 pub fn cap_suffix(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
+}
+
+/// Byte offset where `/infill`'s `input_suffix` starts for a caret at `caret`:
+/// the END of the caret's line, not the caret itself.
+///
+/// This is the model's contract, not a detail. `corpus/fim_pack.py` builds every
+/// training example as prefix = text up to the caret, middle = **the rest of
+/// that line**, suffix = **the newline and everything after it**. The text
+/// between the caret and the end of the line is the answer, so it is never in
+/// the suffix. `eval_fim.py` scores the model the same way.
+///
+/// Sending `full[caret..]` instead put that text in the suffix, a shape the
+/// model never saw in training, and the suggestions showed it: with the caret
+/// before existing text the model read its own suffix back out (suggesting a
+/// copy of the line already there), or completed a call it could see the end of
+/// with different arguments. Caret at end of line — the common case while
+/// typing — is unaffected, since there the two are the same string.
+///
+/// [`post_process`] then drops the part of the answer that duplicates
+/// `line_suffix`, which is why the model may safely regenerate the whole line.
+pub fn fim_suffix_start(full: &str, caret: usize) -> usize {
+    match full[caret..].find('\n') {
+        Some(offset) => caret + offset, // keep the '\n': training's suffix opens with it
+        None => full.len(),             // last line, no trailing newline
+    }
 }
 
 #[cfg(test)]
@@ -296,6 +407,61 @@ mod tests {
     }
 
     #[test]
+    fn post_process_drops_leading_blank_lines() {
+        // Right after Enter the model prefixes a blank line; the ghost should
+        // still start with real content (the indentation of the first real line
+        // is preserved).
+        assert_eq!(
+            post_process("\n    return 0;", "", 6).as_deref(),
+            Some("    return 0;")
+        );
+        // Multiple leading blanks (incl. whitespace-only) are all dropped.
+        assert_eq!(
+            post_process("\n \t\nfoo();", "", 6).as_deref(),
+            Some("foo();")
+        );
+        // A leading blank followed by a two-line body keeps both lines.
+        assert_eq!(
+            post_process("\na();\nb();", "", 6).as_deref(),
+            Some("a();\nb();")
+        );
+    }
+
+    #[test]
+    fn post_process_drops_repetition_blowups() {
+        // The 0.5B tier's observed failure mode: an unbounded digit run.
+        assert_eq!(
+            post_process("printf(\"%d\\n\", 1000000000000000000000);", "", 6),
+            None
+        );
+        // Short legitimate repeats survive…
+        assert_eq!(
+            post_process("x == 1000000;", "", 6).as_deref(),
+            Some("x == 1000000;")
+        );
+        // …and indentation (whitespace runs) is always exempt.
+        assert_eq!(
+            post_process("            deeply_indented();", "", 6).as_deref(),
+            Some("            deeply_indented();")
+        );
+    }
+
+    #[test]
+    fn first_word_splits_at_boundaries() {
+        // Identifier run, then the call punctuation.
+        assert_eq!(first_word("printf(\"hi\");"), "printf");
+        assert_eq!(first_word("(\"hi\");"), "(\"");
+        // Leading indent rides along with the first word.
+        assert_eq!(first_word("    return 0;"), "    return");
+        // Single word → everything.
+        assert_eq!(first_word("alpha"), "alpha");
+        // A leading line break is accepted alone.
+        assert_eq!(first_word("\n    foo();"), "\n");
+        // Symbol run stops at whitespace or identifier.
+        assert_eq!(first_word("+= 2;"), "+=");
+    }
+
+    #[test]
     fn cap_prefix_keeps_tail() {
         assert_eq!(cap_prefix("abcdef", 3), "def");
         assert_eq!(cap_prefix("ab", 3), "ab");
@@ -308,5 +474,36 @@ mod tests {
         assert_eq!(cap_suffix("abcdef", 3), "abc");
         assert_eq!(cap_suffix("ab", 3), "ab");
         assert_eq!(cap_suffix("αβγδ", 2), "αβ");
+    }
+
+    /// The `/infill` suffix must start at the end of the caret's line, matching
+    /// `corpus/fim_pack.py` (middle = rest of the line, suffix = the newline
+    /// onwards). Handing the line's tail to the model instead made it repeat
+    /// text that was already on screen.
+    #[test]
+    fn fim_suffix_starts_at_the_end_of_the_caret_line() {
+        let src = "int main() {\n    encoder->setBuffer(ABuffer, 0, 0);\n    return 0;\n}\n";
+        let caret = src.find("ABuffer").unwrap(); // just after `setBuffer(`
+
+        let start = fim_suffix_start(src, caret);
+        assert_eq!(
+            &src[start..],
+            "\n    return 0;\n}\n",
+            "the rest of the caret's line is the answer, so it stays out of the suffix"
+        );
+
+        // Caret already at end of line: the shape is unchanged from `full[caret..]`.
+        let eol = src.find('\n').unwrap();
+        assert_eq!(fim_suffix_start(src, eol), eol);
+
+        // Last line with no trailing newline: the suffix is empty, not a panic.
+        let tail = "int x = 1;";
+        assert_eq!(fim_suffix_start(tail, 5), tail.len());
+        assert_eq!(&tail[fim_suffix_start(tail, 5)..], "");
+
+        // Multi-byte characters before the caret must not shift the boundary.
+        let utf8 = "// αβγ done\nnext();\n";
+        let caret = utf8.find(" done").unwrap();
+        assert_eq!(&utf8[fim_suffix_start(utf8, caret)..], "\nnext();\n");
     }
 }

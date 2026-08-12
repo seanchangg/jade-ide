@@ -146,6 +146,34 @@ async fn two_instances_ids_and_destroy() {
     manager.destroy(id2);
 }
 
+/// (f) Terminal queries are answered: a DSR cursor-position query (`ESC[6n`)
+/// must produce a reply on the PTY (`ESC[<row>;<col>R`), or interactive TUIs
+/// (Ink/Claude Code, vim) hang or mis-layout. `dd` blocks until the 6 reply
+/// bytes arrive, so `DSR-OK` only prints if the answerback path works.
+#[tokio::test]
+async fn dsr_cursor_position_query_is_answered() {
+    let manager = TermManager::new();
+    let id = manager
+        .create_with_shell(Path::new("/tmp"), Path::new(SH))
+        .expect("PTY available");
+
+    // Raw-ish mode (`-icanon`) like a real TUI, or the line discipline holds
+    // the newline-less reply back from dd. The echoed command line contains
+    // "DSR-'OK'" (with quotes), so matching on DSR-OK only hits echo's output.
+    manager.write(
+        id,
+        b"stty -icanon -echo; printf '\\033[6n'; dd bs=1 count=6 >/dev/null 2>&1; stty icanon echo; echo DSR-'OK'\n",
+    );
+
+    let found = wait_for_snapshot(&manager, id, Duration::from_secs(10), |snap| {
+        snap.contains_text("DSR-OK")
+    })
+    .await;
+    assert!(found, "DSR query should be answered so dd unblocks and DSR-OK prints");
+
+    manager.destroy(id);
+}
+
 /// (e) ANSI color: red output yields a cell with fg = Named(1) / Indexed(1).
 ///
 /// We use octal `\033` for the ESC byte, which every POSIX `printf` (and

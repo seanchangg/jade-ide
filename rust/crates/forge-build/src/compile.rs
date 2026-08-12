@@ -92,6 +92,7 @@ pub async fn compile(engine: &BuildEngine, req: &CompileRequest, out: &OutputSin
                             severity: Severity::Error,
                         }],
                         duration: start.elapsed(),
+                        project_root: None,
                     };
                 }
                 let _ = out.send(format!(
@@ -111,6 +112,7 @@ pub async fn compile(engine: &BuildEngine, req: &CompileRequest, out: &OutputSin
                         severity: Severity::Error,
                     }],
                     duration: start.elapsed(),
+                    project_root: None,
                 };
             }
         },
@@ -174,6 +176,7 @@ pub async fn compile(engine: &BuildEngine, req: &CompileRequest, out: &OutputSin
                 executable: None,
                 errors: parse_compiler_errors(&output, &root),
                 duration: start.elapsed(),
+                project_root: Some(root.clone()),
             };
         }
         engine
@@ -197,6 +200,7 @@ pub async fn compile(engine: &BuildEngine, req: &CompileRequest, out: &OutputSin
             executable: None,
             errors,
             duration: start.elapsed(),
+            project_root: Some(root.clone()),
         };
     }
 
@@ -206,5 +210,6 @@ pub async fn compile(engine: &BuildEngine, req: &CompileRequest, out: &OutputSin
         executable,
         errors,
         duration: start.elapsed(),
+        project_root: Some(root),
     }
 }

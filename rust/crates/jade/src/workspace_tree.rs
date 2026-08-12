@@ -8,7 +8,8 @@
 //!     .pyc` (`workspace.ts:12-15`);
 //!   - dotfiles hidden except `.forge`; `*.dSYM` hidden; root-level extensionless
 //!     files hidden (compiled-binary heuristic, `workspace.ts:91-94`);
-//!   - directories first, then case-insensitive alphabetical (`localeCompare`).
+//!   - directories first, then files grouped by file kind ([`FileKind::rank`])
+//!     and case-insensitive alphabetical inside each group.
 //!
 //! Lazy loading: the initial scan materializes **3 levels**; expanding an
 //! unloaded directory loads **1 more level** (§5.1). A directory whose children
@@ -49,25 +50,118 @@ pub const IGNORED_EXTENSIONS: &[&str] = &[
 /// Initial scan depth (levels of entries materialized eagerly).
 pub const INITIAL_DEPTH: usize = 3;
 
-/// Source/header classification (deliverable §1) — drives the panel's
-/// accent/accent2 row coloring (§5.1).
+/// File-type classification (deliverable §1). It drives two things in the panel:
+/// the per-kind icon and color (§5.1), and the sort order inside a directory —
+/// files group by kind ([`FileKind::rank`]) before they sort by name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExtClass {
-    /// `.cpp .cc .cxx .mm .m .c` — accent-colored.
+pub enum FileKind {
+    /// `.c .cc .cpp .cxx .m .mm` — a compiled translation unit.
     Source,
-    /// `.h .hpp .hxx` — accent2-colored.
+    /// `.h .hh .hpp .hxx .inl` — a declaration.
     Header,
-    /// Everything else — default text color.
+    /// `.metal .cu .cl .wgsl .glsl .hlsl .vert .frag .comp` — a GPU kernel.
+    Shader,
+    /// `.rs .py .js .ts .go .java .swift .kt .rb .lua .cs .sql` — other code.
+    Script,
+    /// `.sh .bash .zsh .fish .command` — a shell script.
+    Shell,
+    /// `Makefile`, `CMakeLists.txt`, `.cmake .mk .ninja`, `meson.build`.
+    Build,
+    /// `.toml .yaml .yml .ini .cfg .conf .plist .xml .entitlements .env`.
+    Config,
+    /// `.json .jsonl .ndjson .proto` — structured data.
+    Data,
+    /// `.csv .tsv .parquet .arrow .xlsx` — tabular data.
+    Table,
+    /// `.gguf .safetensors .pt .pth .ckpt .onnx .npy .npz .bin` — model weights.
+    Model,
+    /// `.md .markdown .rst .txt .log .pdf .tex` — prose.
+    Doc,
+    /// `.png .jpg .jpeg .gif .svg .webp .bmp .ico .tiff` — an image.
+    Image,
+    /// `.zip .tar .gz .tgz .bz2 .xz .7z .whl .dmg` — an archive.
+    Archive,
+    /// `*.lock`, `package-lock.json` — a pinned dependency set.
+    Lock,
+    /// Everything else.
     Other,
 }
 
-/// Classify a file name by extension (deliverable §1).
-pub fn classify(name: &str) -> ExtClass {
-    let ext = name.rsplit('.').next().filter(|_| name.contains('.'));
-    match ext.map(|e| e.to_ascii_lowercase()).as_deref() {
-        Some("cpp" | "cc" | "cxx" | "mm" | "m" | "c") => ExtClass::Source,
-        Some("h" | "hpp" | "hxx") => ExtClass::Header,
-        _ => ExtClass::Other,
+impl FileKind {
+    /// Sort weight inside one directory: code first, then build and config, then
+    /// data, then documents and assets. Files of one kind stay together and sort
+    /// by name inside the group.
+    pub fn rank(self) -> u8 {
+        match self {
+            FileKind::Source => 0,
+            FileKind::Header => 1,
+            FileKind::Shader => 2,
+            FileKind::Script => 3,
+            FileKind::Shell => 4,
+            FileKind::Build => 5,
+            FileKind::Config => 6,
+            FileKind::Data => 7,
+            FileKind::Table => 8,
+            FileKind::Model => 9,
+            FileKind::Doc => 10,
+            FileKind::Image => 11,
+            FileKind::Archive => 12,
+            FileKind::Lock => 13,
+            FileKind::Other => 14,
+        }
+    }
+}
+
+/// Classify a file name (deliverable §1). Well-known whole names (`Makefile`,
+/// `CMakeLists.txt`, `*.lock`) win over the extension; otherwise the last
+/// extension decides.
+pub fn classify(name: &str) -> FileKind {
+    let lower = name.to_ascii_lowercase();
+
+    // Whole-name matches first: these carry a meaning the extension does not.
+    match lower.as_str() {
+        "makefile" | "gnumakefile" | "cmakelists.txt" | "meson.build" | "dockerfile"
+        | "build.ninja" | "justfile" | "rakefile" => return FileKind::Build,
+        "package-lock.json" | "yarn.lock" | "cargo.lock" | "poetry.lock" | "uv.lock" => {
+            return FileKind::Lock
+        }
+        "license" | "readme" | "notice" | "changelog" | "authors" => return FileKind::Doc,
+        _ => {}
+    }
+
+    let ext = lower.rsplit('.').next().filter(|_| lower.contains('.'));
+    match ext {
+        Some("c" | "cc" | "cpp" | "cxx" | "c++" | "m" | "mm") => FileKind::Source,
+        Some("h" | "hh" | "hpp" | "hxx" | "h++" | "inl" | "ipp") => FileKind::Header,
+        Some("metal" | "cu" | "cuh" | "cl" | "wgsl" | "glsl" | "hlsl" | "vert" | "frag"
+        | "comp" | "spv") => FileKind::Shader,
+        Some(
+            "rs" | "py" | "pyi" | "js" | "mjs" | "cjs" | "ts" | "tsx" | "jsx" | "go" | "java"
+            | "swift" | "kt" | "rb" | "lua" | "cs" | "php" | "pl" | "r" | "jl" | "zig"
+            | "sql" | "ipynb",
+        ) => FileKind::Script,
+        Some("sh" | "bash" | "zsh" | "fish" | "command" | "bat" | "ps1") => FileKind::Shell,
+        Some("cmake" | "mk" | "ninja" | "mak" | "gradle" | "bazel" | "bzl") => FileKind::Build,
+        Some(
+            "toml" | "yaml" | "yml" | "ini" | "cfg" | "conf" | "plist" | "xml" | "properties"
+            | "entitlements" | "env" | "editorconfig" | "gitignore" | "gitattributes",
+        ) => FileKind::Config,
+        Some("json" | "jsonc" | "jsonl" | "ndjson" | "proto" | "graphql") => FileKind::Data,
+        Some("csv" | "tsv" | "parquet" | "arrow" | "xlsx" | "db" | "sqlite" | "sqlite3") => {
+            FileKind::Table
+        }
+        Some(
+            "gguf" | "ggml" | "safetensors" | "pt" | "pth" | "ckpt" | "onnx" | "npy" | "npz"
+            | "bin" | "pb" | "tflite" | "mlmodel" | "mlpackage",
+        ) => FileKind::Model,
+        Some("md" | "markdown" | "rst" | "txt" | "log" | "pdf" | "tex" | "adoc") => FileKind::Doc,
+        Some("png" | "jpg" | "jpeg" | "gif" | "svg" | "webp" | "bmp" | "ico" | "tif" | "tiff"
+        | "icns") => FileKind::Image,
+        Some("zip" | "tar" | "gz" | "tgz" | "bz2" | "xz" | "7z" | "whl" | "dmg" | "pkg") => {
+            FileKind::Archive
+        }
+        Some("lock") => FileKind::Lock,
+        _ => FileKind::Other,
     }
 }
 
@@ -79,7 +173,7 @@ pub struct FileNode {
     pub name: String,
     pub path: PathBuf,
     pub is_dir: bool,
-    pub ext_class: ExtClass,
+    pub kind: FileKind,
     pub children: Option<Vec<FileNode>>,
     pub expanded: bool,
 }
@@ -112,7 +206,7 @@ pub struct Row {
     pub name: String,
     pub path: PathBuf,
     pub is_dir: bool,
-    pub ext_class: ExtClass,
+    pub kind: FileKind,
     /// Nesting depth (root entries = 0); the panel indents `12 + depth*16` px.
     pub depth: usize,
     pub expanded: bool,
@@ -299,7 +393,7 @@ fn flatten(nodes: &[FileNode], depth: usize, out: &mut Vec<Row>) {
             name: n.name.clone(),
             path: n.path.clone(),
             is_dir: n.is_dir,
-            ext_class: n.ext_class,
+            kind: n.kind,
             depth,
             expanded: n.expanded,
         });
@@ -339,27 +433,30 @@ fn scan_dir(dir: &Path, is_root: bool, load_levels: usize) -> Vec<FileNode> {
         return Vec::new();
     };
 
-    // Collect (name, is_dir, path).
-    let mut entries: Vec<(String, bool, PathBuf)> = Vec::new();
+    // Collect (name, is_dir, path, kind).
+    let mut entries: Vec<(String, bool, PathBuf, FileKind)> = Vec::new();
     for entry in read.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
         let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-        entries.push((name, is_dir, entry.path()));
+        let kind = if is_dir { FileKind::Other } else { classify(&name) };
+        entries.push((name, is_dir, entry.path(), kind));
     }
 
-    // Dirs first, then case-insensitive alphabetical (localeCompare-ish).
+    // Dirs first; then files group by kind (sources, headers, shaders, … ) and
+    // sort case-insensitively by name inside each group.
     entries.sort_by(|a, b| match (a.1, b.1) {
         (true, false) => std::cmp::Ordering::Less,
         (false, true) => std::cmp::Ordering::Greater,
         _ => a
-            .0
-            .to_lowercase()
-            .cmp(&b.0.to_lowercase())
+            .3
+            .rank()
+            .cmp(&b.3.rank())
+            .then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase()))
             .then_with(|| a.0.cmp(&b.0)),
     });
 
     let mut nodes = Vec::new();
-    for (name, is_dir, path) in entries {
+    for (name, is_dir, path, kind) in entries {
         if !keep(&name, is_dir, is_root) {
             continue;
         }
@@ -369,7 +466,7 @@ fn scan_dir(dir: &Path, is_root: bool, load_levels: usize) -> Vec<FileNode> {
             None // file, or unloaded dir placeholder
         };
         nodes.push(FileNode {
-            ext_class: if is_dir { ExtClass::Other } else { classify(&name) },
+            kind,
             name,
             path,
             is_dir,
@@ -461,13 +558,49 @@ mod tests {
 
     #[test]
     fn classify_extensions() {
-        assert_eq!(classify("a.cpp"), ExtClass::Source);
-        assert_eq!(classify("a.mm"), ExtClass::Source);
-        assert_eq!(classify("a.c"), ExtClass::Source);
-        assert_eq!(classify("a.h"), ExtClass::Header);
-        assert_eq!(classify("a.hpp"), ExtClass::Header);
-        assert_eq!(classify("README.md"), ExtClass::Other);
-        assert_eq!(classify("Makefile"), ExtClass::Other);
+        assert_eq!(classify("a.cpp"), FileKind::Source);
+        assert_eq!(classify("a.mm"), FileKind::Source);
+        assert_eq!(classify("a.c"), FileKind::Source);
+        assert_eq!(classify("a.h"), FileKind::Header);
+        assert_eq!(classify("a.hpp"), FileKind::Header);
+        assert_eq!(classify("gpu.metal"), FileKind::Shader);
+        assert_eq!(classify("train.py"), FileKind::Script);
+        assert_eq!(classify("run.sh"), FileKind::Shell);
+        assert_eq!(classify("ai.json"), FileKind::Data);
+        assert_eq!(classify("Cargo.toml"), FileKind::Config);
+        assert_eq!(classify("model.gguf"), FileKind::Model);
+        assert_eq!(classify("loss.csv"), FileKind::Table);
+        assert_eq!(classify("logo.png"), FileKind::Image);
+        assert_eq!(classify("README.md"), FileKind::Doc);
+        assert_eq!(classify("Makefile"), FileKind::Build);
+        assert_eq!(classify("CMakeLists.txt"), FileKind::Build);
+        assert_eq!(classify("Cargo.lock"), FileKind::Lock);
+        assert_eq!(classify("notes"), FileKind::Other);
+    }
+
+    /// The whole-name rules must beat the extension: `CMakeLists.txt` is a build
+    /// file, not a `.txt` document, and `package-lock.json` is a lock file.
+    #[test]
+    fn whole_name_beats_extension() {
+        assert_ne!(classify("CMakeLists.txt"), FileKind::Doc);
+        assert_ne!(classify("package-lock.json"), FileKind::Data);
+        assert_eq!(classify("package-lock.json"), FileKind::Lock);
+    }
+
+    /// Inside one directory, files group by kind before they sort by name.
+    #[test]
+    fn files_group_by_kind() {
+        let dir = temp_fixture();
+        let tree = FileTree::scan(dir.0.clone());
+        let files: Vec<&str> = tree
+            .roots
+            .iter()
+            .filter(|n| !n.is_dir)
+            .map(|n| n.name.as_str())
+            .collect();
+        // main.cpp (Source) < util.h (Header) < notes.txt (Doc), even though the
+        // plain alphabetical order would be main.cpp, notes.txt, util.h.
+        assert_eq!(files, vec!["main.cpp", "util.h", "notes.txt"]);
     }
 
     #[test]

@@ -11,6 +11,9 @@ description = "Jade AI inline-completion backend: llama.cpp llama-server manager
 tokio = { workspace = true, features = ["process"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# `kill(2)`: the quit path takes the managed server down by PID, because a tokio
+# `Child` (and so `kill_on_drop`) is unusable from a quit or signal handler.
+libc = "0.2"
 # rustls keeps us off OpenSSL; all managed traffic is plain HTTP to 127.0.0.1,
 # but JADE_FIM_ENDPOINT may point at any (possibly https) host — see TS :52.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

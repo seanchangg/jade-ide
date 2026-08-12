@@ -23,12 +23,17 @@ mod backend;
 pub use backend::InlineCompletionBackend;
 
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 /// Managed-model tiers — all FIM-tuned Qwen2.5-Coder GGUFs served by llama.cpp.
 /// Mirrors `AI_MODELS` / `AiModelId` (TS :19-23, shared/types.ts :281).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AiModelId {
+    /// Qwen2.5-Coder 0.5B — the JetBrains-FLCC-style tier: the smallest
+    /// multi-language FIM model llama.cpp serves well. Measured ~260ms warm
+    /// single-line time-to-show vs ~1.4s for the 3B on an Apple-Silicon M-class.
+    Fastest,
     /// Qwen2.5-Coder 1.5B — the default tier (`private modelId = 'fast'`, TS :20, :38).
     #[default]
     Fast,
@@ -36,24 +41,81 @@ pub enum AiModelId {
     Balanced,
     /// Qwen2.5-Coder 7B (TS :22).
     Best,
+    /// sprite-100m — the from-scratch 100M model trained in `ml/`. Not a
+    /// download: it serves a GGUF off disk, so the tier only works on a
+    /// machine that has one. See [`sprite_model_path`].
+    ///
+    /// The alias keeps a saved `~/.config/jade/ai.json` that still says
+    /// `"ghost"` working; the model carried that name until 2026-08-09.
+    #[serde(alias = "ghost")]
+    Sprite,
+}
+
+/// Where `llama-server` gets the weights.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelSource {
+    /// A HuggingFace repo, downloaded on first use (`-hf`).
+    Hf(&'static str),
+    /// A GGUF already on disk (`-m`).
+    Local(PathBuf),
+}
+
+/// The GGUF the `Sprite` tier serves. `$FORGE_SPRITE_MODEL` overrides it, so a
+/// fresh export can be tried without rebuilding the app.
+///
+/// `sprite-100m-v2-mw` (2026-08-08): the v2 from-scratch run plus a
+/// middle-loss-weight anneal. 41.3% Perfect Lines at Q8_0 on metalLLM, against
+/// 17% for the model it replaced. Name the file explicitly rather than a moving
+/// "final" alias, so the shipped model is readable from the source.
+///
+/// The runs in `ml/train/runs/` keep their original `ghost-*` names. Those are
+/// the record the logs and `HANDOFF.md` refer to, so renaming them would break
+/// the trail; only the shipped model took the new name.
+pub fn sprite_model_path() -> PathBuf {
+    match std::env::var("FORGE_SPRITE_MODEL") {
+        Ok(p) if !p.is_empty() => PathBuf::from(p),
+        _ => PathBuf::from(std::env::var("HOME").unwrap_or_default())
+            .join("models/sprite-100m/sprite-100m-v2-mw-q8_0.gguf"),
+    }
 }
 
 impl AiModelId {
-    /// The HuggingFace repo passed to `llama-server -hf` (TS :20-22).
-    pub fn hf(self) -> &'static str {
+    /// Where the weights come from (TS :20-22 knew only `-hf`).
+    pub fn source(self) -> ModelSource {
         match self {
-            AiModelId::Fast => "ggml-org/Qwen2.5-Coder-1.5B-Q8_0-GGUF",
-            AiModelId::Balanced => "ggml-org/Qwen2.5-Coder-3B-Q8_0-GGUF",
-            AiModelId::Best => "ggml-org/Qwen2.5-Coder-7B-Q8_0-GGUF",
+            AiModelId::Fastest => ModelSource::Hf("ggml-org/Qwen2.5-Coder-0.5B-Q8_0-GGUF"),
+            AiModelId::Fast => ModelSource::Hf("ggml-org/Qwen2.5-Coder-1.5B-Q8_0-GGUF"),
+            AiModelId::Balanced => ModelSource::Hf("ggml-org/Qwen2.5-Coder-3B-Q8_0-GGUF"),
+            AiModelId::Best => ModelSource::Hf("ggml-org/Qwen2.5-Coder-7B-Q8_0-GGUF"),
+            AiModelId::Sprite => ModelSource::Local(sprite_model_path()),
+        }
+    }
+
+    /// `-b` / `-ub` for this model. llama-server derives how much prefix
+    /// `/infill` keeps from the batch size — `n_prefix_take = 3*(n_batch/4)`
+    /// — so this is a quality knob, not only a throughput one.
+    ///
+    /// sprite-100m trains on prefixes up to 1280 tokens; 1024 would feed it
+    /// only 768. Measured on metalLLM, 400 cases, two independent case
+    /// samples: 17.0%/13.2% Perfect Lines at `-b 1024` against 21.2%/21.8%
+    /// at 1792. CAUTION — that curve is NOT monotonic (1408 scores below
+    /// 1024, and 1920 collapses to ~9%), so 1792 is the best measured point,
+    /// not an understood optimum. See `ml/HANDOFF.md`.
+    pub fn batch(self) -> u32 {
+        match self {
+            AiModelId::Sprite => 1792,
+            _ => 1024,
         }
     }
 
     /// Human-readable label used in status detail strings (TS :20-22).
     pub fn label(self) -> &'static str {
         match self {
+            AiModelId::Fastest => "Qwen2.5-Coder 0.5B",
             AiModelId::Fast => "Qwen2.5-Coder 1.5B",
             AiModelId::Balanced => "Qwen2.5-Coder 3B",
             AiModelId::Best => "Qwen2.5-Coder 7B",
+            AiModelId::Sprite => "sprite-100m",
         }
     }
 }

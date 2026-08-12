@@ -13,11 +13,11 @@ use std::collections::HashMap;
 use forge_buffer::Point;
 use gpui::{
     canvas, div, point, prelude::*, px, rgb, rgba, size, uniform_list, Bounds, ClickEvent, Context,
-    ElementInputHandler, Entity, FocusHandle, HighlightStyle, KeyDownEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, Rgba, UnderlineStyle,
+    ElementInputHandler, Entity, FocusHandle, HighlightStyle, KeyDownEvent,
+    ListHorizontalSizingBehavior, MouseButton, MouseDownEvent, MouseMoveEvent, Rgba, UnderlineStyle,
 };
 
-use crate::app::{CompletionState, HoverState, JadeApp};
+use crate::app::{CompletionState, HoverState, JadeApp, SignatureState};
 use crate::decorations::flow::GlyphKind;
 use crate::decorations::{self, RuntimeAlloc};
 use crate::editor_view::{self, CellStyle};
@@ -106,6 +106,7 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> gpui::AnyElement {
 
             let flow_visible = this.flow_visible;
             let error_line = this.error_line;
+            let exec_line = this.exec_pointer_line();
             let has_run = !this.last_executed.is_empty();
             let theme = this.theme.clone();
             // Ghost text (§4.11): shown on the caret row only. Multi-line ghosts
@@ -127,6 +128,13 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> gpui::AnyElement {
                 .unwrap_or(false);
             let row_handle = this.editor_focus.clone();
             let char_w = this.char_w();
+            // Find matches (whole-buffer byte ranges) captured before the tab
+            // borrow, so every occurrence — not just the current one — is washed.
+            let find_matches: Vec<std::ops::Range<usize>> = this
+                .find
+                .as_ref()
+                .map(|f| f.matches.clone())
+                .unwrap_or_default();
 
             let Some(tab) = this.editor.active_tab() else {
                 return rows;
@@ -136,6 +144,12 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> gpui::AnyElement {
             let Some(tab) = this.editor.active_tab() else {
                 return rows;
             };
+
+            // Uniform code-cell width (§ horizontal scroll): the longest line plus
+            // a trailing margin, so every row is at least this wide. Rows wider
+            // than the viewport make the `Unconstrained` list scroll sideways; the
+            // uniform min-width also keeps the whole line band clickable past EOL.
+            let code_w = tab.max_cols as f32 * char_w + 48.0;
 
             // Caret + selection (buffer byte coordinates).
             let sel = tab.buffer.selection();
@@ -171,8 +185,16 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> gpui::AnyElement {
                         line_end,
                     )
                 });
-                let cells =
-                    editor_view::merge_line_styles(line_bytes, syntax, selection, &underlines, marked);
+                let line_matches =
+                    editor_view::find_matches_on_line(&find_matches, line_start, line_end);
+                let cells = editor_view::merge_line_styles(
+                    line_bytes,
+                    syntax,
+                    selection,
+                    &underlines,
+                    marked,
+                    &line_matches,
+                );
                 let highlights = cells
                     .into_iter()
                     .map(|(r, s)| (r, cell_to_style(&s, &theme)))
@@ -240,12 +262,21 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> gpui::AnyElement {
                     row_bg = Some(rgba_a(theme.red, 0.10));
                     border_col = rgba_a(theme.red, 0.45);
                 }
+                // Execution pointer (§5.8): the line the debugger is paused on
+                // gets an amber wash + border and a gutter arrow, over any
+                // breakpoint tint (you want to see where you ARE first).
+                let is_exec = exec_line == Some(line_no as u32);
+                if is_exec {
+                    row_bg = Some(rgba_a(theme.amber, 0.14));
+                    border_col = rgba_a(theme.amber, 0.7);
+                }
 
-                // `.w_full()`: uniform_list items size to content by default, so
-                // short lines produced narrow rows and clicks to the right of
-                // the code hit nothing (caret wouldn't move). Full-width rows
-                // make the whole line band clickable (cell clamps to EOL).
-                let mut row = div().flex().flex_row().w_full().h(px(LINE_H)).items_center();
+                // Row width comes from the fixed gutter/fold columns plus the
+                // `code_w`-wide code cell below (uniform across rows), so every
+                // line band is clickable past EOL AND long lines extend the row so
+                // the `Unconstrained` list can scroll horizontally. (No `.w_full()`
+                // — that would re-clamp rows to the viewport and kill h-scroll.)
+                let mut row = div().flex().flex_row().h(px(LINE_H)).items_center();
 
                 if flow_visible {
                     let mut cell = div()
@@ -289,7 +320,14 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> gpui::AnyElement {
                     .pr(px(8.));
                 // The 8px glyph margin: click toggles a breakpoint (§4.6); it
                 // shows a red breakpoint dot (precedence) or the diagnostic dot.
-                let dot: gpui::AnyElement = if has_bp {
+                let dot: gpui::AnyElement = if is_exec {
+                    // Where the paused program is: an amber ▶ in the margin.
+                    div()
+                        .text_size(px(9.))
+                        .text_color(rgb(theme.amber))
+                        .child("▶")
+                        .into_any_element()
+                } else if has_bp {
                     div()
                         .w(px(6.))
                         .h(px(6.))
@@ -378,12 +416,16 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> gpui::AnyElement {
                 // Code cell: relative so the caret bar can be absolutely placed.
                 // Stateful (`.id`) from the start so the mouse handlers below keep
                 // the element type consistent.
+                // `min_w(code_w)` (not `flex_1`) + no `overflow_hidden`: the cell is
+                // at least the longest-line width so short lines stay clickable to
+                // the right, and long lines / EOL annotations extend it past the
+                // viewport for horizontal scrolling instead of being clipped.
                 let mut cell = div()
                     .id(("code-cell", i))
                     .debug_selector(|| format!("code-cell-{i}"))
-                    .flex_1()
+                    .flex_none()
+                    .min_w(px(code_w))
                     .relative()
-                    .overflow_hidden()
                     .flex()
                     .flex_row()
                     .items_center();
@@ -420,8 +462,10 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> gpui::AnyElement {
                             .child("…"),
                     );
                 }
-                // Ghost text run (§4.11): faded (~40% muted) at the caret row,
-                // appended right after the line text (before the EOL annotation).
+                // Ghost text run (§4.11): faded gray at the caret row, appended
+                // right after the line text (before the EOL annotation). 65%
+                // muted ≈ the CLion/VS Code inline-hint contrast (~3.5:1); the
+                // old 40% landed near 1.7:1 — invisible with smoothing off.
                 if focused {
                     if let Some((grow, gtext)) = &ghost_render {
                         if *grow == i {
@@ -429,7 +473,8 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> gpui::AnyElement {
                                 div()
                                     .flex_none()
                                     .whitespace_nowrap()
-                                    .text_color(rgba_a(theme.muted, 0.4))
+                                    .text_color(rgba_a(theme.muted, 0.65))
+                                    .debug_selector(|| "ghost-run".into())
                                     .child(gtext.clone()),
                             );
                         }
@@ -484,6 +529,9 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> gpui::AnyElement {
         }),
     )
     .track_scroll(&app.code_scroll)
+    // Let rows exceed the viewport width so long lines scroll horizontally
+    // (trackpad / shift-wheel), instead of being clipped at the right edge.
+    .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
     .flex_1()
     .size_full()
     .pt(px(PAD_TOP))
@@ -522,6 +570,21 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> gpui::AnyElement {
             entity,
         ));
 
+    // Find / replace bar (⌘F / Ctrl+F): anchored top-right of the editor, over
+    // the code. Its own focus handle captures keystrokes (see `app.find_key`).
+    if app.find.is_some() {
+        let focus = app
+            .find_focus
+            .clone()
+            .unwrap_or_else(|| cx.focus_handle());
+        container = container.child(find_bar(app, focus, cx));
+    }
+
+    // Sync-suggestion banner (§4.13): floats bottom-center over the code.
+    if app.sync_suggestion.is_some() {
+        container = container.child(sync_banner(app, cx));
+    }
+
     let scroll_top = app.editor_scroll_top();
     if let Some(popup) = completion_popup(app, flow_visible_now, scroll_top, cx) {
         container = container.child(popup);
@@ -529,7 +592,341 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> gpui::AnyElement {
     if let Some(popup) = hover_popup(app, flow_visible_now, scroll_top) {
         container = container.child(popup);
     }
+    if let Some(popup) = signature_popup(app, flow_visible_now, scroll_top) {
+        container = container.child(popup);
+    }
     container.into_any_element()
+}
+
+/// True when a keystroke should type a character into a find field: a printable
+/// `key_char` with no command/control/alt/function modifier.
+fn find_is_printable(ev: &KeyDownEvent) -> bool {
+    let m = &ev.keystroke.modifiers;
+    ev.keystroke.key_char.is_some() && !m.platform && !m.control && !m.alt && !m.function
+}
+
+/// A small pill button for the find bar (icon/label + hover + click).
+fn find_btn(
+    id: &'static str,
+    label: impl Into<String>,
+    active: bool,
+    theme: &Theme,
+    cx: &mut Context<JadeApp>,
+    on_click: impl Fn(&mut JadeApp, &mut Context<JadeApp>) + 'static,
+) -> gpui::Stateful<gpui::Div> {
+    let hover_bg = theme.border;
+    let mut b = div()
+        .id(id)
+        .flex()
+        .items_center()
+        .justify_center()
+        .h(px(20.))
+        .min_w(px(22.))
+        .px(px(5.))
+        .rounded_md()
+        .text_xs()
+        .cursor_pointer()
+        .text_color(rgb(if active { theme.accent } else { theme.muted }))
+        .hover(move |st| st.bg(rgb(hover_bg)))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |app: &mut JadeApp, _ev: &MouseDownEvent, _w, cx| {
+                on_click(app, cx);
+                cx.notify();
+            }),
+        )
+        .child(label.into());
+    if active {
+        b = b.bg(rgba_a(theme.accent, 0.15));
+    }
+    b
+}
+
+/// One clickable text field of the find bar: the captured query/replace buffer,
+/// with a blinking caret at `cursor` when it's the focused field. Clicking it
+/// makes it the active field, puts the caret at the clicked char column
+/// (mapped through the same measured-advance scheme as editor clicks), and
+/// pulls keyboard focus back to the bar.
+fn find_field(
+    id: &'static str,
+    field: crate::find::FindField,
+    value: &str,
+    placeholder: &str,
+    focused: bool,
+    caret_on: bool,
+    cursor: usize,
+    app: &JadeApp,
+    theme: &Theme,
+    cx: &mut Context<JadeApp>,
+) -> gpui::Stateful<gpui::Div> {
+    use std::sync::atomic::Ordering;
+    // Shared fake-input line: caret before the placeholder when empty, at the
+    // cursor while typing; blinks via `caret_on` (530ms editor phase).
+    let inner =
+        crate::panels::input_line(value, placeholder, focused, caret_on, theme.accent, theme, cursor)
+            .text_xs();
+
+    // Zero-width canvas as the FIRST flex child: its painted origin is exactly
+    // where the text starts (past padding), and the inherited text style gives
+    // the bar's real font/size — both captured for click→column mapping.
+    let text_left = app.find_field_left[field as usize].clone();
+    let char_w_store = app.find_char_w.clone();
+    let geom = canvas(
+        move |_bounds, _window, _cx| {},
+        move |bounds: Bounds<gpui::Pixels>, _, window, _cx| {
+            text_left.store(f32::from(bounds.origin.x).to_bits(), Ordering::Relaxed);
+            let style = window.text_style();
+            let font_id = window.text_system().resolve_font(&style.font());
+            let size = style.font_size.to_pixels(window.rem_size());
+            if let Ok(adv) = window.text_system().advance(font_id, size, 'M') {
+                let w = f32::from(adv.width);
+                if w > 0.0 {
+                    char_w_store.store(w.to_bits(), Ordering::Relaxed);
+                }
+            }
+        },
+    )
+    .w(px(0.))
+    .h(px(16.))
+    .flex_none();
+
+    let text_left = app.find_field_left[field as usize].clone();
+    let char_w_store = app.find_char_w.clone();
+    let max_col = value.chars().count();
+    div()
+        .id(id)
+        .debug_selector(move || id.to_string())
+        .flex()
+        .flex_row()
+        .items_center()
+        .h(px(22.))
+        .min_w(px(200.))
+        .px(px(6.))
+        .rounded_md()
+        .bg(rgb(theme.bg))
+        .border_1()
+        .border_color(rgb(if focused { theme.accent } else { theme.border }))
+        .cursor_text()
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |app: &mut JadeApp, ev: &MouseDownEvent, _w, cx| {
+                let left = f32::from_bits(text_left.load(Ordering::Relaxed));
+                let cw = f32::from_bits(char_w_store.load(Ordering::Relaxed));
+                let col =
+                    editor_view::px_to_col(f32::from(ev.position.x) - left, cw, max_col);
+                app.find_click_field(field, col);
+                cx.notify();
+            }),
+        )
+        .child(geom)
+        .child(inner)
+}
+
+/// The cross-file sync banner (§4.13): the pending suggestion's message plus
+/// an apply pill (⌘⏎) and a dismiss pill (Esc). Floats near the bottom of the
+/// editor so it never hides the caret line.
+fn sync_banner(app: &JadeApp, cx: &mut Context<JadeApp>) -> gpui::AnyElement {
+    let theme = app.theme.clone();
+    let Some(sug) = app.sync_suggestion.as_ref() else {
+        return div().into_any_element();
+    };
+    div()
+        .id("sync-banner")
+        .debug_selector(|| "sync-banner".to_string())
+        .absolute()
+        .bottom(px(14.))
+        .left(px(24.))
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(8.))
+        .h(px(28.))
+        .px(px(10.))
+        .rounded_md()
+        .bg(rgb(theme.panel))
+        .border_1()
+        .border_color(rgba_a(theme.accent, 0.6))
+        .shadow_md()
+        .text_xs()
+        .text_color(rgb(theme.text))
+        .child(sug.message())
+        .when(
+            !matches!(sug, crate::sync::SyncSuggestion::SimilarLines { .. })
+                && app.sync_scope_is_narrow(),
+            |el| {
+                let dir = app
+                    .sync_scope
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                el.child(
+                    div()
+                        .text_color(rgb(theme.muted))
+                        .child(format!("in {dir}/")),
+                )
+            },
+        )
+        .child(find_btn("sync-apply", "apply ⌘⏎", true, &theme, cx, |app, cx| {
+            app.sync_apply(cx);
+        }))
+        .child(find_btn("sync-dismiss", "esc", false, &theme, cx, |app, _cx| {
+            app.sync_suggestion = None;
+        }))
+        .into_any_element()
+}
+
+/// The find / replace bar. A captured-keystroke buffer (like Quick Open): the
+/// panel takes focus and forwards keystrokes to `JadeApp::find_key`. Anchored
+/// top-right so it never hides the caret line.
+fn find_bar(app: &JadeApp, focus: FocusHandle, cx: &mut Context<JadeApp>) -> gpui::AnyElement {
+    use crate::find::FindField;
+    let theme = app.theme.clone();
+    let Some(state) = app.find.as_ref() else {
+        return div().into_any_element();
+    };
+    let replace_visible = state.replace_visible;
+    let find_focused = state.field == FindField::Find;
+    // The caret blinks only while the bar owns focus (so it goes dim when you
+    // click into the editor to keep editing) — driven by the shared 530ms phase.
+    let blink = app.caret_blink_show && app.find_bar_focused;
+    let count = state.count();
+    let count_label = if state.query.is_empty() {
+        String::new()
+    } else if count == 0 {
+        "No results".to_string()
+    } else {
+        format!("{} of {}", state.ordinal(), count)
+    };
+
+    // Left chevron: the dropdown toggle that shows / hides the replace row.
+    let chevron = if replace_visible { "chevron-down" } else { "chevron-right" };
+    let chevron_btn = div()
+        .id("find-chevron")
+        .flex()
+        .items_center()
+        .justify_center()
+        .w(px(16.))
+        .h(px(22.))
+        .flex_none()
+        .cursor_pointer()
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|app: &mut JadeApp, _ev: &MouseDownEvent, _w, cx| {
+                if let Some(s) = app.find.as_mut() {
+                    if s.replace_visible {
+                        s.replace_visible = false;
+                        s.field = FindField::Find;
+                    } else {
+                        s.replace_visible = true;
+                    }
+                }
+                app.pending_find_focus = true;
+                cx.notify();
+            }),
+        )
+        .child(crate::assets::ui_icon(chevron, 12., theme.muted));
+
+    // Find row: [chevron] [ query field ] [k of N] [Aa] [‹] [›] [×]
+    let find_row = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(4.))
+        .child(chevron_btn)
+        .child(find_field(
+            "find-query-field",
+            FindField::Find,
+            &state.query,
+            "Find",
+            find_focused,
+            blink,
+            if find_focused { state.cursor } else { state.query.len() },
+            app,
+            &theme,
+            cx,
+        ))
+        .child(
+            div()
+                .min_w(px(58.))
+                .text_xs()
+                .text_color(rgb(theme.muted))
+                .child(count_label),
+        )
+        .child(find_btn("find-case", "Aa", state.case_sensitive, &theme, cx, |app, _cx| {
+            app.find_toggle_case();
+        }))
+        .child(find_btn("find-prev", "‹", false, &theme, cx, |app, _cx| {
+            app.find_prev();
+        }))
+        .child(find_btn("find-next", "›", false, &theme, cx, |app, _cx| {
+            app.find_next();
+        }))
+        .child(find_btn("find-close", "×", false, &theme, cx, |app, _cx| {
+            app.close_find();
+        }));
+
+    let mut bar = div().flex().flex_col().gap(px(4.)).child(find_row);
+
+    // Replace row (the dropdown): [ replace field ] [Replace] [All]. Indented to
+    // line up under the query field, past the chevron column.
+    if replace_visible {
+        let replace_row = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(4.))
+            .child(div().w(px(16.)).flex_none()) // align under the query field
+            .child(find_field(
+                "find-replace-field",
+                FindField::Replace,
+                &state.replace,
+                "Replace",
+                !find_focused,
+                blink,
+                if find_focused { state.replace.len() } else { state.cursor },
+                app,
+                &theme,
+                cx,
+            ))
+            .child(find_btn("find-replace-one", "Replace", false, &theme, cx, |app, cx| {
+                app.find_replace_current(cx);
+            }))
+            .child(find_btn("find-replace-all", "All", false, &theme, cx, |app, cx| {
+                app.find_replace_all(cx);
+            }));
+        bar = bar.child(replace_row);
+    }
+
+    div()
+        .absolute()
+        .top(px(8.))
+        .right(px(16.))
+        .p(px(6.))
+        .rounded_lg()
+        .bg(rgb(theme.panel))
+        .border_1()
+        .border_color(rgb(theme.border))
+        // Absorb mouse events so a click on the bar never falls through to the
+        // editor rows painted underneath (which would move the caret / focus).
+        .occlude()
+        .track_focus(&focus)
+        .on_key_down(cx.listener(|app: &mut JadeApp, ev: &KeyDownEvent, _w, cx| {
+            let ks = &ev.keystroke;
+            app.find_key(
+                ks.key.as_str(),
+                ks.key_char.clone(),
+                find_is_printable(ev),
+                ks.modifiers.shift,
+                ks.modifiers.platform,
+                cx,
+            );
+            // Consume every key so it doesn't bubble to the editor / global
+            // shortcuts while the bar owns input.
+            cx.stop_propagation();
+            cx.notify();
+        }))
+        .child(bar)
+        .into_any_element()
 }
 
 /// Convert a flattened [`CellStyle`] into a gpui [`HighlightStyle`]: syntax color,
@@ -550,11 +947,21 @@ fn cell_to_style(cell: &CellStyle, theme: &Theme) -> HighlightStyle {
                 wavy: false,
             })
         });
+    // Background wash precedence: the *current* find match (both selected and a
+    // match) reads strongest, other matches get an amber wash so every occurrence
+    // is visible, and a plain text selection keeps its subtle 15% accent.
+    let background_color = if cell.selected && cell.find_match {
+        Some(gpui::Hsla::from(rgba_a(theme.accent, 0.34)))
+    } else if cell.find_match {
+        Some(gpui::Hsla::from(rgba_a(theme.amber, 0.30)))
+    } else if cell.selected {
+        Some(gpui::Hsla::from(rgba_a(theme.accent, 0.15)))
+    } else {
+        None
+    };
     HighlightStyle {
         color: cell.color.map(|c| rgb(c).into()),
-        background_color: cell
-            .selected
-            .then(|| gpui::Hsla::from(rgba_a(theme.accent, 0.15))),
+        background_color,
         underline,
         ..Default::default()
     }
@@ -628,10 +1035,12 @@ fn ime_geometry_canvas(
 }
 
 /// The x pixel of the code column `col`, including the gutter + optional flow
-/// margin, for anchoring the floating popups inside the editor container.
-fn popup_x(col: usize, flow_visible: bool, char_w: f32) -> f32 {
+/// margin, for anchoring the floating popups inside the editor container. The
+/// code text scrolls horizontally under the fixed gutter, so `h_scroll` (the
+/// list's horizontal offset, ≤ 0) is folded in to keep popups under the glyph.
+fn popup_x(col: usize, flow_visible: bool, char_w: f32, h_scroll: f32) -> f32 {
     let glyph = if flow_visible { GLYPH_W } else { 0.0 };
-    8.0 + GUTTER_W + FOLD_W + glyph + editor_view::col_to_px(col, char_w)
+    8.0 + GUTTER_W + FOLD_W + glyph + editor_view::col_to_px(col, char_w) + h_scroll
 }
 
 /// The y pixel (top) of the row below `row`, given the current scroll top.
@@ -654,7 +1063,7 @@ fn completion_popup(
     let theme = app.theme.clone();
     let (row, col) = c.anchor;
     let row = app.editor.active_tab().map(|t| t.display_row(row)).unwrap_or(row);
-    let left = popup_x(col, flow_visible, app.char_w());
+    let left = popup_x(col, flow_visible, app.char_w(), app.editor_h_scroll());
     let top = popup_y(row, scroll_top);
 
     // Window of up to 8 items centered on the selection.
@@ -720,12 +1129,87 @@ fn completion_popup(
     )
 }
 
+/// The signature-help hint: the active call's signature shown one line above the
+/// caret, with the parameter currently being filled in emphasized (accent+bold).
+fn signature_popup(
+    app: &JadeApp,
+    flow_visible: bool,
+    scroll_top: usize,
+) -> Option<gpui::AnyElement> {
+    let s: &SignatureState = app.signature.as_ref()?;
+    if s.label.is_empty() {
+        return None;
+    }
+    let theme = app.theme.clone();
+    let (row, col) = s.anchor;
+    let row = app.editor.active_tab().map(|t| t.display_row(row)).unwrap_or(row);
+    let left = popup_x(col, flow_visible, app.char_w(), app.editor_h_scroll());
+    let rel = row.saturating_sub(scroll_top);
+    // Sit the hint fully ABOVE the caret line: its bottom edge lands SIG_GAP px
+    // above the line's top so it never overlaps the code you're typing (the box
+    // is ~24px, taller than one line, so a plain "-LINE_H" left ~6px of overlap).
+    // When there isn't room above (caret near the viewport top), drop it BELOW
+    // the caret line instead — same fallback the completion popup uses.
+    const SIG_H: f32 = 24.0;
+    const SIG_GAP: f32 = 4.0;
+    let caret_top = PAD_TOP + rel as f32 * LINE_H;
+    let above = caret_top - SIG_H - SIG_GAP;
+    let top = if above >= 2.0 {
+        above
+    } else {
+        caret_top + LINE_H + SIG_GAP // below the caret line
+    };
+
+    // Split the label into before · active-param · after so the argument being
+    // filled in stands out.
+    let mut hint = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .text_xs()
+        .whitespace_nowrap();
+    match &s.active_param {
+        Some(r) if r.end <= s.label.len() && r.start <= r.end => {
+            hint = hint
+                .child(div().text_color(rgb(theme.muted)).child(s.label[..r.start].to_string()))
+                .child(
+                    div()
+                        .text_color(rgb(theme.accent))
+                        .font_weight(gpui::FontWeight::BOLD)
+                        .child(s.label[r.start..r.end].to_string()),
+                )
+                .child(div().text_color(rgb(theme.muted)).child(s.label[r.end..].to_string()));
+        }
+        _ => {
+            hint = hint.child(div().text_color(rgb(theme.text)).child(s.label.clone()));
+        }
+    }
+
+    Some(
+        div()
+            .absolute()
+            .left(px(left))
+            .top(px(top))
+            .debug_selector(|| "signature-hint".into())
+            .max_w(px(560.))
+            .px(px(8.))
+            .py(px(3.))
+            .rounded_md()
+            .bg(rgb(theme.panel))
+            .border_1()
+            .border_color(rgb(theme.border))
+            .overflow_hidden()
+            .child(hint)
+            .into_any_element(),
+    )
+}
+
 /// The floating hover panel (plain text; markdown rendering deferred).
 fn hover_popup(app: &JadeApp, flow_visible: bool, scroll_top: usize) -> Option<gpui::AnyElement> {
     let h: &HoverState = app.hover.as_ref()?;
     let theme = app.theme.clone();
     let row = app.editor.active_tab().map(|t| t.display_row(h.row)).unwrap_or(h.row);
-    let left = popup_x(h.col, flow_visible, app.char_w());
+    let left = popup_x(h.col, flow_visible, app.char_w(), app.editor_h_scroll());
     let top = popup_y(row, scroll_top);
     Some(
         div()

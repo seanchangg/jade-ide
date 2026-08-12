@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 #include <malloc/malloc.h>
 
 // Forge malloc/free interposer for macOS
@@ -22,6 +23,24 @@ static int _forge_free_count = 0;
         (const void *)(unsigned long)&_original \
     };
 
+// Live heap sampling: the exit summary alone gives the IDE's Memory chart a
+// single point, so emit the same __FORGE_HEAP_SUMMARY line periodically
+// (at most every 100ms, checked on each alloc/free). The timestamp is
+// updated BEFORE fprintf so any malloc fprintf does internally re-enters
+// the wrappers, sees a fresh emit, and skips — no recursion.
+static uint64_t _forge_last_emit_ns = 0;
+
+static void forge_maybe_emit(void) {
+    uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+    if (now - _forge_last_emit_ns < 100000000ull)
+        return;
+    _forge_last_emit_ns = now;
+    fprintf(stderr, "__FORGE_HEAP_SUMMARY|%zu|%zu|%zu|%zu|%d|%d\n",
+            _forge_total_alloc, _forge_total_freed,
+            _forge_current_heap, _forge_peak_heap,
+            _forge_alloc_count, _forge_free_count);
+}
+
 // Wrapper functions — call the real implementation, then track
 void *forge_malloc(size_t size) {
     void *ptr = malloc(size);
@@ -33,6 +52,7 @@ void *forge_malloc(size_t size) {
         if (_forge_current_heap > _forge_peak_heap)
             _forge_peak_heap = _forge_current_heap;
     }
+    forge_maybe_emit();
     return ptr;
 }
 
@@ -45,6 +65,7 @@ void forge_free(void *ptr) {
         _forge_free_count++;
     }
     free(ptr);
+    forge_maybe_emit();
 }
 
 void *forge_calloc(size_t count, size_t size) {
@@ -57,6 +78,7 @@ void *forge_calloc(size_t count, size_t size) {
         if (_forge_current_heap > _forge_peak_heap)
             _forge_peak_heap = _forge_current_heap;
     }
+    forge_maybe_emit();
     return ptr;
 }
 
@@ -73,6 +95,7 @@ void *forge_realloc(void *ptr, size_t size) {
         if (_forge_current_heap > _forge_peak_heap)
             _forge_peak_heap = _forge_current_heap;
     }
+    forge_maybe_emit();
     return new_ptr;
 }
 

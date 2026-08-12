@@ -1,9 +1,10 @@
 //! File-tree panel (feature inventory §5.1, deliverable §2).
 //!
 //! Header "FILES" + a minimize placeholder; one row per visible tree node with a
-//! leading lucide icon (folder/folder-open for directories, file-code/file for
-//! files — see `crate::assets`), indentation `12 + depth*16` px, source files
-//! accent-colored / headers accent2, and the active file's row highlighted.
+//! leading lucide icon (folder/folder-open for directories, one glyph per
+//! `FileKind` for files — see `kind_glyph` and `crate::assets`), indentation
+//! `12 + depth*16` px, source files accent-colored / headers accent2, and the
+//! active file's row highlighted.
 //! Clicking a directory toggles expansion (lazy-loading its children); clicking a
 //! file opens it in the editor.
 //!
@@ -15,7 +16,7 @@ use gpui::{div, prelude::*, px, rgb, Context};
 
 use crate::app::JadeApp;
 use crate::theme::Theme;
-use crate::workspace_tree::{ExtClass, Row};
+use crate::workspace_tree::{FileKind, Row};
 
 pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> impl IntoElement {
     let theme = app.theme.clone();
@@ -41,8 +42,15 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> impl IntoElement {
     match &app.tree {
         Some(tree) => {
             let active = app.active_file.clone();
+            let selected = app.tree_selection.clone();
             for row in tree.visible_rows() {
-                list = list.child(tree_row(row, active.as_deref(), &theme, cx));
+                list = list.child(tree_row(
+                    row,
+                    active.as_deref(),
+                    selected.as_deref(),
+                    &theme,
+                    cx,
+                ));
             }
         }
         None => {
@@ -66,39 +74,35 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> impl IntoElement {
 fn tree_row(
     row: Row,
     active: Option<&std::path::Path>,
+    selected: Option<&std::path::Path>,
     theme: &Theme,
     cx: &mut Context<JadeApp>,
 ) -> impl IntoElement {
     let indent = 12.0 + row.depth as f32 * 16.0;
     let is_active = active == Some(row.path.as_path());
+    // The selected row is the one a new terminal opens in (§5.2). A directory
+    // shows it; for a file the active-tab highlight already says the same thing.
+    let is_selected = row.is_dir && selected == Some(row.path.as_path());
     let path = row.path.clone();
 
-    // Leading icon: a folder (open when expanded) for dirs; for files, file-code
-    // for source/header, else the plain file glyph. Color still encodes the ext
-    // class and inherits into the icon via text_color.
+    // Leading icon: a folder (open when expanded) for dirs; for files, one glyph
+    // per file kind (see `kind_glyph`). The color inherits into the icon via
+    // text_color.
     let (icon_name, glyph_color) = if row.is_dir {
         let name = if row.expanded { "folder-open" } else { "folder" };
         (name, theme.muted)
     } else {
-        let color = match row.ext_class {
-            ExtClass::Source => theme.accent,
-            ExtClass::Header => theme.blue_gray,
-            ExtClass::Other => theme.muted,
-        };
-        let name = match row.ext_class {
-            ExtClass::Source | ExtClass::Header => "file-code",
-            ExtClass::Other => "file",
-        };
-        (name, color)
+        kind_glyph(row.kind, theme)
     };
 
-    // Label color: source accent, header accent2, dirs/others default text.
+    // Label color: source accent, header types-color, dirs/others default text.
+    // Other kinds keep the plain text color so the icon carries the type.
     let label_color = if is_active {
         theme.accent
     } else {
-        match (row.is_dir, row.ext_class) {
-            (false, ExtClass::Source) => theme.accent,
-            (false, ExtClass::Header) => theme.blue_gray,
+        match (row.is_dir, row.kind) {
+            (false, FileKind::Source) => theme.accent,
+            (false, FileKind::Header) => theme.blue_gray,
             _ => theme.text,
         }
     };
@@ -118,12 +122,14 @@ fn tree_row(
         // Hover affordance (§2; main.css:562-564 `.file-tree-row:hover`).
         .hover(|s| s.bg(rgb(theme.border)));
 
-    if is_active {
+    if is_active || is_selected {
         el = el.bg(rgb(theme.border));
     }
 
     let is_dir = row.is_dir;
     el.on_click(cx.listener(move |app, _ev, _win, cx| {
+        // Every click sets the selection, so the next terminal opens here.
+        app.select_tree_path(path.clone());
         if is_dir {
             app.toggle_dir(path.clone());
         } else {
@@ -142,6 +148,28 @@ fn tree_row(
             .child(crate::assets::ui_icon(icon_name, 14., glyph_color)),
     )
     .child(div().text_color(rgb(label_color)).child(row.name))
+}
+
+/// The icon name and tint for one file kind. Every name here must also appear in
+/// `assets::ICONS` (the `every_ui_icon_resolves` test guards that).
+fn kind_glyph(kind: FileKind, theme: &Theme) -> (&'static str, u32) {
+    match kind {
+        FileKind::Source => ("file-code", theme.accent),
+        FileKind::Header => ("code", theme.blue_gray),
+        FileKind::Shader => ("cpu", theme.amber),
+        FileKind::Script => ("file-code", theme.periwinkle),
+        FileKind::Shell => ("file-terminal", theme.periwinkle),
+        FileKind::Build => ("hammer", theme.amber),
+        FileKind::Config => ("settings", theme.blue_gray),
+        FileKind::Data => ("braces", theme.amber),
+        FileKind::Table => ("table", theme.accent),
+        FileKind::Model => ("box", theme.periwinkle),
+        FileKind::Doc => ("file-text", theme.text),
+        FileKind::Image => ("image", theme.periwinkle),
+        FileKind::Archive => ("package", theme.muted),
+        FileKind::Lock => ("lock", theme.muted),
+        FileKind::Other => ("file", theme.muted),
+    }
 }
 
 /// Stable-ish element id from a path (hash of the string form).

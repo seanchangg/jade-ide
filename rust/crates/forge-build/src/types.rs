@@ -51,6 +51,12 @@ pub struct BuildResult {
     pub executable: Option<PathBuf>,
     pub errors: Vec<BuildError>,
     pub duration: Duration,
+    /// The CMake project root the build ran from. Launch cwd for Run/Debug
+    /// follows THIS (the built project), not the currently-active workspace —
+    /// they differ when multiple projects are open, and running a program from
+    /// the wrong root breaks its relative data paths.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_root: Option<PathBuf>,
 }
 
 /// Input to [`crate::BuildEngine::run`] (build-runner.ts `run()` config).
@@ -60,6 +66,12 @@ pub struct RunConfig {
     pub args: Vec<String>,
     pub enable_sanitizers: bool,
     pub enable_instrumentation: bool,
+    /// Working directory for the launched program. `None` falls back to the
+    /// executable's parent (the build dir). The app sets this to the project
+    /// root so relative paths in the program (e.g. `fopen("data.txt")`)
+    /// resolve like they do in CLion — otherwise the binary runs from
+    /// `cmake-build-*/` and can't find its sibling data files.
+    pub cwd: Option<PathBuf>,
 }
 
 /// Whether a memory event is an allocation or a free.

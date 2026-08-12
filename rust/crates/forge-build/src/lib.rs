@@ -33,6 +33,10 @@ use tokio::sync::oneshot;
 
 pub use compile::OutputSink;
 pub use dylib::{INTERPOSE_DYLIB, PROBE_DYLIB};
+// Instrumentation-line parsers, re-exported so the Debug (LLDB) path can
+// apply the same `__FORGE_*` handling to console output that `run` applies
+// to a directly-spawned child's stdio.
+pub use parse::{parse_alloc_free, parse_heap_summary, parse_scalar, parse_timing};
 pub use run::RunHandle;
 pub use symbolicate::AtosSymbolicator;
 pub use types::*;

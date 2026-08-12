@@ -116,6 +116,12 @@ pub struct GridSnapshot {
     /// configured scrollback limit (default 1000). Each inner `Vec` is a full
     /// row of `cols` cells.
     pub scrollback: Vec<Vec<Cell>>,
+    /// DECCKM application cursor keys mode (`?1h`): arrows should be encoded
+    /// as SS3 (`ESC O A`…) instead of CSI (`ESC [ A`…).
+    pub app_cursor: bool,
+    /// Bracketed paste mode (`?2004h`): pasted text should be wrapped in
+    /// `ESC [ 200~` … `ESC [ 201~` so TUIs can tell paste from typing.
+    pub bracketed_paste: bool,
 }
 
 impl GridSnapshot {

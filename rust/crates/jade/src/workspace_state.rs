@@ -56,6 +56,14 @@ pub struct WorkspaceUi {
     pub benchmarks: Vec<Benchmark>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ai_completion_enabled: Option<bool>,
+    /// Timer bundles (synthetic summed series, e.g. "Forward") — the member
+    /// kernel names are project-specific, so definitions live per-workspace.
+    /// ALWAYS serialized (never skip-if-empty): the merge in [`save_to`]
+    /// removes absent owned keys, so a skipped empty vec would erase persisted
+    /// bundles any time a save ran while none were loaded. Explicit `[]` means
+    /// "user has no bundles"; absence must only ever mean "older writer".
+    #[serde(default)]
+    pub timer_groups: Vec<crate::timer_groups::TimerGroupDef>,
 }
 
 /// The keys Jade writes into the `ui` object (everything except `stickyNotes`,
@@ -70,6 +78,7 @@ const OWNED_KEYS: &[&str] = &[
     "breakpoints",
     "benchmarks",
     "aiCompletionEnabled",
+    "timerGroups",
 ];
 
 /// Load Jade's UI state for a workspace (`ui` key), or the default on any error.
@@ -173,6 +182,10 @@ mod tests {
                 timestamp: 1700000000000,
             }],
             ai_completion_enabled: Some(false),
+            timer_groups: vec![crate::timer_groups::TimerGroupDef {
+                name: "Forward".into(),
+                members: vec!["embedForward".into(), "linearForward".into()],
+            }],
         };
         save_to(&path, &ui);
         assert_eq!(load_from(&path), ui);

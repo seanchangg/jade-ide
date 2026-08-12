@@ -110,6 +110,10 @@ struct EventProxy {
     id: TermId,
     tx: mpsc::UnboundedSender<TermEvent>,
     dirty: Arc<AtomicBool>,
+    /// Channel back into the PTY event loop, filled in right after the loop is
+    /// created (the proxy must exist first). Carries the parser's answerback
+    /// text (`Event::PtyWrite`).
+    pty_tx: Arc<Mutex<Option<EventLoopSender>>>,
 }
 
 impl EventListener for EventProxy {
@@ -120,6 +124,15 @@ impl EventListener for EventProxy {
             Event::Wakeup => {
                 if !self.dirty.swap(true, Ordering::AcqRel) {
                     let _ = self.tx.send(TermEvent::Damaged { id: self.id });
+                }
+            }
+            // The terminal was queried (DSR cursor-position, DA device
+            // attributes, XTGETTCAP, …) and the parser produced the reply.
+            // Write it straight back to the PTY — interactive TUIs (Ink/Claude
+            // Code, vim) block on or mis-layout without these answers.
+            Event::PtyWrite(text) => {
+                if let Some(sender) = self.pty_tx.lock().unwrap().as_ref() {
+                    let _ = sender.send(Msg::Input(text.into_bytes().into()));
                 }
             }
             // Race-free child exit (SIGCHLD). Ports the `onExit` callback with
@@ -261,7 +274,13 @@ impl TermManager {
             .map_err(TermError::PtyUnavailable)?;
 
         let dirty = Arc::new(AtomicBool::new(false));
-        let proxy = EventProxy { id, tx: self.tx.clone(), dirty: Arc::clone(&dirty) };
+        let pty_tx = Arc::new(Mutex::new(None));
+        let proxy = EventProxy {
+            id,
+            tx: self.tx.clone(),
+            dirty: Arc::clone(&dirty),
+            pty_tx: Arc::clone(&pty_tx),
+        };
 
         let size = TermSize { cols: INIT_COLS as usize, rows: INIT_ROWS as usize };
         let config = TermConfig { scrolling_history: scrollback, ..Default::default() };
@@ -273,6 +292,9 @@ impl TermManager {
         let event_loop = EventLoop::new(Arc::clone(&term), proxy, pty, false, false)
             .map_err(TermError::PtyUnavailable)?;
         let sender = event_loop.channel();
+        // Fill the answerback channel before the reader thread starts, so no
+        // query reply can race the slot being empty.
+        *pty_tx.lock().unwrap() = Some(sender.clone());
         let io_thread = event_loop.spawn();
 
         inner.instances.insert(
@@ -413,7 +435,8 @@ impl TermManager {
         // Cursor: always in the screen region; map into viewport rows.
         let point = grid.cursor.point;
         let cursor_line = point.line.0 + offset;
-        let show = guard.mode().contains(TermMode::SHOW_CURSOR);
+        let mode = *guard.mode();
+        let show = mode.contains(TermMode::SHOW_CURSOR);
         let visible = show && cursor_line >= 0 && (cursor_line as usize) < rows;
         let cursor = Cursor {
             col: point.column.0.min(cols.saturating_sub(1)),
@@ -421,7 +444,15 @@ impl TermManager {
             visible,
         };
 
-        Some(GridSnapshot { cols, rows, cursor, cells, scrollback })
+        Some(GridSnapshot {
+            cols,
+            rows,
+            cursor,
+            cells,
+            scrollback,
+            app_cursor: mode.contains(TermMode::APP_CURSOR),
+            bracketed_paste: mode.contains(TermMode::BRACKETED_PASTE),
+        })
     }
 }
 

@@ -45,6 +45,24 @@ use crate::protocol::*;
 /// `run()`.
 pub trait Symbolicator: Send + Sync {
     fn variable_names(&self, addrs: &[String], exe: Option<&str>, load: &str) -> Vec<String>;
+
+    /// Resolve several allocation sites sharing one `(exe, load)` in a single
+    /// pass. A probed app declares every buffer in one startup burst — hundreds
+    /// of decls — and one `atos` process per decl thundering-herds the machine
+    /// until invocations blow their timeout and those buffers keep their
+    /// fallback names. Implementations that shell out should override this to
+    /// spawn ONE process for the whole batch; the default just loops.
+    fn variable_names_batch(
+        &self,
+        addr_sets: &[Vec<String>],
+        exe: Option<&str>,
+        load: &str,
+    ) -> Vec<Vec<String>> {
+        addr_sets
+            .iter()
+            .map(|addrs| self.variable_names(addrs, exe, load))
+            .collect()
+    }
 }
 
 /// Events surfaced to the UI layer (the Rust analogue of the renderer IPC
@@ -112,6 +130,16 @@ struct State {
     alias_pending: HashSet<String>,
     /// Installed by `forge-build` before a run; see [`Symbolicator`].
     symbolicator: Option<Arc<dyn Symbolicator>>,
+    /// Queue feeding the single symbolication worker (spawned on first use).
+    sym_tx: Option<mpsc::UnboundedSender<SymJob>>,
+}
+
+/// One buffer decl awaiting variable-name resolution.
+struct SymJob {
+    probe_name: String,
+    addrs: Vec<String>,
+    exe: Option<String>,
+    load: String,
 }
 
 impl State {
@@ -211,17 +239,21 @@ impl State {
     /// Turn symbolicated variable-name parts (innermost first) into a unique
     /// buffer alias and migrate the probe's entry onto it, recording the
     /// two-way alias so `track` messages translate back to the probe's name.
-    /// Port of `resolveBufferAlias`'s tail (telemetry-server.ts:267-289): take
-    /// the innermost name, prepend outer scopes until unique ("buf" →
-    /// "attn.buf"), then disambiguate with `#2`, `#3`… suffixes. Always clears
-    /// the `aliasPending` guard (the TS `finally`).
+    ///
+    /// The alias is always the FULL recovered scope chain ("blocks.ln2.buf"),
+    /// with `#2`, `#3`… suffixes only for identical chains (the same alloc
+    /// site run once per layer). The TS original (telemetry-server.ts:267-289)
+    /// kept the *shortest* unique name instead, which handed the first-resolved
+    /// buffer the bare innermost name ("xBuffer") and qualified only later
+    /// arrivals — and since atos resolutions complete in nondeterministic
+    /// order, which buffer won the generic name changed run to run. Full
+    /// qualification keeps sibling instances consistently specific. Always
+    /// clears the `aliasPending` guard (the TS `finally`).
     fn apply_symbolicated_alias(&mut self, kind: Kind, probe_name: &str, parts: Vec<String>) {
         if !parts.is_empty() {
             let mut alias = parts[0].clone();
-            let mut i = 1;
-            while i < parts.len() && self.probe_names.contains_key(&key_of(kind, &alias)) {
-                alias = format!("{}.{}", parts[i], alias);
-                i += 1;
+            for outer in &parts[1..] {
+                alias = format!("{}.{}", outer, alias);
             }
             if self.probe_names.contains_key(&key_of(kind, &alias)) {
                 let mut k = 2;
@@ -296,6 +328,7 @@ impl TelemetryServer {
             events: events_tx,
             alias_pending: HashSet::new(),
             symbolicator: None,
+            sym_tx: None,
         }));
 
         let accept_state = state.clone();
@@ -604,9 +637,9 @@ fn maybe_symbolicate(state: &mut State, state_arc: &Arc<Mutex<State>>, decl: &De
     if decl.kind != Kind::Buffer {
         return;
     }
-    let Some(symbolicator) = state.symbolicator.clone() else {
+    if state.symbolicator.is_none() {
         return;
-    };
+    }
     let Some(meta) = decl.meta.as_ref() else {
         return;
     };
@@ -632,16 +665,72 @@ fn maybe_symbolicate(state: &mut State, state_arc: &Arc<Mutex<State>>, decl: &De
         return; // already resolving this probe name
     }
 
-    let state_arc = state_arc.clone();
+    // One worker drains the queue in batches: a probed app declares every
+    // buffer in one startup burst, and one atos process per decl (the previous
+    // shape) ran hundreds of atos concurrently — enough contention that some
+    // blew their timeout and kept their fallback names.
+    let tx = match &state.sym_tx {
+        Some(tx) => tx.clone(),
+        None => {
+            let (tx, rx) = mpsc::unbounded_channel();
+            state.sym_tx = Some(tx.clone());
+            spawn_sym_worker(rx, state_arc.clone());
+            tx
+        }
+    };
+    let _ = tx.send(SymJob {
+        probe_name,
+        addrs,
+        exe,
+        load,
+    });
+}
+
+/// Symbolication worker: debounce-collect queued jobs, group them by
+/// `(exe, load)`, resolve each group with ONE batched symbolicator call, and
+/// apply the aliases. `alias_pending` entries are cleared by
+/// `apply_symbolicated_alias` even when resolution yields nothing.
+fn spawn_sym_worker(mut rx: mpsc::UnboundedReceiver<SymJob>, state_arc: Arc<Mutex<State>>) {
     tokio::spawn(async move {
-        let names = tokio::task::spawn_blocking(move || {
-            symbolicator.variable_names(&addrs, exe.as_deref(), &load)
-        })
-        .await
-        .unwrap_or_default();
-        state_arc
-            .lock()
-            .unwrap()
-            .apply_symbolicated_alias(Kind::Buffer, &probe_name, names);
+        while let Some(first) = rx.recv().await {
+            let mut jobs = vec![first];
+            // Collect the rest of the burst; cap the batch so one atos argv
+            // stays reasonable.
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(50);
+            while jobs.len() < 128 {
+                match tokio::time::timeout_at(deadline, rx.recv()).await {
+                    Ok(Some(job)) => jobs.push(job),
+                    _ => break,
+                }
+            }
+
+            let mut groups: HashMap<(Option<String>, String), Vec<SymJob>> = HashMap::new();
+            for job in jobs {
+                groups
+                    .entry((job.exe.clone(), job.load.clone()))
+                    .or_default()
+                    .push(job);
+            }
+            for ((exe, load), group) in groups {
+                let Some(symbolicator) = state_arc.lock().unwrap().symbolicator.clone() else {
+                    let mut state = state_arc.lock().unwrap();
+                    for job in &group {
+                        state.alias_pending.remove(&job.probe_name);
+                    }
+                    continue;
+                };
+                let addr_sets: Vec<Vec<String>> = group.iter().map(|j| j.addrs.clone()).collect();
+                let names = tokio::task::spawn_blocking(move || {
+                    symbolicator.variable_names_batch(&addr_sets, exe.as_deref(), &load)
+                })
+                .await
+                .unwrap_or_default();
+                let mut state = state_arc.lock().unwrap();
+                for (i, job) in group.iter().enumerate() {
+                    let parts = names.get(i).cloned().unwrap_or_default();
+                    state.apply_symbolicated_alias(Kind::Buffer, &job.probe_name, parts);
+                }
+            }
+        }
     });
 }

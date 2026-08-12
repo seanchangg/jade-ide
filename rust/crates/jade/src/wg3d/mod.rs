@@ -20,6 +20,8 @@
 pub mod camera;
 pub mod grid;
 pub mod math;
+#[cfg(target_os = "macos")]
+pub mod metal;
 pub mod render;
 
 pub use grid::WeightGrid3D;

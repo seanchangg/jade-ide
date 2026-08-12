@@ -116,18 +116,29 @@ impl DebugSession {
     /// the console one character per row. Chunks accumulate in
     /// [`console_partial`](Self::console_partial); only newline-terminated
     /// lines move into the scrollback.
-    pub fn push_console(&mut self, text: &str) {
+    ///
+    /// `__FORGE_*` instrumentation lines (interposer heap summaries, the
+    /// `idetools.h` alloc/scalar/timing macros) are data, not program output:
+    /// they're swallowed from the console and returned for the caller to
+    /// parse — the debug-path counterpart of `run`'s stdio handlers.
+    pub fn push_console(&mut self, text: &str) -> Vec<String> {
+        let mut forge_lines = Vec::new();
         self.console_partial.push_str(&crate::output::strip_ansi(text));
         while let Some(pos) = self.console_partial.find('\n') {
             let rest = self.console_partial.split_off(pos + 1);
             let line = std::mem::replace(&mut self.console_partial, rest);
-            self.console
-                .push(line.trim_end_matches(['\n', '\r']).to_string());
+            let line = line.trim_end_matches(['\n', '\r']);
+            if line.trim_start().starts_with("__FORGE_") {
+                forge_lines.push(line.trim().to_string());
+            } else {
+                self.console.push(line.to_string());
+            }
         }
         if self.console.len() > CONSOLE_MAX {
             let drop = self.console.len() - CONSOLE_MAX;
             self.console.drain(0..drop);
         }
+        forge_lines
     }
 
     /// Whether a variable path is currently expanded.
@@ -210,6 +221,14 @@ fn walk_vars<'a>(
             }
         }
     }
+}
+
+/// Whether a stop/frame location reported by LLDB refers to `active` (the open
+/// file). LLDB reports either a full path or a bare file name depending on how
+/// the binary was compiled, so match the whole path or the trailing component.
+pub fn location_matches_file(active: &std::path::Path, reported: &str) -> bool {
+    active.as_os_str() == reported
+        || std::path::Path::new(reported).file_name() == active.file_name()
 }
 
 /// Whether a `Removed` or `Added` breakpoint toggle occurred, so the caller can
@@ -405,6 +424,18 @@ mod tests {
     }
 
     #[test]
+    fn location_matching_full_path_and_bare_name() {
+        use std::path::Path;
+        let active = Path::new("/ws/src/main.cpp");
+        // Full-path report and bare-name report both match the open file.
+        assert!(location_matches_file(active, "/ws/src/main.cpp"));
+        assert!(location_matches_file(active, "main.cpp"));
+        // A different file (even same directory) does not.
+        assert!(!location_matches_file(active, "/ws/src/util.cpp"));
+        assert!(!location_matches_file(active, "util.cpp"));
+    }
+
+    #[test]
     fn console_strips_ansi() {
         let mut s = DebugSession::new();
         s.push_console("\x1b[32mrunning\x1b[0m\n");
@@ -429,5 +460,25 @@ mod tests {
         assert_eq!(s.console[1], "(lldb) run");
         assert_eq!(s.console[2], "Process 1 launched");
         assert_eq!(s.console_partial, "partial");
+    }
+
+    #[test]
+    fn console_swallows_and_returns_forge_lines() {
+        let mut s = DebugSession::new();
+        // Instrumentation lines never reach the console; complete lines come
+        // back for the caller to parse. Byte-at-a-time delivery still works.
+        let mut got = Vec::new();
+        got.extend(s.push_console("__FORGE_HEAP_SUMMARY|1|2|3|4|5|6\nhello\n"));
+        for ch in "__FORGE_INTERPOSE_ACTIVE\n".chars() {
+            got.extend(s.push_console(&ch.to_string()));
+        }
+        assert_eq!(s.console, vec!["hello".to_string()]);
+        assert_eq!(
+            got,
+            vec![
+                "__FORGE_HEAP_SUMMARY|1|2|3|4|5|6".to_string(),
+                "__FORGE_INTERPOSE_ACTIVE".to_string(),
+            ]
+        );
     }
 }

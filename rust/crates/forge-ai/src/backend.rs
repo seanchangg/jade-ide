@@ -13,8 +13,8 @@
 //!   the published status, so a slow managed health-probe never blocks typing.
 
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -23,7 +23,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::{watch, Mutex as AsyncMutex};
 use tokio::task::AbortHandle;
 
-use crate::{AiModelId, AiState, AiStatus, InfillRequest, InfillResult};
+use crate::{AiModelId, AiState, AiStatus, InfillRequest, InfillResult, ModelSource};
 
 // ── Constants (TS :15-29) ──
 const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:8012";
@@ -55,6 +55,12 @@ struct Shared {
     status_tx: watch::Sender<AiStatus>,
     lifecycle: AsyncMutex<Lifecycle>,
     stopped: AtomicBool,
+    /// PID of the managed server, or 0 for none. It duplicates `lifecycle.proc`
+    /// on purpose: quit and signal handlers must kill the server *without*
+    /// taking the async lock or awaiting anything. See `kill_managed_now`.
+    /// Also set when `start()` adopts an orphan left by a previous Jade, so the
+    /// orphan dies with this run.
+    managed_pid: AtomicU32,
     /// The abort handle of the in-flight `/infill` task and its generation, so a
     /// superseding call can abort it (the `AbortController` port, TS :36, :122).
     inflight: std::sync::Mutex<Option<(u64, AbortHandle)>>,
@@ -95,6 +101,7 @@ impl InlineCompletionBackend {
                     model_id: AiModelId::default(),
                 }),
                 stopped: AtomicBool::new(false),
+                managed_pid: AtomicU32::new(0),
                 inflight: std::sync::Mutex::new(None),
                 inflight_gen: AtomicU64::new(0),
                 client,
@@ -142,16 +149,30 @@ impl InlineCompletionBackend {
         candidates.push(DEFAULT_ENDPOINT.to_string());
         candidates.push(managed_endpoint());
 
+        let managed = managed_endpoint();
         for ep in candidates {
             let healthy = shared.is_healthy(&ep).await;
             if shared.stopped.load(Ordering::SeqCst) {
                 return; // turned off while we were probing (TS :59)
             }
             if healthy {
+                // A healthy server on our own managed port, with a live PID in
+                // our PID file, is an orphan from a previous Jade that did not
+                // exit cleanly. Adopt it rather than kill it — the weights are
+                // already loaded — but take ownership of the PID so quitting
+                // this run takes it down. Servers on any other endpoint belong
+                // to somebody else and are never killed.
+                if ep == managed {
+                    if let Some(pid) = read_pid_file().filter(|pid| pid_is_alive(*pid)) {
+                        shared.managed_pid.store(pid, Ordering::SeqCst);
+                    }
+                }
                 shared.set_status(AiStatus::ready(format!("Connected to {ep}"), ep));
                 return;
             }
         }
+        // No managed server answered, so any PID we recorded is dead.
+        clear_pid_file();
 
         // Nothing running — spawn our own (TS :67-76).
         let Some(bin) = find_llama_server() else {
@@ -183,6 +204,10 @@ impl InlineCompletionBackend {
         if let Some(mut child) = life.proc.take() {
             let _ = child.start_kill(); // SIGKILL; releases GPU memory (TS :85-87)
         }
+        // Kill by PID too: `start_kill` only covers a child we still hold, and
+        // an adopted orphan has no `Child` at all.
+        kill_pid(shared.managed_pid.swap(0, Ordering::SeqCst));
+        clear_pid_file();
         life.startup_gen = life.startup_gen.wrapping_add(1); // retire the poll loop
         shared.set_status(AiStatus::new(AiState::Disabled, detail));
     }
@@ -190,6 +215,47 @@ impl InlineCompletionBackend {
     /// `shutdown()` (TS :157-159) — stop with the shutdown detail.
     pub async fn shutdown(&self) {
         self.stop_with(String::from("Shutting down")).await;
+    }
+
+    /// Kill the managed server **now**, synchronously, and report whether a
+    /// signal went out.
+    ///
+    /// Quit paths cannot use [`shutdown`](Self::shutdown): it is async and takes
+    /// the lifecycle lock, but GPUI ends the process from `on_app_quit` and a
+    /// signal handler has no runtime to await on. `kill_on_drop` does not save
+    /// us either — the process exits without dropping the tokio `Child`. That is
+    /// why llama-server kept running (and kept the GPU busy) after Jade closed.
+    ///
+    /// Only ever kills a server this backend spawned or adopted on the managed
+    /// port. An external endpoint (`JADE_FIM_ENDPOINT`, or a server on
+    /// [`DEFAULT_ENDPOINT`]) is left alone.
+    pub fn kill_managed_now(&self) -> bool {
+        let shared = &self.shared;
+        shared.stopped.store(true, Ordering::SeqCst);
+        let killed = kill_pid(shared.managed_pid.swap(0, Ordering::SeqCst));
+        clear_pid_file();
+        killed
+    }
+
+    /// Spawn the managed server directly, skipping endpoint resolution.
+    ///
+    /// Test seam only. [`start`](Self::start) adopts whatever already answers on
+    /// 8012 or the managed port, so on a machine that is running Jade (or a
+    /// llama-server for an eval) a spawn-then-kill test would never spawn.
+    #[doc(hidden)]
+    pub async fn spawn_managed_for_test(&self, bin: &str) {
+        let mut life = self.shared.lifecycle.lock().await;
+        self.shared.stopped.store(false, Ordering::SeqCst);
+        self.shared.spawn_managed(&mut life, bin);
+    }
+
+    /// PID of the managed server, or `None`. Test seam.
+    #[doc(hidden)]
+    pub fn managed_pid(&self) -> Option<u32> {
+        match self.shared.managed_pid.load(Ordering::SeqCst) {
+            0 => None,
+            pid => Some(pid),
+        }
     }
 
     /// Switch the managed model tier, restarting the server only if it's a child
@@ -318,16 +384,39 @@ impl Shared {
         let endpoint = managed_endpoint();
         let model = life.model_id;
 
+        // A local GGUF that is not there can never become ready, and the poll
+        // loop would just time out. Say so now, with the path we looked for.
+        let (src_flag, src_value) = match model.source() {
+            ModelSource::Hf(repo) => ("-hf", repo.to_string()),
+            ModelSource::Local(path) => {
+                if !path.exists() {
+                    self.set_status(AiStatus::new(
+                        AiState::Error,
+                        format!(
+                            "{} needs a GGUF at {}. Build one with ml/train/export_gguf.py, \
+                             or set FORGE_SPRITE_MODEL to point elsewhere.",
+                            model.label(),
+                            path.display()
+                        ),
+                    ));
+                    return;
+                }
+                ("-m", path.to_string_lossy().into_owned())
+            }
+        };
+
         self.set_status(AiStatus::new(
             AiState::Starting,
             format!("Starting {} (downloads on first use)…", model.label()),
         ));
 
-        // Spawn args, verbatim (TS :201-210).
+        // Spawn args, verbatim (TS :201-210), except that the weights may now
+        // come off disk and the batch size is per-model (see AiModelId::batch).
+        let batch = model.batch().to_string();
         let mut cmd = Command::new(bin);
         cmd.args([
-            "-hf",
-            model.hf(),
+            src_flag,
+            &src_value,
             "--host",
             "127.0.0.1",
             "--port",
@@ -335,9 +424,9 @@ impl Shared {
             "-ngl",
             "99", // full GPU offload (Metal)
             "-ub",
-            "1024",
+            &batch,
             "-b",
-            "1024",
+            &batch,
             "--ctx-size",
             "0", // use the model's full context window
             "--cache-reuse",
@@ -384,6 +473,12 @@ impl Shared {
 
         life.startup_gen = life.startup_gen.wrapping_add(1);
         let gen = life.startup_gen;
+        // Record the PID before anything can await, so a quit that lands in the
+        // next microsecond still finds a server to kill. The file survives a
+        // crash, which is how the *next* run finds this server (see `start`).
+        let pid = child.id().unwrap_or(0);
+        self.managed_pid.store(pid, Ordering::SeqCst);
+        write_pid_file(pid);
         life.proc = Some(child);
 
         // Poll until the model is loaded (server returns 503 while loading),
@@ -421,6 +516,8 @@ impl Shared {
             if let Some(child) = life.proc.as_mut() {
                 if let Ok(Some(exit)) = child.try_wait() {
                     life.proc = None;
+                    self.managed_pid.store(0, Ordering::SeqCst); // it is gone
+                    clear_pid_file();
                     let ready = self.status_tx.borrow().state == AiState::Ready;
                     if !self.stopped.load(Ordering::SeqCst) && !ready {
                         let tail = stderr_tail.lock().unwrap().clone();
@@ -457,6 +554,8 @@ impl Shared {
                 if let Some(mut child) = life.proc.take() {
                     let _ = child.start_kill();
                 }
+                kill_pid(self.managed_pid.swap(0, Ordering::SeqCst));
+                clear_pid_file();
                 life.startup_gen = life.startup_gen.wrapping_add(1);
                 self.set_status(AiStatus::new(AiState::Disabled, "Shutting down"));
                 return;
@@ -471,7 +570,12 @@ fn infill_body(req: &InfillRequest) -> serde_json::Value {
         "input_prefix": req.prefix,
         "input_suffix": req.suffix,
         "n_predict": if req.single_line { 64 } else { 96 },
-        "stop": if req.single_line { vec!["\n"] } else { Vec::<&str>::new() },
+        // Multiline stops at a blank line: the client cuts there anyway
+        // (`ghost::post_process`), so generating past it only burns latency —
+        // benchmarked, the 96-token cap was routinely hit generating text that
+        // was then thrown away (JetBrains FLCC likewise prefers
+        // newline-terminated hypotheses over longer ones, arXiv 2405.08704).
+        "stop": if req.single_line { vec!["\n"] } else { vec!["\n\n"] },
         "top_k": 40,
         "top_p": 0.99,
         "temperature": 0.1,
@@ -506,6 +610,59 @@ fn find_llama_server() -> Option<String> {
         }
     }
     None
+}
+
+/// SIGKILL `pid`, the same signal `stop()` has always sent. A PID of 0 means
+/// "no managed server" and is ignored. Returns whether the signal went out.
+fn kill_pid(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    // SAFETY: `kill` with a positive PID and a valid signal number. The worst
+    // case is ESRCH (the process is already gone), which we report as `false`.
+    unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) == 0 }
+}
+
+/// Is `pid` still a live process? `signal 0` runs the permission and existence
+/// checks without delivering anything.
+fn pid_is_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    // SAFETY: as `kill_pid`; signal 0 delivers nothing.
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+/// Where the managed server's PID is recorded, so the next run can find a
+/// server this one left behind. `JADE_LLAMA_PIDFILE` overrides it, which keeps
+/// tests off the real `~/.config/jade`.
+fn pid_file() -> Option<PathBuf> {
+    if let Ok(explicit) = std::env::var("JADE_LLAMA_PIDFILE") {
+        if !explicit.is_empty() {
+            return Some(PathBuf::from(explicit));
+        }
+    }
+    let home = std::env::var_os("HOME")?;
+    Some(Path::new(&home).join(".config/jade/llama-server.pid"))
+}
+
+fn write_pid_file(pid: u32) {
+    let Some(path) = pid_file() else { return };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, pid.to_string());
+}
+
+fn read_pid_file() -> Option<u32> {
+    let text = std::fs::read_to_string(pid_file()?).ok()?;
+    text.trim().parse().ok()
+}
+
+fn clear_pid_file() {
+    if let Some(path) = pid_file() {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 /// `fs.accessSync(candidate, X_OK)` equivalent (TS :185-188).

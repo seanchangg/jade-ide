@@ -43,6 +43,9 @@ pub const SIZES_DEBOUNCE_MS: u64 = 1000;
 pub const FLOW_DEBOUNCE_MS: u64 = 300;
 /// Structure-outline recompute delay (inventory §10: 800ms).
 pub const STRUCT_DEBOUNCE_MS: u64 = 800;
+/// Sync-detection delay (§4.13): the edit must settle before the cross-file
+/// detectors compare the buffer against its snapshot.
+pub const SYNC_DEBOUNCE_MS: u64 = 600;
 
 /// One open, editable file.
 ///
@@ -83,11 +86,34 @@ pub struct OpenTab {
     pub flow_debounce: Debounce,
     /// Debounce for the symbol-outline recompute (§10: 800ms).
     pub struct_debounce: Debounce,
+    /// Debounce for the cross-file sync detectors (§4.13: 600ms).
+    pub sync_debounce: Debounce,
+    /// The buffer text at the last sync-quiescent point. The detectors compare
+    /// the current text against this snapshot, then replace it.
+    pub sync_snapshot: String,
     palette: TokenPalette,
     /// Compiled highlighter reused across edits. Building one compiles the
     /// tree-sitter query from source (~20ms) — doing that per keystroke was
     /// the editor's typing latency. `None` for non-highlightable files.
     highlighter: Option<highlight::Highlighter>,
+    /// Longest line's length in chars (columns), cached so the code viewer can
+    /// size rows for horizontal scrolling without an O(file) scan every frame.
+    /// Recomputed on the same per-edit text pass as [`rehighlight`](Self::rehighlight).
+    pub max_cols: usize,
+    /// Remembered vertical page position (top display row) for this tab, so
+    /// switching away and back — or between tabs — restores where you were
+    /// reading. Updated when the tab is switched away from; applied on return.
+    pub scroll_top: usize,
+}
+
+/// The longest line's length in `char`s (columns) — the horizontal-scroll extent.
+/// Wide glyphs count as one column, matching the viewer's `CHAR_W` monospace
+/// approximation.
+fn max_line_cols(text: &str) -> usize {
+    text.split('\n')
+        .map(|l| l.chars().count())
+        .max()
+        .unwrap_or(0)
 }
 
 impl OpenTab {
@@ -137,8 +163,12 @@ impl OpenTab {
             sizes_debounce: Debounce::new(SIZES_DEBOUNCE_MS),
             flow_debounce: Debounce::new(FLOW_DEBOUNCE_MS),
             struct_debounce: Debounce::new(STRUCT_DEBOUNCE_MS),
+            sync_debounce: Debounce::new(SYNC_DEBOUNCE_MS),
+            sync_snapshot: text.to_string(),
             palette,
             highlighter,
+            max_cols: max_line_cols(text),
+            scroll_top: 0,
         }
     }
 
@@ -170,6 +200,7 @@ impl OpenTab {
         self.sizes_debounce.arm(now_ms);
         self.flow_debounce.arm(now_ms);
         self.struct_debounce.arm(now_ms);
+        self.sync_debounce.arm(now_ms);
     }
 
     /// Full-file re-highlight (see the module-level invalidation note). The
@@ -181,6 +212,7 @@ impl OpenTab {
             None => highlight::highlight_file(&self.path, &text, self.palette),
         };
         self.fold_map = fold_regions(&text);
+        self.max_cols = max_line_cols(&text);
     }
 
     /// Swap the token palette (theme toggle, §4.2): rebuild the cached
@@ -223,6 +255,7 @@ impl OpenTab {
         self.sizes_debounce.is_pending()
             || self.flow_debounce.is_pending()
             || self.struct_debounce.is_pending()
+            || self.sync_debounce.is_pending()
     }
 
     /// The monotonic LSP document version (buffer version + 1, so `didOpen` is 1).
@@ -439,6 +472,9 @@ pub struct CellStyle {
     pub underline: Option<u32>,
     /// True when this byte is inside the IME marked (composing) range.
     pub marked: bool,
+    /// True when this byte is inside a find match (rendered as an amber wash so
+    /// every occurrence is visible; the *current* match also sets `selected`).
+    pub find_match: bool,
 }
 
 /// Flatten the style layers for one line into coalesced `(byte-range, CellStyle)`
@@ -451,6 +487,7 @@ pub fn merge_line_styles(
     selection: Option<Range<usize>>,
     underlines: &[(Range<usize>, u32)],
     marked: Option<Range<usize>>,
+    find_matches: &[Range<usize>],
 ) -> Vec<(Range<usize>, CellStyle)> {
     if len == 0 {
         return Vec::new();
@@ -459,6 +496,11 @@ pub fn merge_line_styles(
     for s in syntax {
         for cell in &mut cells[s.start.min(len)..s.end.min(len)] {
             cell.color = Some(s.color);
+        }
+    }
+    for r in find_matches {
+        for cell in &mut cells[r.start.min(len)..r.end.min(len)] {
+            cell.find_match = true;
         }
     }
     if let Some(sel) = selection {
@@ -720,6 +762,14 @@ pub fn completion_edit(
     buffer: &Buffer,
     ident_range: Range<usize>,
 ) -> (Range<usize>, String) {
+    // Snippet items (`snippetSupport: true`) carry LSP snippet syntax in their
+    // text — `foo(${1:int a}, ${2:int b})` — which must be expanded, not inserted
+    // literally. We keep each placeholder's default text so completing a call
+    // fills in its parameters as editable text (the signature hint shows them
+    // too); tabstops/variables are dropped.
+    let is_snippet = item.insert_text_format == Some(lsp_types::InsertTextFormat::SNIPPET);
+    let expand = |text: String| if is_snippet { strip_snippet(&text) } else { text };
+
     if let Some(te) = &item.text_edit {
         let (range, text) = match te {
             CompletionTextEdit::Edit(e) => (&e.range, e.new_text.clone()),
@@ -727,13 +777,98 @@ pub fn completion_edit(
         };
         let s = buffer.lsp_to_offset(lsp_pos(range.start));
         let end = buffer.lsp_to_offset(lsp_pos(range.end));
-        return (s..end, text);
+        return (s..end, expand(text));
     }
     let text = item
         .insert_text
         .clone()
         .unwrap_or_else(|| item.label.clone());
-    (ident_range, text)
+    (ident_range, expand(text))
+}
+
+/// Expand LSP snippet syntax to plain text, keeping placeholder default text so a
+/// completed call shows its parameters (`foo(${1:int a}, ${2:int b})` →
+/// `foo(int a, int b)`). Handles `${n:default}` (default kept, nested-aware),
+/// `${n|a,b|}` (first choice), bare `$n` / `${n}` / `$var` (dropped), and the
+/// `\$ \} \\` escapes.
+pub fn strip_snippet(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    let mut out = String::with_capacity(s.len());
+    snippet_text(&chars, &mut i, &mut out, false);
+    out
+}
+
+/// Parse snippet body into `out`. When `in_placeholder`, stops after the matching
+/// unescaped `}` (which it consumes).
+fn snippet_text(chars: &[char], i: &mut usize, out: &mut String, in_placeholder: bool) {
+    while *i < chars.len() {
+        match chars[*i] {
+            '\\' => {
+                // Escape: emit the next char literally (or a lone trailing '\').
+                if *i + 1 < chars.len() {
+                    out.push(chars[*i + 1]);
+                    *i += 2;
+                } else {
+                    out.push('\\');
+                    *i += 1;
+                }
+            }
+            '}' if in_placeholder => {
+                *i += 1;
+                return;
+            }
+            '$' => {
+                *i += 1;
+                if *i < chars.len() && chars[*i] == '{' {
+                    *i += 1;
+                    snippet_placeholder(chars, i, out);
+                } else {
+                    // Bare `$1` / `$var`: drop the identifier/number.
+                    while *i < chars.len() && (chars[*i].is_alphanumeric() || chars[*i] == '_') {
+                        *i += 1;
+                    }
+                }
+            }
+            c => {
+                out.push(c);
+                *i += 1;
+            }
+        }
+    }
+}
+
+/// Parse the body after `${`: a tabstop number or variable, then optional
+/// `:default` (kept) or `|choice,…|` (first kept), then the closing `}`.
+fn snippet_placeholder(chars: &[char], i: &mut usize, out: &mut String) {
+    // Skip the leading tabstop number / variable name.
+    while *i < chars.len() && !matches!(chars[*i], ':' | '}' | '|') {
+        *i += 1;
+    }
+    match chars.get(*i) {
+        Some(':') => {
+            *i += 1;
+            snippet_text(chars, i, out, true); // default text (nested-aware)
+        }
+        Some('|') => {
+            *i += 1; // ${1|a,b,c|} → keep the first option
+            while *i < chars.len() && !matches!(chars[*i], ',' | '|') {
+                out.push(chars[*i]);
+                *i += 1;
+            }
+            while *i < chars.len() && chars[*i] != '}' {
+                *i += 1;
+            }
+            if *i < chars.len() {
+                *i += 1; // consume '}'
+            }
+        }
+        _ => {
+            if *i < chars.len() {
+                *i += 1; // consume '}' of a bare ${1}
+            }
+        }
+    }
 }
 
 fn lsp_pos(p: LspRange) -> LspPosition {
@@ -827,6 +962,28 @@ pub fn selection_on_line(
     Some(cs..ce)
 }
 
+/// Every find match intersecting `[line_start, line_end]`, clipped and made
+/// line-relative (byte coords). `matches` are whole-buffer byte ranges. Empty
+/// when no match touches this line.
+pub fn find_matches_on_line(
+    matches: &[Range<usize>],
+    line_start: usize,
+    line_end: usize,
+) -> Vec<Range<usize>> {
+    let mut out = Vec::new();
+    for m in matches {
+        if m.end <= line_start || m.start >= line_end {
+            continue;
+        }
+        let cs = m.start.max(line_start) - line_start;
+        let ce = m.end.min(line_end) - line_start;
+        if ce > cs {
+            out.push(cs..ce);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -890,10 +1047,26 @@ mod tests {
         // +1000ms (=1500).
         assert!(!t.poll_decorations(700)); // none due yet
         assert!(t.poll_decorations(800)); // flow due
-        assert!(t.decorations_pending()); // struct + sizes still pending
+        assert!(t.decorations_pending()); // struct + sizes + sync still pending
+        assert!(t.sync_debounce.poll(1100)); // sync due (the app loop polls it)
         assert!(t.poll_decorations(1300)); // struct due
         assert!(t.poll_decorations(1500)); // sizes due
         assert!(!t.decorations_pending());
+    }
+
+    #[test]
+    fn max_cols_tracks_longest_line_and_updates_on_edit() {
+        // Longest line is the 15-char "int a = 12345;" row (＝ its char count).
+        let mut t = tab_from("a.cpp", "int x;\nint a = 12345;\n");
+        assert_eq!(t.max_cols, "int a = 12345;".chars().count());
+
+        // Growing a line past the current max updates the cached extent.
+        t.buffer.set_caret(0);
+        for _ in 0..40 {
+            t.buffer.type_char('z');
+        }
+        t.on_edited(0); // rehighlight recomputes max_cols
+        assert!(t.max_cols >= 40, "max_cols grew with the edited line");
     }
 
     #[test]
@@ -1022,6 +1195,47 @@ mod tests {
     }
 
     #[test]
+    fn strip_snippet_keeps_parameter_defaults() {
+        // The exact clangd shape for a two-arg call.
+        assert_eq!(strip_snippet("foo(${1:int a}, ${2:int b})"), "foo(int a, int b)");
+        // Bare tabstops and the final `$0` vanish; `()` stays.
+        assert_eq!(strip_snippet("bar($1)$0"), "bar()");
+        assert_eq!(strip_snippet("baz(${1})"), "baz()");
+        // Choice placeholder keeps the first option.
+        assert_eq!(strip_snippet("f(${1|a,b,c|})"), "f(a)");
+        // Escapes: literal `$`, `}`, `\`.
+        assert_eq!(strip_snippet("price = \\$5"), "price = $5");
+        // Nested placeholder: the inner default is kept.
+        assert_eq!(strip_snippet("${1:outer ${2:inner}}"), "outer inner");
+        // Non-snippet text is untouched.
+        assert_eq!(strip_snippet("plain_text"), "plain_text");
+    }
+
+    #[test]
+    fn completion_edit_expands_snippet_only_when_flagged() {
+        use lsp_types::InsertTextFormat;
+        let buf = Buffer::from_text("Poi");
+        // Snippet-format constructor → expanded, params kept.
+        let snip = CompletionItem {
+            label: "Point".into(),
+            insert_text: Some("Point(${1:int x}, ${2:int y})".into()),
+            insert_text_format: Some(InsertTextFormat::SNIPPET),
+            ..Default::default()
+        };
+        let (_r, text) = completion_edit(&snip, &buf, 0..3);
+        assert_eq!(text, "Point(int x, int y)");
+
+        // Same text WITHOUT the snippet flag is inserted verbatim (never expanded).
+        let plain = CompletionItem {
+            label: "Point".into(),
+            insert_text: Some("Point(${1:int x})".into()),
+            ..Default::default()
+        };
+        let (_r, text) = completion_edit(&plain, &buf, 0..3);
+        assert_eq!(text, "Point(${1:int x})");
+    }
+
+    #[test]
     fn utf16_doc_conversions_roundtrip() {
         // Mixed BMP + astral: "aü\n🎉b" — ü is 1 utf16 unit, 🎉 is 2.
         let buf = Buffer::from_text("aü\n🎉b");
@@ -1055,7 +1269,7 @@ mod tests {
             end: 3,
             color: 0x111111,
         }];
-        let runs = merge_line_styles(6, &syntax, Some(2..5), &[(4..6, 0xff0000)], None);
+        let runs = merge_line_styles(6, &syntax, Some(2..5), &[(4..6, 0xff0000)], None, &[]);
         // Expected boundaries: 0..2 (color), 2..3 (color+sel), 3..4 (sel),
         // 4..5 (sel+underline), 5..6 (underline).
         assert_eq!(runs.len(), 5);
@@ -1066,6 +1280,25 @@ mod tests {
         assert!(runs[1].1.selected && runs[1].1.color == Some(0x111111));
         assert_eq!(runs[3].0, 4..5);
         assert!(runs[3].1.selected && runs[3].1.underline == Some(0xff0000));
+    }
+
+    #[test]
+    fn find_matches_on_line_clips() {
+        // Buffer rows: "abcd\nefgh". Row 0 bytes 0..4, row 1 bytes 5..9.
+        // Matches at bytes 1..3 (row 0) and 6..8 (row 1).
+        let matches = vec![1..3, 6..8];
+        assert_eq!(find_matches_on_line(&matches, 0, 4), vec![1..3]);
+        assert_eq!(find_matches_on_line(&matches, 5, 9), vec![1..3]); // line-relative
+        assert!(find_matches_on_line(&matches, 10, 14).is_empty());
+    }
+
+    #[test]
+    fn merge_line_styles_marks_find_matches() {
+        // A find match on 1..4, no selection: those cells get find_match set.
+        let runs = merge_line_styles(6, &[], None, &[], None, &[1..4]);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].0, 1..4);
+        assert!(runs[0].1.find_match && !runs[0].1.selected);
     }
 }
 /// Typing-latency probe (kept `#[ignore]`d; run explicitly when touching the

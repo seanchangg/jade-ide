@@ -37,8 +37,9 @@ macro_rules! icons {
 icons![
     // playback / build
     "play", "square", "hammer", "bug", "timer",
-    // files
+    // files — one glyph per file kind (see `workspace_tree::FileKind`)
     "folder", "folder-open", "file", "file-code", "code",
+    "file-text", "file-terminal", "braces", "image", "table", "package", "lock",
     // data / telemetry
     "activity", "cpu", "memory-stick", "gauge", "layers",
     "grid-3x3", "flame", "box", "list-tree", "sigma",
@@ -47,11 +48,13 @@ icons![
     "eye", "eye-off",
     // toolbar extras
     "panel-left", "panel-right", "moon", "sun", "house",
-    "corner-down-right", "circle", "circle-x", "triangle-alert", "info",
+    "corner-down-right", "circle", "circle-x", "circle-check", "triangle-alert", "info",
     // AI
     "sparkles",
     // added beyond icons.ts (lucide.dev, MIT): +/- controls + debug step glyphs
     "plus", "minus", "arrow-down", "arrow-down-to-line", "arrow-up-from-line",
+    // CLion hand-off (research-studio seam)
+    "external-link",
 ];
 
 /// GPUI asset source over the compile-time-embedded icon set. Registered on the
@@ -106,9 +109,11 @@ mod tests {
         "panel-left", "terminal", "corner-down-right", "gauge",
         "code", "hammer", "play", "bug", "square",
         "sparkles", "eye", "eye-off", "moon", "sun",
-        "circle-x", "triangle-alert", "info",
-        // file tree (panels/file_tree.rs)
+        "circle-x", "circle-check", "triangle-alert", "info",
+        // file tree (panels/file_tree.rs) — folder + one glyph per FileKind
         "folder", "folder-open", "file", "file-code", "minus",
+        "code", "cpu", "file-terminal", "hammer", "settings",
+        "braces", "table", "box", "file-text", "image", "package", "lock",
         // tab strip (panels/code_view.rs)
         "x",
         // panel headers

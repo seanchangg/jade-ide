@@ -22,7 +22,9 @@ use gpui::{
 
 use forge_telemetry::Kind;
 
+use crate::app::dim_input::DimField;
 use crate::app::JadeApp;
+use crate::registry::DEFAULT_MAX_DIM;
 use crate::theme::Theme;
 
 use super::camera::{OrbitCamera, HEIGHT_SCALE};
@@ -77,19 +79,21 @@ pub fn ensure_anim(app: &mut JadeApp, cx: &mut Context<JadeApp>) {
 }
 
 /// Build the full-window overlay element. `focus` is the pre-created handle;
-/// `vp_w`/`vp_h` are the window viewport dimensions.
+/// `vp_w`/`vp_h` are the window viewport dimensions and `scale` the window's
+/// device-pixel scale factor (capped at 2 like the TS dpr cap).
 pub fn overlay(
-    app: &JadeApp,
+    app: &mut JadeApp,
     focus: FocusHandle,
     vp_w: f32,
     vp_h: f32,
+    scale: f32,
     cx: &mut Context<JadeApp>,
 ) -> gpui::AnyElement {
     let theme = app.theme.clone();
     let canvas_w = vp_w;
     let canvas_h = (vp_h - TOOLBAR_H).max(1.0);
 
-    let grid = app.wg3d.current_bars();
+    let grid = app.wg3d.current_bars_cached();
 
     let root = div()
         .absolute()
@@ -108,7 +112,7 @@ pub fn overlay(
             }
         }))
         .child(toolbar(app, &theme, cx))
-        .child(scene(app, grid, &theme, canvas_w, canvas_h, cx));
+        .child(scene(app, grid, &theme, canvas_w, canvas_h, scale.min(2.0), cx));
 
     root.into_any_element()
 }
@@ -156,12 +160,18 @@ fn toolbar(app: &JadeApp, theme: &Theme, cx: &mut Context<JadeApp>) -> gpui::Any
         );
     }
 
-    // Resolution select (≤64/≤128/≤256). Sets the interactive display budget
-    // (default 64 so the CPU sort+paint stays comfortable) AND forwards to the
-    // registry's streaming maxDim setter, as the TS `resSelect` did. Pushing
-    // `track` to the probe rides the app's normal enable path.
+    // Streaming resolution (≤64/≤128/≤256, weight-grid-3d.ts `resSelect`,
+    // default 256): the chips reflect the REGISTRY's per-buffer maxDim (the
+    // value actually sent to the probe), not the local paint budget — those
+    // are two different caps. `set_buffer_max_dim` persists + re-pushes
+    // `track`; `set_view_max_dim` is kept alongside as the separate Rust-side
+    // CPU sort+paint budget (never shown to the user).
     let sel_name = app.wg3d.selected().map(|s| s.to_string());
-    let cur_res = app.wg3d.view_max_dim();
+    let cur_res = sel_name
+        .as_deref()
+        .and_then(|n| app.registry.get(Kind::Buffer, n))
+        .and_then(|i| i.max_dim)
+        .unwrap_or(DEFAULT_MAX_DIM);
     for dim in [64u32, 128, 256] {
         let name = sel_name.clone();
         let active = cur_res == dim;
@@ -176,7 +186,7 @@ fn toolbar(app: &JadeApp, theme: &Theme, cx: &mut Context<JadeApp>) -> gpui::Any
                 .on_click(cx.listener(move |app, _e, _w, cx| {
                     app.wg3d.set_view_max_dim(dim);
                     if let Some(n) = &name {
-                        app.registry.set_max_dim(Kind::Buffer, n, dim);
+                        app.set_buffer_max_dim(n, dim);
                     }
                     cx.notify();
                 }))
@@ -184,17 +194,12 @@ fn toolbar(app: &JadeApp, theme: &Theme, cx: &mut Context<JadeApp>) -> gpui::Any
         );
     }
 
-    // Shape-override placeholder (rows×cols text inputs need a widget; deferred
-    // like the telemetry sidebar's shape editor). Shows the current source shape.
-    if let Some(frame) = app.wg3d.current_frame() {
-        let r = frame.src_rows.unwrap_or(frame.rows);
-        let c = frame.src_cols.unwrap_or(frame.cols);
-        bar = bar.child(
-            div()
-                .text_size(px(10.))
-                .text_color(rgb(theme.muted))
-                .child(format!("shape {r}×{c}")),
-        );
+    // Tensor shape hint: rows × cols, editable inline (weight-grid-3d.ts
+    // `makeDimInput` + `applyShape`, lines 250-287/474-482). Prefilled from
+    // the registry's stored hint; empty shows the latest frame's source dims
+    // as a placeholder (`syncDimInputs`).
+    if let Some(name) = sel_name {
+        bar = bar.child(dim_fields(app, theme, cx, &name));
     }
 
     // Step scrubber: draggable track plus ◀ / ▶ stepping and a Live jump.
@@ -248,6 +253,111 @@ fn toolbar(app: &JadeApp, theme: &Theme, cx: &mut Context<JadeApp>) -> gpui::Any
         );
 
     bar.into_any_element()
+}
+
+/// The rows×cols shape-hint fields for `name` (a buffer) — shares the
+/// captured-keystroke editor (`app.dim_edit`) with the telemetry sidebar's
+/// inline row editor (`panels/telemetry_sidebar.rs`). When no session is open
+/// for this buffer, shows the stored hint (or the placeholder, muted) and
+/// starts a session on click; while a session is open, shows the two live
+/// text buffers with the active one underlined + caret, and clicking either
+/// field just moves the caret between them.
+fn dim_fields(app: &JadeApp, theme: &Theme, cx: &mut Context<JadeApp>, name: &str) -> gpui::AnyElement {
+    let editing = app.dim_edit().filter(|s| s.name == name);
+    let (ph_rows, ph_cols) = app.dim_edit_placeholder(name);
+    let hint = app.registry.get(Kind::Buffer, name).and_then(|i| i.effective_shape());
+
+    let (rows_raw, cols_raw, active_field) = match editing {
+        Some(s) => (s.rows.clone(), s.cols.clone(), Some(s.field)),
+        None => (
+            hint.map(|(r, _)| r.to_string()).unwrap_or_default(),
+            hint.map(|(_, c)| c.to_string()).unwrap_or_default(),
+            None,
+        ),
+    };
+    let (rows_text, rows_ph) = crate::app::dim_input::display_value(&rows_raw, &ph_rows);
+    let (cols_text, cols_ph) = crate::app::dim_input::display_value(&cols_raw, &ph_cols);
+
+    let mut wrap = div()
+        .id(SharedString::from(format!("wg3d-dim-{name}")))
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_1()
+        .text_size(px(10.));
+
+    if editing.is_some() {
+        if let Some(focus) = app.dim_edit_focus_handle() {
+            wrap = wrap.track_focus(&focus).on_key_down(cx.listener(
+                |a: &mut JadeApp, ev: &KeyDownEvent, _w, cx| {
+                    if a.dim_edit_key(&ev.keystroke) {
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                },
+            ));
+        }
+    }
+
+    wrap.child(dim_field_chip(
+        name,
+        DimField::Rows,
+        rows_text,
+        rows_ph,
+        active_field == Some(DimField::Rows),
+        theme,
+        cx,
+    ))
+    .child(div().text_color(rgb(theme.muted)).child("×"))
+    .child(dim_field_chip(
+        name,
+        DimField::Cols,
+        cols_text,
+        cols_ph,
+        active_field == Some(DimField::Cols),
+        theme,
+        cx,
+    ))
+    .into_any_element()
+}
+
+/// One rows/cols field: static + clickable (opens the editor, or — while a
+/// session for this buffer is already open — just moves the caret to this
+/// field) when not active; live text + caret + accent underline when active.
+fn dim_field_chip(
+    name: &str,
+    field: DimField,
+    text: String,
+    is_placeholder: bool,
+    active: bool,
+    theme: &Theme,
+    cx: &mut Context<JadeApp>,
+) -> gpui::AnyElement {
+    let n = name.to_string();
+    let label = if active { format!("{text}▏") } else { text };
+    let mut el = div()
+        .id(SharedString::from(format!(
+            "wg3d-dimfield-{name}-{}",
+            if field == DimField::Rows { "r" } else { "c" }
+        )))
+        .px_1()
+        .min_w(px(14.))
+        .rounded_sm()
+        .cursor_pointer()
+        .text_color(rgb(if is_placeholder { theme.muted } else { theme.text }))
+        .on_click(cx.listener(move |app: &mut JadeApp, _e, _w, cx| {
+            if app.dim_edit().map(|s| s.name == n).unwrap_or(false) {
+                app.set_dim_edit_field(field);
+            } else {
+                app.start_dim_edit(&n, field);
+            }
+            cx.notify();
+        }))
+        .child(label);
+    if active {
+        el = el.border_b_1().border_color(rgb(theme.accent));
+    }
+    el.into_any_element()
 }
 
 fn step_button(
@@ -364,11 +474,12 @@ fn scrub_track(app: &JadeApp, theme: &Theme, cx: &mut Context<JadeApp>) -> gpui:
 // ── Scene (canvas + projected label overlays) ──────────────────────────────────
 
 fn scene(
-    app: &JadeApp,
-    grid: Option<BarGrid>,
+    app: &mut JadeApp,
+    grid: Option<(std::sync::Arc<BarGrid>, u64)>,
     theme: &Theme,
     w: f32,
     h: f32,
+    scale: f32,
     cx: &mut Context<JadeApp>,
 ) -> gpui::AnyElement {
     let camera = app.wg3d.camera.clone();
@@ -430,11 +541,38 @@ fn scene(
             cx.notify();
         }));
 
-    // Paint layer.
-    if let Some(g) = grid {
+    // Paint layer: the Metal engine when available (the WebGL port — one
+    // instanced draw), else the CPU painter (headless tests, Metal-less VMs).
+    if let Some((g, generation)) = grid {
         // Compute label placements on the Rust side (projected anchors).
         let labels = label_placements(&g, &camera, w, h);
-        area = area.child(scene_canvas(g, camera, theme.clone()));
+
+        let mut painted = false;
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(gpu) = app.wg3d_gpu() {
+                let w_px = (w * scale).round().max(2.0) as usize;
+                let h_px = (h * scale).round().max(2.0) as usize;
+                if let Some(pb) = gpu.render(&g, generation, &camera, w_px, h_px) {
+                    area = area.child(
+                        gpui::surface(pb)
+                            .object_fit(gpui::ObjectFit::Fill)
+                            .absolute()
+                            .top(px(0.))
+                            .left(px(0.))
+                            .w(px(w))
+                            .h(px(h)),
+                    );
+                    painted = true;
+                }
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = (scale, generation);
+        if !painted {
+            area = area.child(scene_canvas((*g).clone(), camera, theme.clone()));
+        }
+
         // Label overlays, absolutely positioned over the canvas area.
         for (text, x, y) in labels {
             area = area.child(

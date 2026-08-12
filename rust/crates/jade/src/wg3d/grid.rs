@@ -47,6 +47,7 @@ impl Bar {
 /// The result of turning one frame into bars: the (possibly subsampled) grid
 /// dimensions, the bars, the frame max-abs (drives the value-axis label), and
 /// the source dimensions (for index axis labels).
+#[derive(Debug, Clone)]
 pub struct BarGrid {
     pub rows: u32,
     pub cols: u32,
@@ -193,7 +194,20 @@ pub struct WeightGrid3D {
     /// the CPU sort+paint stays comfortable; the ≤64/≤128/≤256 select raises it
     /// (also forwarding to the registry's streaming maxDim as in the TS).
     view_max_dim: u32,
+
+    /// Memoized bars for the current (buffer, frame, resolution): camera motion
+    /// repaints every 16 ms and must not re-subsample the tensor each time.
+    /// The key's `step` distinguishes ring turnover in live mode (a full ring
+    /// keeps the same len/index while frames keep changing).
+    bars_cache: Option<(BarsKey, std::sync::Arc<BarGrid>)>,
+    /// Bumped on every cache rebuild; the GPU renderer re-uploads instance
+    /// data only when this changes (the TS `bufferSubData`-per-new-frame).
+    bars_generation: u64,
 }
+
+/// Cache key for [`WeightGrid3D::current_bars_cached`]:
+/// (buffer, frame index, ring len, view resolution, frame step).
+type BarsKey = (String, usize, usize, u32, i64);
 
 impl Default for WeightGrid3D {
     fn default() -> Self {
@@ -211,6 +225,8 @@ impl Default for WeightGrid3D {
             drag_last: None,
             drag_pan: false,
             view_max_dim: 64,
+            bars_cache: None,
+            bars_generation: 0,
         }
     }
 }
@@ -307,6 +323,34 @@ impl WeightGrid3D {
     /// under the interactive display budget (`view_max_dim`²).
     pub fn current_bars(&self) -> Option<BarGrid> {
         build_bars_capped(self.current_frame()?, self.view_cells())
+    }
+
+    /// Memoized [`current_bars`](Self::current_bars): rebuilds only when the
+    /// (buffer, frame, resolution) key changes, so per-repaint cost during
+    /// camera motion is a hash-key compare instead of a full re-subsample.
+    /// Returns the bars plus the cache generation the GPU uploader keys on.
+    pub fn current_bars_cached(&mut self) -> Option<(std::sync::Arc<BarGrid>, u64)> {
+        let name = self.selected.clone()?;
+        let frame_step = self.current_frame()?.step;
+        let key: BarsKey = (
+            name,
+            self.index,
+            self.frames_len(),
+            self.view_max_dim,
+            frame_step,
+        );
+        if let Some((k, bars)) = &self.bars_cache {
+            if *k == key {
+                return Some((bars.clone(), self.bars_generation));
+            }
+        }
+        let bars = std::sync::Arc::new(build_bars_capped(
+            self.current_frame()?,
+            self.view_cells(),
+        )?);
+        self.bars_generation = self.bars_generation.wrapping_add(1);
+        self.bars_cache = Some((key, bars.clone()));
+        Some((bars, self.bars_generation))
     }
 
     /// Interactive display resolution (bars per dimension).

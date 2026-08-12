@@ -480,6 +480,8 @@ static NSString *pso_name(id<MTLComputePipelineState> pso) {
   return name;
 }
 
+static void note_encoder_kernel(id encoder, NSString *kernel);  // per-encoder timing (below)
+
 static void hook_compute_encoder_class(Class encClass) {
   static void *kHooked = &kHooked;
   if (objc_getAssociatedObject(encClass, kHooked)) return;
@@ -497,6 +499,7 @@ static void hook_compute_encoder_class(Class encClass) {
           [kernels addObject:name];
           os_unfair_lock_unlock(&g_psoLock);
         }
+        note_encoder_kernel(self, name);  // per-encoder timing series
       });
 }
 
@@ -513,16 +516,231 @@ static void attach_kernel_set(id<MTLCommandBuffer> cb, id encoder) {
 }
 
 // Timing name for a completed command buffer: explicit label > kernel names.
+// Long joins keep a readable prefix plus an FNV-1a hash of the FULL join: a
+// bare prefix truncation collapsed every kernel set sharing the first 61
+// chars into one series, and the cut point shifted whenever the set changed.
 static NSString *command_buffer_timing_name(id<MTLCommandBuffer> cb) {
   if (cb.label.length) return cb.label;
   NSSet<NSString *> *kernels = objc_getAssociatedObject(cb, kKernelSetKey);
   if (kernels.count) {
     NSArray *sorted = [kernels.allObjects sortedArrayUsingSelector:@selector(compare:)];
     NSString *joined = [sorted componentsJoinedByString:@"+"];
-    if (joined.length > 64) joined = [[joined substringToIndex:61] stringByAppendingString:@"…"];
+    if (joined.length > 64) {
+      uint32_t h = 2166136261u; // FNV-1a over the untruncated join
+      for (NSUInteger i = 0; i < joined.length; i++)
+        h = (h ^ (uint32_t)[joined characterAtIndex:i]) * 16777619u;
+      joined = [NSString stringWithFormat:@"%@…%08x", [joined substringToIndex:52], h];
+    }
     return joined;
   }
   return @"gpu.commandBuffer";
+}
+
+// ─── timer tracking: samples are opt-in, names are declared on discovery ─────
+// Timers default to NOT tracked: a training loop emits hundreds of samples/s
+// across many kernel names, which floods the IDE when nobody is looking. Each
+// new timing name is declared once (decl kind=timer) so the IDE's pre-run
+// panel can list it; samples flow only after {"type":"track","kind":"timer"}.
+
+static NSMutableSet<NSString *> *g_trackedTimers;
+static NSMutableSet<NSString *> *g_declaredTimers;
+static os_unfair_lock g_timerLock = OS_UNFAIR_LOCK_INIT;
+
+// Declares `name` on first sight (returns outside the lock before emitting —
+// emit_json can block on the socket). Returns whether samples should be sent.
+static bool note_timer_name(NSString *name) {
+  bool declare = false, tracked = false;
+  os_unfair_lock_lock(&g_timerLock);
+  if (![g_declaredTimers containsObject:name]) {
+    [g_declaredTimers addObject:name];
+    declare = true;
+  }
+  tracked = g_trackAll || [g_trackedTimers containsObject:name];
+  os_unfair_lock_unlock(&g_timerLock);
+  if (declare) {
+    emit_json(@{@"type" : @"decl", @"kind" : @"timer", @"name" : name});
+  }
+  return tracked;
+}
+
+static void set_timer_tracked(NSString *name, BOOL enabled) {
+  os_unfair_lock_lock(&g_timerLock);
+  if (enabled) [g_trackedTimers addObject:name];
+  else [g_trackedTimers removeObject:name];
+  os_unfair_lock_unlock(&g_timerLock);
+}
+
+// ─── per-encoder GPU timing (counter sampling at stage boundaries) ───────────
+// GPUStartTime/GPUEndTime only time the WHOLE command buffer, so once an app
+// encodes every pipeline stage into one command buffer the timers all merge
+// into a single joined series. Apple GPUs support timestamp sampling at
+// encoder (stage) boundaries: each compute encoder is created through a
+// MTLComputePassDescriptor holding a slice of a shared per-command-buffer
+// sample buffer, and completion resolves per-encoder GPU durations, summed
+// per kernel name — one sample per kernel per command buffer, the same shape
+// the old one-command-buffer-per-pipeline apps produced. Emitted only when
+// the command buffer mixes ≥2 kernels (a single-kernel buffer is already
+// covered by the whole-buffer timer of the same name).
+
+static id<MTLCounterSet> g_timestampCounterSet;  // nil = unsupported
+static const NSUInteger CSB_SAMPLES = 256;       // 128 encoders per command buffer
+static os_unfair_lock g_csbPoolLock = OS_UNFAIR_LOCK_INIT;
+static NSMutableArray<id<MTLCounterSampleBuffer>> *g_csbPool;
+
+// GPU-tick → nanosecond calibration from two correlated CPU/GPU samples
+// (`sampleTimestamps:` returns both clocks at one instant; the ratio of CPU-ns
+// elapsed to GPU-ticks elapsed between two calls is the tick length).
+static os_unfair_lock g_tsCalLock = OS_UNFAIR_LOCK_INIT;
+static MTLTimestamp g_calCpu0, g_calGpu0;
+static double g_gpuNsPerTick;
+
+static void refresh_gpu_timebase(id<MTLDevice> dev) {
+  if (![dev respondsToSelector:@selector(sampleTimestamps:gpuTimestamp:)]) return;
+  MTLTimestamp cpu = 0, gpu = 0;
+  [dev sampleTimestamps:&cpu gpuTimestamp:&gpu];
+  if (!cpu || !gpu) return;
+  os_unfair_lock_lock(&g_tsCalLock);
+  if (!g_calCpu0) {
+    g_calCpu0 = cpu;
+    g_calGpu0 = gpu;
+  } else if (gpu > g_calGpu0 && cpu > g_calCpu0) {
+    g_gpuNsPerTick = (double)(cpu - g_calCpu0) / (double)(gpu - g_calGpu0);
+  }
+  os_unfair_lock_unlock(&g_tsCalLock);
+}
+
+static double gpu_delta_ms(MTLTimestamp start, MTLTimestamp end) {
+  if (end <= start) return 0;
+  os_unfair_lock_lock(&g_tsCalLock);
+  double scale = g_gpuNsPerTick;
+  os_unfair_lock_unlock(&g_tsCalLock);
+  if (scale <= 0) return 0;
+  return (double)(end - start) * scale / 1e6;
+}
+
+// One command buffer's encoder-timing state: the shared sample buffer, and per
+// handed-out sample pair the kernel name that ran (samples 2i, 2i+1 bracket
+// encoder i). Names are filled by the setComputePipelineState hook.
+@interface ForgeCBSamples : NSObject
+@property(nonatomic, strong) id<MTLCounterSampleBuffer> csb;
+@property(nonatomic, strong) NSMutableArray<NSString *> *names;  // "" until a PSO is set
+@end
+@implementation ForgeCBSamples
+@end
+
+static void *kCBSamplesKey = &kCBSamplesKey;
+static void *kEncSamplesKey = &kEncSamplesKey;
+static void *kEncPairKey = &kEncPairKey;
+
+static id<MTLCounterSampleBuffer> acquire_csb(id<MTLDevice> dev) {
+  os_unfair_lock_lock(&g_csbPoolLock);
+  id<MTLCounterSampleBuffer> csb = g_csbPool.lastObject;
+  if (csb) [g_csbPool removeLastObject];
+  os_unfair_lock_unlock(&g_csbPoolLock);
+  if (csb) return csb;
+  MTLCounterSampleBufferDescriptor *d = [MTLCounterSampleBufferDescriptor new];
+  d.counterSet = g_timestampCounterSet;
+  d.storageMode = MTLStorageModeShared;
+  d.sampleCount = CSB_SAMPLES;
+  NSError *err = nil;
+  return [dev newCounterSampleBufferWithDescriptor:d error:&err];  // nil on failure → unsampled
+}
+
+static void release_csb(id<MTLCounterSampleBuffer> csb) {
+  if (!csb) return;
+  os_unfair_lock_lock(&g_csbPoolLock);
+  if (!g_csbPool) g_csbPool = [NSMutableArray new];
+  if (g_csbPool.count < 8) [g_csbPool addObject:csb];
+  os_unfair_lock_unlock(&g_csbPoolLock);
+}
+
+// Create a compute encoder with start/end-of-encoder timestamp samples wired
+// in, sharing the command buffer's sample buffer. Falls back to `nil` (caller
+// uses the plain encoder path) when sampling is unavailable or exhausted.
+static id forge_sampled_encoder(id<MTLCommandBuffer> cb, MTLDispatchType type) {
+  if (!g_timestampCounterSet) return nil;
+  if (![cb respondsToSelector:@selector(computeCommandEncoderWithDescriptor:)]) return nil;
+  ForgeCBSamples *s = objc_getAssociatedObject(cb, kCBSamplesKey);
+  if (!s) {
+    id<MTLCounterSampleBuffer> csb = acquire_csb(cb.device);
+    if (!csb) return nil;
+    s = [ForgeCBSamples new];
+    s.csb = csb;
+    s.names = [NSMutableArray new];
+    objc_setAssociatedObject(cb, kCBSamplesKey, s, OBJC_ASSOCIATION_RETAIN);
+  }
+  NSUInteger pair = s.names.count;
+  if (pair * 2 + 1 >= CSB_SAMPLES) return nil;  // slice exhausted → unsampled encoder
+
+  MTLComputePassDescriptor *desc = [MTLComputePassDescriptor computePassDescriptor];
+  desc.dispatchType = type;
+  MTLComputePassSampleBufferAttachmentDescriptor *att = desc.sampleBufferAttachments[0];
+  att.sampleBuffer = s.csb;
+  att.startOfEncoderSampleIndex = pair * 2;
+  att.endOfEncoderSampleIndex = pair * 2 + 1;
+  id enc = [cb computeCommandEncoderWithDescriptor:desc];
+  if (!enc) return nil;
+  [s.names addObject:@""];
+  objc_setAssociatedObject(enc, kEncSamplesKey, s, OBJC_ASSOCIATION_RETAIN);
+  objc_setAssociatedObject(enc, kEncPairKey, @(pair), OBJC_ASSOCIATION_RETAIN);
+  return enc;
+}
+
+// Record the kernel that ran in a sampled encoder (called from the
+// setComputePipelineState hook). Repeat PSOs in one encoder join with '+'.
+static void note_encoder_kernel(id encoder, NSString *kernel) {
+  if (!kernel) return;
+  ForgeCBSamples *s = objc_getAssociatedObject(encoder, kEncSamplesKey);
+  NSNumber *pair = objc_getAssociatedObject(encoder, kEncPairKey);
+  if (!s || !pair || pair.unsignedIntegerValue >= s.names.count) return;
+  NSString *prev = s.names[pair.unsignedIntegerValue];
+  if (prev.length == 0) {
+    s.names[pair.unsignedIntegerValue] = kernel;
+  } else if (![prev isEqualToString:kernel] &&
+             ![prev containsString:[NSString stringWithFormat:@"+%@", kernel]]) {
+    s.names[pair.unsignedIntegerValue] = [NSString stringWithFormat:@"%@+%@", prev, kernel];
+  }
+}
+
+// Resolve, aggregate per kernel, emit, and recycle — completion-handler side.
+static void emit_encoder_timings(id<MTLCommandBuffer> cb, int step) {
+  ForgeCBSamples *s = objc_getAssociatedObject(cb, kCBSamplesKey);
+  if (!s) return;
+  objc_setAssociatedObject(cb, kCBSamplesKey, nil, OBJC_ASSOCIATION_RETAIN);
+  refresh_gpu_timebase(cb.device);
+  NSUInteger pairs = s.names.count;
+  NSData *data = pairs ? [s.csb resolveCounterRange:NSMakeRange(0, pairs * 2)] : nil;
+  if (data && data.length >= pairs * 2 * sizeof(MTLCounterResultTimestamp)) {
+    const MTLCounterResultTimestamp *ts =
+        (const MTLCounterResultTimestamp *)data.bytes;
+    NSMutableDictionary<NSString *, NSNumber *> *sums = [NSMutableDictionary new];
+    NSMutableArray<NSString *> *order = [NSMutableArray new];
+    for (NSUInteger i = 0; i < pairs; i++) {
+      NSString *name = s.names[i];
+      MTLTimestamp a = ts[i * 2].timestamp, b = ts[i * 2 + 1].timestamp;
+      if (name.length == 0 || a == MTLCounterErrorValue || b == MTLCounterErrorValue) continue;
+      double ms = gpu_delta_ms(a, b);
+      if (ms <= 0) continue;
+      NSNumber *acc = sums[name];
+      if (!acc) [order addObject:name];
+      sums[name] = @(acc.doubleValue + ms);
+    }
+    // Only worth emitting when the buffer mixes kernels; a single-kernel
+    // buffer already gets a whole-buffer timer under this exact name.
+    if (sums.count >= 2) {
+      for (NSString *name in order) {
+        if (note_timer_name(name)) {
+          emit_json(@{
+            @"type" : @"timing",
+            @"name" : name,
+            @"ms" : sums[name],
+            @"step" : @(step),
+          });
+        }
+      }
+    }
+  }
+  release_csb(s.csb);
 }
 
 // ─── command buffer hooks: auto GPU timing + readback scheduling ─────────────
@@ -598,21 +816,35 @@ static void hook_command_buffer_class(Class cbClass) {
   if (objc_getAssociatedObject(cbClass, kHooked)) return;
   objc_setAssociatedObject(cbClass, kHooked, @YES, OBJC_ASSOCIATION_RETAIN);
 
-  // Track which compute kernels get encoded into each command buffer.
+  // Track which compute kernels get encoded into each command buffer. App
+  // encoders are created through a sampled compute pass when the device
+  // supports stage-boundary timestamps (per-encoder timing); the plain path
+  // is the fallback.
   static IMP origEnc;
   origEnc = swizzle(cbClass, @selector(computeCommandEncoder), ^id(id<MTLCommandBuffer> self) {
-    id enc = ((id (*)(id, SEL))origEnc)(self, @selector(computeCommandEncoder));
-    if (!in_probe()) attach_kernel_set(self, enc);
-    return enc;
+    if (!in_probe()) {
+      id enc = forge_sampled_encoder(self, MTLDispatchTypeSerial);
+      if (!enc) enc = ((id (*)(id, SEL))origEnc)(self, @selector(computeCommandEncoder));
+      attach_kernel_set(self, enc);
+      return enc;
+    }
+    return ((id (*)(id, SEL))origEnc)(self, @selector(computeCommandEncoder));
   });
   static IMP origEncDispatch;
   origEncDispatch = swizzle(
       cbClass, @selector(computeCommandEncoderWithDispatchType:),
       ^id(id<MTLCommandBuffer> self, MTLDispatchType type) {
-        id enc = ((id (*)(id, SEL, MTLDispatchType))origEncDispatch)(
+        if (!in_probe()) {
+          id enc = forge_sampled_encoder(self, type);
+          if (!enc) {
+            enc = ((id (*)(id, SEL, MTLDispatchType))origEncDispatch)(
+                self, @selector(computeCommandEncoderWithDispatchType:), type);
+          }
+          attach_kernel_set(self, enc);
+          return enc;
+        }
+        return ((id (*)(id, SEL, MTLDispatchType))origEncDispatch)(
             self, @selector(computeCommandEncoderWithDispatchType:), type);
-        if (!in_probe()) attach_kernel_set(self, enc);
-        return enc;
       });
 
   static IMP origCommit;
@@ -622,13 +854,21 @@ static void hook_command_buffer_class(Class cbClass) {
         int step = atomic_fetch_add(&g_step, 1);
         double ms = (cb.GPUEndTime - cb.GPUStartTime) * 1000.0;
         if (ms > 0) {
-          emit_json(@{
-            @"type" : @"timing",
-            @"name" : command_buffer_timing_name(cb),
-            @"ms" : @(ms),
-            @"step" : @(step),
-          });
+          NSString *name = command_buffer_timing_name(cb);
+          // Declared on first sight; samples only when the IDE tracks it.
+          if (note_timer_name(name)) {
+            emit_json(@{
+              @"type" : @"timing",
+              @"name" : name,
+              @"ms" : @(ms),
+              @"step" : @(step),
+            });
+          }
         }
+        // Per-kernel series from the encoder timestamp samples — each
+        // pipeline stays individually selectable even when the app encodes
+        // everything into one command buffer.
+        emit_encoder_timings(cb, step);
         note_gpu_work_done(step);
       }];
     }
@@ -655,6 +895,22 @@ static void hook_queue_class(Class qClass) {
 static void hook_device(id<MTLDevice> dev) {
   if (!dev) return;
   g_device = dev;
+
+  // Per-encoder timing support: a timestamp counter set sampled at encoder
+  // (stage) boundaries — the granularity Apple GPUs support. Absent → the
+  // whole-command-buffer timer is the only series (previous behavior).
+  if (!g_timestampCounterSet &&
+      [dev respondsToSelector:@selector(supportsCounterSampling:)] &&
+      [dev supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) {
+    for (id<MTLCounterSet> cs in dev.counterSets) {
+      if ([cs.name isEqualToString:MTLCommonCounterSetTimestamp]) {
+        g_timestampCounterSet = cs;
+        break;
+      }
+    }
+    refresh_gpu_timebase(dev);  // first calibration point
+  }
+
   Class devClass = object_getClass(dev);
   static void *kHooked = &kHooked;
   if (objc_getAssociatedObject(devClass, kHooked)) return;
@@ -751,21 +1007,33 @@ static void hook_buffer_label_class(Class bufClass) {
 }
 
 // ─── IDE → probe control channel ─────────────────────────────────────────────
-// Reads NDJSON from the telemetry socket. Only handles:
+// Reads NDJSON from the telemetry socket. Handles:
 //   {"type":"track","kind":"buffer","name":"...","enabled":bool,"maxDim":N}
-// Scalars/timers are always emitted (they're cheap); the IDE filters display.
+//   {"type":"track","kind":"timer","name":"...","enabled":bool}
+// Scalars are always emitted (cheap, explicit in user code); timing samples
+// are opt-in per name (see note_timer_name); the IDE filters display.
 
 static void handle_control_line(NSData *lineData) {
   NSDictionary *msg = [NSJSONSerialization JSONObjectWithData:lineData options:0 error:nil];
   if (![msg isKindOfClass:NSDictionary.class]) return;
-  if (![msg[@"type"] isEqual:@"track"] || ![msg[@"kind"] isEqual:@"buffer"]) return;
+  if (![msg[@"type"] isEqual:@"track"]) return;
+  if ([msg[@"kind"] isEqual:@"timer"]) {
+    NSString *tname = msg[@"name"];
+    if ([tname isKindOfClass:NSString.class]) {
+      set_timer_tracked(tname, [msg[@"enabled"] boolValue]);
+    }
+    return;
+  }
+  if (![msg[@"kind"] isEqual:@"buffer"]) return;
   NSString *name = msg[@"name"];
   BOOL enabled = [msg[@"enabled"] boolValue];
   if (!name) return;
   NSNumber *maxDim = msg[@"maxDim"];
   BOOL maxDimChanged = NO;
   if (maxDim) {
-    int newDim = MAX(4, MIN(256, maxDim.intValue));
+    // 512 cap ≈ 1MB/frame of f32 — fine under the snapshot rate limiter, and
+    // lets a ≤512-wide tensor stream UNPOOLED for artifact-free inspection.
+    int newDim = MAX(4, MIN(512, maxDim.intValue));
     maxDimChanged = atomic_exchange(&g_maxDim, newDim) != newDim;
   }
   // Optional shape hint: the true tensor dimensions of this buffer.
@@ -845,6 +1113,8 @@ __attribute__((constructor)) static void forge_probe_init(void) {
   pthread_key_create(&g_inProbeKey, NULL);
   g_buffers = [NSMutableArray new];
   g_pendingTracked = [NSMutableSet new];
+  g_trackedTimers = [NSMutableSet new];
+  g_declaredTimers = [NSMutableSet new];
   g_shapeHints = [NSMutableDictionary new];
   g_psoNames = [NSMapTable weakToStrongObjectsMapTable];
   g_trackAll = getenv("FORGE_TRACK_ALL") != NULL;

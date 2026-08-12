@@ -17,8 +17,10 @@ use crate::prefs::TelemetryPrefs;
 /// default, unless the user has a stored preference (§10, telemetry-panel.ts:40).
 pub const AUTO_CHECK_SCALARS: usize = 3;
 
-/// Default per-dimension streaming cap for buffers when the user hasn't set one.
-pub const DEFAULT_MAX_DIM: u32 = 128;
+/// Default per-dimension streaming cap for buffers when the user hasn't set one
+/// (telemetry-panel.ts:39 `DEFAULT_MAX_DIM = 256` — the full detail the probe
+/// streams; the ≤64/≤128/≤256 chips lower it per buffer).
+pub const DEFAULT_MAX_DIM: u32 = 256;
 
 #[derive(Debug, Clone)]
 pub struct RegistryItem {
@@ -38,6 +40,11 @@ pub struct RegistryItem {
     pub last_step: Option<i64>,
     pub last_rows: Option<u32>,
     pub last_cols: Option<u32>,
+    /// Pre-populated from a persisted pref (or a loaded bundle def) before the
+    /// probe confirmed it this session. Seeded items render in the panels but
+    /// don't count as discovered inventory; the first real decl clears this
+    /// and re-arms `track`.
+    pub seeded: bool,
 }
 
 impl RegistryItem {
@@ -55,6 +62,7 @@ impl RegistryItem {
             last_step: None,
             last_rows: None,
             last_cols: None,
+            seeded: false,
         }
     }
 
@@ -84,6 +92,45 @@ pub struct DeclareOutcome {
 
 pub fn key_of(kind: Kind, name: &str) -> String {
     format!("{} {}", kind.as_str(), name)
+}
+
+/// Byte-wise compare with digit runs compared as numbers, so `buf#9` sorts
+/// before `buf#10`. Dotted-scope grouping falls out of plain prefix ordering.
+fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    let (mut i, mut j) = (0, 0);
+    loop {
+        match (a.get(i), b.get(j)) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(&ca), Some(&cb)) => {
+                if ca.is_ascii_digit() && cb.is_ascii_digit() {
+                    let prse = |s: &[u8], k: &mut usize| -> u64 {
+                        let mut v: u64 = 0;
+                        while let Some(c) = s.get(*k).filter(|c| c.is_ascii_digit()) {
+                            v = v.saturating_mul(10).saturating_add((c - b'0') as u64);
+                            *k += 1;
+                        }
+                        v
+                    };
+                    match prse(a, &mut i).cmp(&prse(b, &mut j)) {
+                        Ordering::Equal => {}
+                        o => return o,
+                    }
+                } else {
+                    match ca.cmp(&cb) {
+                        Ordering::Equal => {
+                            i += 1;
+                            j += 1;
+                        }
+                        o => return o,
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -120,6 +167,16 @@ impl TelemetryRegistry {
             .collect()
     }
 
+    /// Items of one kind sorted by name (natural number ordering), so dotted
+    /// scope siblings — every `blocks.attn.*` buffer — sit together instead of
+    /// interleaving in probe allocation order, and `#9` sorts before `#10`.
+    /// The BUFFERS section uses this; scalars/timers keep discovery order.
+    pub fn items_of_kind_grouped(&self, kind: Kind) -> Vec<&RegistryItem> {
+        let mut items = self.items_of_kind(kind);
+        items.sort_by(|a, b| natural_cmp(&a.name, &b.name));
+        items
+    }
+
     /// Register (or merge metadata into) an item. Applies stored prefs and the
     /// auto-check rule on first sight.
     pub fn declare(
@@ -141,6 +198,18 @@ impl TelemetryRegistry {
             if meta_cols.is_some() && item.meta_cols != meta_cols {
                 item.meta_cols = meta_cols;
                 changed = true;
+            }
+            // First REAL decl of a pref-seeded item: confirm it and surface
+            // `pref_enabled` once so the caller re-arms `track` — the probe's
+            // registry starts empty each run and a seeded checkbox would
+            // otherwise never stream.
+            if item.seeded {
+                item.seeded = false;
+                return DeclareOutcome {
+                    structure_changed: true,
+                    auto_enabled: false,
+                    pref_enabled: item.enabled,
+                };
             }
             return DeclareOutcome {
                 structure_changed: changed,
@@ -187,6 +256,43 @@ impl TelemetryRegistry {
             auto_enabled,
             pref_enabled,
         }
+    }
+
+    /// Pre-populate an item before the probe has declared it this session
+    /// (persisted selections / loaded bundle defs), so the sidebar and pre-run
+    /// panel aren't empty at startup. Stored prefs (enabled/shape/maxdim)
+    /// apply as usual; the item is marked `seeded` so it doesn't count as
+    /// discovered inventory and re-arms `track` on its first real decl.
+    /// No-op if the item already exists.
+    pub fn seed(&mut self, kind: Kind, name: &str, prefs: &TelemetryPrefs) {
+        let key = key_of(kind, name);
+        if self.items.contains_key(&key) {
+            return;
+        }
+        self.declare(kind, name, None, None, prefs);
+        if let Some(item) = self.items.get_mut(&key) {
+            item.seeded = true;
+        }
+    }
+
+    /// Remove every still-seeded item except those `keep` claims, returning
+    /// what was removed. Called after a scan/run has produced real decls:
+    /// anything the probe didn't confirm by then is a stale leftover name.
+    pub fn prune_seeded(&mut self, keep: impl Fn(Kind, &str) -> bool) -> Vec<(Kind, String)> {
+        let doomed: Vec<String> = self
+            .items
+            .iter()
+            .filter(|(_, i)| i.seeded && !keep(i.kind, &i.name))
+            .map(|(k, _)| k.clone())
+            .collect();
+        let mut removed = Vec::new();
+        for key in doomed {
+            if let Some(item) = self.items.remove(&key) {
+                self.order.retain(|k| k != &key);
+                removed.push((item.kind, item.name));
+            }
+        }
+        removed
     }
 
     /// Toggle enabled state (user checkbox). Returns whether it changed.
@@ -317,6 +423,46 @@ mod tests {
 
     fn prefs() -> TelemetryPrefs {
         TelemetryPrefs::default()
+    }
+
+    #[test]
+    fn grouped_buffers_sort_by_scope_with_natural_numbers() {
+        let mut r = TelemetryRegistry::new();
+        let p = prefs();
+        // Probe allocation order: layer 1's objects, then layer 2's renames
+        // land as "#2" siblings, plus a straggler that never resolved.
+        for n in [
+            "blocks.ln1.xBuffer",
+            "blocks.attn.XBuffer",
+            "blocks.attn.QBuffer",
+            "blocks.mlp.vBuffer",
+            "blocks.ln1.xBuffer#2",
+            "blocks.attn.XBuffer#10",
+            "blocks.attn.XBuffer#2",
+            "MetalMLP::MetalMLP #118",
+        ] {
+            r.declare(Kind::Buffer, n, None, None, &p);
+        }
+        let names: Vec<&str> = r
+            .items_of_kind_grouped(Kind::Buffer)
+            .iter()
+            .map(|i| i.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "MetalMLP::MetalMLP #118",
+                "blocks.attn.QBuffer",
+                "blocks.attn.XBuffer",
+                "blocks.attn.XBuffer#2",  // natural: #2 before #10
+                "blocks.attn.XBuffer#10",
+                "blocks.ln1.xBuffer",
+                "blocks.ln1.xBuffer#2",
+                "blocks.mlp.vBuffer",
+            ]
+        );
+        // Discovery order stays untouched for the other accessor.
+        assert_eq!(r.items_of_kind(Kind::Buffer)[0].name, "blocks.ln1.xBuffer");
     }
 
     #[test]

@@ -27,6 +27,13 @@ use crate::util::output_with_timeout;
 static ATOS_FRAME_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\(([^():]+):(\d+)\)\s*$").unwrap());
 
+// Full `atos` frame: `Symbol (in image) (file.cpp:123)` — the symbol names the
+// function containing the frame, which for constructor calls identifies the
+// callee's class and lets us resolve WHICH member of the caller was being
+// constructed (see `member_of`).
+static ATOS_SYM_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(.*?)\s+\(in [^)]+\)\s+\(([^():]+):(\d+)\)\s*$").unwrap());
+
 // Assignment LHS: `[type] lhs = ...` (telemetry-server.ts:310-312).
 static ASSIGN_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^\s*(?:[\w:<>,~ \t*&\[\]]+?\s+)?((?:this->)?[A-Za-z_]\w*(?:(?:\.|->)[A-Za-z_]\w*)*)\s*=[^=]").unwrap()
@@ -51,6 +58,78 @@ impl AtosSymbolicator {
             fallback_exe,
             source_cache: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Cached source lines of `base_name` under the first root that has it.
+    fn source_lines(&self, roots: &[PathBuf], base_name: &str) -> Option<Vec<String>> {
+        let mut cache = self.source_cache.lock().unwrap();
+        for root in roots {
+            let p = root.join(base_name);
+            let content = cache.entry(p.clone()).or_insert_with(|| {
+                std::fs::read_to_string(&p)
+                    .ok()
+                    .map(|s| s.split('\n').map(str::to_string).collect())
+            });
+            if let Some(lines) = content {
+                return Some(lines.clone());
+            }
+        }
+        None
+    }
+
+    /// Resolve which member of `caller_class` the frame was constructing, by
+    /// the callee's type. Line-based extraction alone cannot split an
+    /// initializer list that packs several member inits onto one line
+    /// (`MetalBlock() : ln1(...), attn(...),`) — it recovers one arbitrary
+    /// identifier and files every buffer under it. The callee class from the
+    /// inner frame's symbol names the member's TYPE: a unique member of that
+    /// type wins outright; duplicated types (ln1/ln2) fall back to whichever
+    /// candidate appears on the call-site-adjusted source line.
+    fn member_of(
+        &self,
+        roots: &[PathBuf],
+        base_name: &str,
+        caller_class: &str,
+        callee_class: &str,
+        line_no: usize,
+    ) -> Option<String> {
+        let lines = self.source_lines(roots, base_name)?;
+        let def_re = Regex::new(&format!(
+            r"^\s*(?:struct|class)\s+{}\b",
+            regex::escape(caller_class)
+        ))
+        .ok()?;
+        let start = lines.iter().position(|l| def_re.is_match(l))?;
+        let mem_re = Regex::new(&format!(
+            r"^\s*{}\s+([A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*)\s*;",
+            regex::escape(callee_class)
+        ))
+        .ok()?;
+        let mut cands: Vec<String> = Vec::new();
+        for l in lines.iter().skip(start + 1).take(500) {
+            if l.trim_start().starts_with("};") {
+                break;
+            }
+            if let Some(c) = mem_re.captures(l) {
+                cands.extend(c[1].split(',').map(|s| s.trim().to_string()));
+            }
+        }
+        if cands.len() == 1 {
+            return cands.pop();
+        }
+        if cands.len() > 1 {
+            let line = lines.get(line_no.wrapping_sub(1))?;
+            let mut on_line = cands.into_iter().filter(|c| {
+                Regex::new(&format!(r"\b{}\s*\(", regex::escape(c)))
+                    .map(|r| r.is_match(line))
+                    .unwrap_or(false)
+            });
+            let first = on_line.next();
+            if first.is_some() && on_line.next().is_none() {
+                return first;
+            }
+        }
+        None
     }
 
     /// Read `root/base_name`:`line_no` and extract the variable the allocation
@@ -100,23 +179,124 @@ impl AtosSymbolicator {
     }
 }
 
+/// `Cls::Cls(args)` → `Cls`: a demangled symbol is a constructor when its last
+/// two `::` segments match. Frames inside a constructor mean the caller was
+/// constructing a member — the class name keys the `member_of` lookup.
+fn ctor_class(sym: &str) -> Option<&str> {
+    let head = sym.split('(').next().unwrap_or("").trim();
+    let segs: Vec<&str> = head.split("::").collect();
+    match segs.as_slice() {
+        [.., cls, last] if cls == last => Some(cls),
+        _ => None,
+    }
+}
+
+/// `atos` against the bare executable reads line info through the stab debug
+/// map (macOS keeps DWARF in the .o files), and CoreSymbolication mis-reads
+/// DWARF-5 line tables through that map for optimized builds — file:line
+/// comes back shifted into the wrong FILE (observed: `-g -O3` metal-cpp
+/// project, every allocation frame reported in main.cpp at pre-refactor line
+/// numbers, so no variable name ever extracted and every buffer kept its
+/// `Ctor::Ctor #N` fallback). A linked dSYM bypasses the debug map entirely
+/// and symbolicates correctly, so build one (dsymutil, sub-second on debug
+/// binaries) whenever the exe is newer than its dSYM, and hand THAT to atos.
+fn ensure_dsym(exe: &PathBuf) -> Option<PathBuf> {
+    let name = exe.file_name()?;
+    let mut dsym = exe.clone().into_os_string();
+    dsym.push(".dSYM");
+    let dwarf = PathBuf::from(dsym).join("Contents/Resources/DWARF").join(name);
+    let stale = match (dwarf.metadata().and_then(|m| m.modified()), exe.metadata().and_then(|m| m.modified())) {
+        (Ok(d), Ok(e)) => d < e,
+        _ => true,
+    };
+    if stale {
+        let mut cmd = Command::new("dsymutil");
+        cmd.arg(exe);
+        let ok = output_with_timeout(cmd, Duration::from_secs(30))
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !ok {
+            return None;
+        }
+    }
+    dwarf.exists().then_some(dwarf)
+}
+
+/// Probe frames are `backtrace()` return addresses, which point at the
+/// instruction AFTER the call. Symbolicate one byte back so the lookup lands
+/// inside the call instruction itself: when a call is the last thing on its
+/// source line (constructor initializer lists spanning lines — `attn(...),\n
+/// ln2(...)` — hit this every time), the return address otherwise resolves to
+/// the NEXT line and the buffer gets filed under the wrong member.
+fn call_site(addr: &str) -> String {
+    addr.strip_prefix("0x")
+        .and_then(|h| u64::from_str_radix(h, 16).ok())
+        .filter(|a| *a > 0)
+        .map(|a| format!("0x{:x}", a - 1))
+        .unwrap_or_else(|| addr.to_string())
+}
+
+impl AtosSymbolicator {
+    /// One frame set (innermost first) → dotted-name parts, applying the
+    /// constructor-member disambiguation before the line regexes.
+    fn parts_from_frames(&self, roots: &[PathBuf], frames: &[(String, String, usize)]) -> Vec<String> {
+        let mut parts = Vec::new();
+        for (i, (sym, base, line_no)) in frames.iter().enumerate() {
+            // Constructor-in-constructor: name the member by the callee's type
+            // first; the line regexes can't split multi-init lines.
+            let mut name = None;
+            if i > 0 {
+                if let (Some(callee), Some(caller)) = (ctor_class(&frames[i - 1].0), ctor_class(sym))
+                {
+                    name = self.member_of(roots, base, caller, callee, *line_no);
+                }
+            }
+            let name = name.or_else(|| self.extract_var_name(roots, base, *line_no));
+            if let Some(name) = name {
+                parts.push(name);
+            }
+        }
+        parts
+    }
+}
+
 impl Symbolicator for AtosSymbolicator {
     fn variable_names(&self, addrs: &[String], exe: Option<&str>, load: &str) -> Vec<String> {
-        if addrs.is_empty() {
-            return Vec::new();
+        self.variable_names_batch(std::slice::from_ref(&addrs.to_vec()), exe, load)
+            .pop()
+            .unwrap_or_default()
+    }
+
+    /// Whole batch through ONE `atos` process — the per-decl process storm at
+    /// app startup (hundreds of buffers declared at once) is what used to blow
+    /// timeouts and strand fallback names. Output lines map back to input
+    /// order, so the flat result is re-split by each set's address count.
+    fn variable_names_batch(
+        &self,
+        addr_sets: &[Vec<String>],
+        exe: Option<&str>,
+        load: &str,
+    ) -> Vec<Vec<String>> {
+        let flat: Vec<&String> = addr_sets.iter().flatten().collect();
+        if flat.is_empty() {
+            return addr_sets.iter().map(|_| Vec::new()).collect();
         }
         let exe: PathBuf = exe.map(PathBuf::from).unwrap_or_else(|| self.fallback_exe.clone());
 
-        // `atos -o <exe> -l <load> <addrs...>`, 8s timeout (telemetry-server.ts:246-253).
+        // `atos -o <dSYM|exe> -l <load> <addrs...>`, 8s timeout
+        // (telemetry-server.ts:246-253). Prefer the dSYM (see `ensure_dsym`).
+        let sym_target = ensure_dsym(&exe).unwrap_or_else(|| exe.clone());
         let mut cmd = Command::new("atos");
-        cmd.arg("-o").arg(&exe).arg("-l").arg(load).args(addrs);
-        let Some(out) = output_with_timeout(cmd, Duration::from_secs(8)) else {
-            return Vec::new();
+        cmd.arg("-o").arg(&sym_target).arg("-l").arg(load);
+        cmd.args(flat.iter().map(|a| call_site(a)));
+        let stdout = match output_with_timeout(cmd, Duration::from_secs(8)) {
+            Some(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
+            _ => return addr_sets.iter().map(|_| Vec::new()).collect(),
         };
-        if !out.status.success() {
-            return Vec::new();
+        let lines: Vec<&str> = stdout.trim().split('\n').collect();
+        if lines.len() != flat.len() {
+            return addr_sets.iter().map(|_| Vec::new()).collect();
         }
-        let stdout = String::from_utf8_lossy(&out.stdout);
 
         // Search roots: the exe's directory and its parent (CMake build dirs
         // live inside the project root) (telemetry-server.ts:257).
@@ -128,17 +308,28 @@ impl Symbolicator for AtosSymbolicator {
             }
         }
 
-        let mut parts = Vec::new();
-        for line in stdout.trim().split('\n') {
-            if let Some(c) = ATOS_FRAME_RE.captures(line) {
-                let base = &c[1];
-                let line_no: usize = c[2].parse().unwrap_or(0);
-                if let Some(name) = self.extract_var_name(&roots, base, line_no) {
-                    parts.push(name);
-                }
-            }
+        let mut results = Vec::with_capacity(addr_sets.len());
+        let mut cursor = 0usize;
+        for set in addr_sets {
+            let chunk = &lines[cursor..cursor + set.len()];
+            cursor += set.len();
+            // Innermost-first frames: (symbol, file base name, line).
+            let frames: Vec<(String, String, usize)> = chunk
+                .iter()
+                .filter_map(|line| {
+                    if let Some(c) = ATOS_SYM_RE.captures(line) {
+                        Some((c[1].to_string(), c[2].to_string(), c[3].parse().unwrap_or(0)))
+                    } else {
+                        // No symbol (stripped frame) but source info still usable.
+                        ATOS_FRAME_RE.captures(line).map(|c| {
+                            (String::new(), c[1].to_string(), c[2].parse().unwrap_or(0))
+                        })
+                    }
+                })
+                .collect();
+            results.push(self.parts_from_frames(&roots, &frames));
         }
-        parts
+        results
     }
 }
 
@@ -208,6 +399,47 @@ mod tests {
         let roots = vec![dir.path().to_path_buf()];
         assert_eq!(s.extract_var_name(&roots, "k.cpp", 2), None);
         assert_eq!(s.extract_var_name(&roots, "d.cpp", 2), None);
+    }
+
+    #[test]
+    fn ctor_class_detects_constructors() {
+        assert_eq!(ctor_class("MetalAttention::MetalAttention(int, int, int)"), Some("MetalAttention"));
+        assert_eq!(ctor_class("Outer::Inner::Inner()"), Some("Inner"));
+        assert_eq!(ctor_class("main"), None);
+        assert_eq!(ctor_class("AdamOptimizer::build(int)"), None);
+    }
+
+    #[test]
+    fn initializer_list_members_resolve_by_callee_type() {
+        // The metalLLM shape: four member inits on two lines; ln1/attn share
+        // line 6, ln2/mlp share line 7. Line-based extraction alone filed
+        // attn's buffers under whatever identifier the line regex grabbed.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("model.cpp"),
+            "struct Block {\n    Norm ln1;\n    Attn attn;\n    Norm ln2;\n    Mlp mlp;\n    Block() : ln1(1), attn(2),\n        ln2(3), mlp(4) {}\n};\n",
+        )
+        .unwrap();
+        let s = sym(dir.path());
+        let roots = vec![dir.path().to_path_buf()];
+        // Unique member type: resolved regardless of which line the frame hit.
+        assert_eq!(s.member_of(&roots, "model.cpp", "Block", "Attn", 6).as_deref(), Some("attn"));
+        assert_eq!(s.member_of(&roots, "model.cpp", "Block", "Mlp", 7).as_deref(), Some("mlp"));
+        // Duplicated member type: the call-site line picks the sibling.
+        assert_eq!(s.member_of(&roots, "model.cpp", "Block", "Norm", 6).as_deref(), Some("ln1"));
+        assert_eq!(s.member_of(&roots, "model.cpp", "Block", "Norm", 7).as_deref(), Some("ln2"));
+        // Unknown type or class: no fabricated name.
+        assert_eq!(s.member_of(&roots, "model.cpp", "Block", "Loss", 6), None);
+        assert_eq!(s.member_of(&roots, "model.cpp", "Nope", "Attn", 6), None);
+    }
+
+    #[test]
+    fn call_site_backs_up_one_byte() {
+        // Return addr → call-site addr; malformed input passes through.
+        assert_eq!(call_site("0x1020f04fc"), "0x1020f04fb");
+        assert_eq!(call_site("0x1"), "0x0");
+        assert_eq!(call_site("0x0"), "0x0");
+        assert_eq!(call_site("garbage"), "garbage");
     }
 
     #[test]

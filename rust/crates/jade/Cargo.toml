@@ -32,7 +32,9 @@ forge-term = { path = "../forge-term" }
 # Cross-platform filesystem watcher for the file-tree auto-refresh (§5.1); the
 # recommended backend (FSEvents on macOS) is debounced 250ms in app wiring.
 notify = "8"
-tokio = { workspace = true }
+# `signal` is additive to the workspace features: ⌃C / SIGTERM must kill the
+# managed llama-server before we exit (see `spawn_signal_cleanup`).
+tokio = { workspace = true, features = ["signal"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # Read-only syntax highlighting (editor-core Step 1): the plain tree-sitter
@@ -48,12 +50,29 @@ regex = "1"
 # Error context for the bundled-icon AssetSource (assets.rs); gpui's AssetSource
 # trait speaks anyhow::Result, so we surface a missing asset with .context().
 anyhow = "1"
+# Tensor heatmap previews are baked into a gpui RenderImage once per NEW frame
+# and drawn as one textured quad (the TS putImageData→drawImage architecture) —
+# painting one quad per cell per repaint was the training-view lag. Versions
+# must unify with gpui's own `image`/`smallvec` (RenderImage::new takes both).
+image = { version = "0.25", default-features = false }
+smallvec = "1"
+# Persistent run store (run_store.rs): every telemetry run's scalar/timing/
+# memory series + metadata land in <workspace>/.forge/runs.db so the training
+# view can overlay & compare historical runs. `bundled` compiles SQLite in —
+# no system-lib version drift, same choice Zed makes for its sqlez.
+rusqlite = { version = "0.40.1", features = ["bundled"] }
 # Setting the app-scoped AppleFontSmoothing=0 default at startup (crisp/thin
 # text, same trick as Chromium's -webkit-font-smoothing: antialiased); gpui's
 # mac text system reads it to skip glyph dilation. Version matches gpui's.
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"
 core-foundation-sys = "0.8"
+# The 3D weight grid's real GPU renderer (wg3d/metal.rs): instanced bars drawn
+# with Metal into a CVPixelBuffer that gpui's `surface()` element presents
+# zero-copy. Versions pinned to the ones gpui itself locks so types unify
+# (core-video's CVMetalTextureCache takes a metal::Device).
+metal = "0.33"
+core-video = { version = "0.5.2", features = ["metal"] }
 
 [dev-dependencies]
 # test-support turns on gpui's TestAppContext/VisualTestContext so interaction

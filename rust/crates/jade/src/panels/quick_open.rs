@@ -30,7 +30,8 @@ pub fn overlay(app: &JadeApp, focus: FocusHandle, cx: &mut Context<JadeApp>) -> 
     let selected = state.map(|s| s.selected).unwrap_or(0);
     let results = app.quick_open_matches();
 
-    // Input row: the captured query buffer + a blinking-free caret bar.
+    // Input row: the captured query buffer + caret (before the placeholder
+    // when empty — shared fake-input rule).
     let input = div()
         .flex()
         .flex_row()
@@ -39,14 +40,15 @@ pub fn overlay(app: &JadeApp, focus: FocusHandle, cx: &mut Context<JadeApp>) -> 
         .px(px(10.))
         .border_b_1()
         .border_color(rgb(theme.border))
-        .child(if query.is_empty() {
-            div()
-                .text_color(rgb(theme.muted))
-                .child("Search files by name…")
-        } else {
-            div().text_color(rgb(theme.text)).child(query.clone())
-        })
-        .child(div().text_color(rgb(theme.accent)).child("▏"));
+        .child(crate::panels::input_line(
+            &query,
+            "Search files by name…",
+            true,
+            true,
+            theme.accent,
+            &theme,
+            query.len(),
+        ));
 
     // Results list.
     let mut list = div().flex().flex_col().py_1();

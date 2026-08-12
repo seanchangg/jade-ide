@@ -35,6 +35,7 @@
 // deliberately present ahead of full wiring.
 #![allow(dead_code)]
 
+mod ai_prefs;
 mod app;
 mod asm;
 mod assets;
@@ -42,6 +43,7 @@ mod benchmark;
 mod debug;
 mod decorations;
 mod editor_view;
+mod find;
 mod fonts;
 mod format;
 mod frequency;
@@ -55,8 +57,11 @@ mod panels;
 mod prefs;
 mod quick_open;
 mod registry;
+mod run_store;
 mod structure;
+mod sync;
 mod theme;
+mod timer_groups;
 mod training;
 mod wg3d;
 mod workspace_state;
@@ -72,8 +77,8 @@ use forge_sysmon::SystemMonitor;
 use forge_telemetry::{Event, TelemetryServer};
 use forge_term::TermManager;
 use gpui::{
-    point, px, size, App, AppContext, Bounds, TitlebarOptions, WindowBackgroundAppearance,
-    WindowBounds, WindowOptions,
+    point, px, size, App, AppContext, Bounds, KeyBinding, TitlebarOptions,
+    WindowBackgroundAppearance, WindowBounds, WindowOptions,
 };
 use gpui_platform::application;
 use tokio::runtime::Handle;
@@ -174,6 +179,13 @@ fn main() {
         TelemetryServer::start(socket.clone()).expect("bind telemetry socket")
     };
     let server = Arc::new(server);
+    // Buffer-name aliasing works from app start (TS parity: the server always
+    // resolved allocation sites). The probe's decl meta carries the exe path,
+    // so the empty fallback only matters for probes that omit it; Run/Debug
+    // re-install with the freshly built executable.
+    server.set_symbolicator(Arc::new(forge_build::AtosSymbolicator::new(
+        std::path::PathBuf::new(),
+    )));
 
     // ── Engine lifecycle (deliverable §2) ─────────────────────────────────────
     let root = repo_root();
@@ -234,6 +246,10 @@ fn main() {
         println!("active file: {}", f.display());
     }
 
+    // Kept out of `deps` so the quit and signal handlers below can take the
+    // managed llama-server down; `deps` moves into the window.
+    let ai_cleanup = ai.clone();
+
     let deps = AppDeps {
         server: server.clone(),
         engine,
@@ -248,6 +264,7 @@ fn main() {
         workspace_opened,
         fs_watch,
         demo,
+        prefs_path: None, // real ~/.config/jade prefs
     };
 
     // ── Headless smoke hook (deliverable §7) ──────────────────────────────────
@@ -281,6 +298,8 @@ fn main() {
         } else if mode == "lsp" {
             let target = arg_value(&args, "lsp").map(PathBuf::from);
             run_smoke_lsp(runtime, deps, target);
+        } else if mode == "sighelp" {
+            run_smoke_sighelp(runtime, deps, app_rx);
         } else {
             run_smoke(runtime, deps, app_rx, &mode);
         }
@@ -295,12 +314,29 @@ fn main() {
     // Optionally launch the probe's test training program against ourselves.
     maybe_launch_train(&args, &socket);
 
+    // ⌃C / `kill` must take the managed llama-server with us. `on_app_quit`
+    // below covers ⌘Q and the menu, but a `cargo run` in a terminal dies by
+    // signal, and the server would then hold the GPU until the next reboot.
+    spawn_signal_cleanup(&handle, ai_cleanup.clone());
+
     // Register the bundled-icon asset source (lucide SVGs) so `gpui::svg()` can
     // resolve `icons/<name>.svg`; `with_assets` also rebuilds the SvgRenderer over
     // it. Chained onto the platform Application before the first window opens; the
     // font registration below is unaffected (it runs against the same `App`).
     application().with_assets(assets::Assets).run(move |cx: &mut App| {
         fonts::register_bundled_fonts(cx);
+
+        // Quitting Jade must stop the model server. GPUI ends the process
+        // without dropping the tokio `Child`, so `kill_on_drop` never fires and
+        // llama-server kept running (and kept the GPU allocated) long after the
+        // window closed. `kill_managed_now` is synchronous on purpose — there is
+        // no runtime to await here, and quit does not wait for us.
+        cx.on_app_quit(move |_cx| {
+            ai_cleanup.kill_managed_now();
+            async {}
+        })
+        .detach();
+
         // Signature window chrome (§2 "the look" / main.ts:41-66): 1400×900 window,
         // `hiddenInset`-equivalent titlebar (transparent, traffic lights at 12,12),
         // 800×500 minimum. The #1E1F22 backdrop is painted by the root div's
@@ -327,9 +363,38 @@ fn main() {
         // directory picker as ⌘O / the action-bar button (CLion-style project
         // opening); each opened folder lands in the project subtabs.
         cx.on_action(move |_: &OpenFolder, cx| {
-            let _ = window.update(cx, |app, _window, cx| app.prompt_open_project(cx));
+            // The menu action is dispatched *inside* the active window's own
+            // update (`Window::dispatch_action` → `cx.defer` → `window.update`),
+            // so calling `window.update` again here re-enters the same window —
+            // `update_window_id` has already `take()`n it out of its slot, so the
+            // nested update returns `Err` and the folder picker never opens (the
+            // action-bar folder button works because it's already in the entity
+            // context). Defer our update so it runs after the dispatch unwinds and
+            // the window slot is restored.
+            cx.defer(move |cx| {
+                let _ = window.update(cx, |app, _window, cx| app.prompt_open_project(cx));
+            });
         });
         cx.on_action(|_: &Quit, cx| cx.quit());
+
+        // gpui builds the macOS menu itself and takes each item's ⌘-shortcut
+        // from the keymap binding registered for that item's action
+        // (gpui_macos platform.rs: `bindings_for_action` → `initWithTitle_
+        // action_keyEquivalent_`). Jade registered no bindings at all, so "Quit
+        // Jade" carried no shortcut.
+        //
+        // CAVEAT: with this binding in place, the item STILL reports no key
+        // equivalent over the accessibility API (AXMenuItemCmdChar is missing).
+        // So the menu label does not come from here today. ⌘Q itself is carried
+        // by the root `on_key_down` in app.rs, alongside ⌘P and ⌘O. The binding
+        // stays because it is the mechanism that is supposed to label the item,
+        // and it costs one line — but do not read it as the reason ⌘Q works.
+        //
+        // Only Quit is bound. ⌘O already works through that same root handler,
+        // and a binding for it could fire the action AND the handler, opening
+        // two folder pickers.
+        cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
+
         cx.set_menus(vec![
             gpui::Menu::new("Jade").items(vec![gpui::MenuItem::action("Quit Jade", Quit)]),
             gpui::Menu::new("File").items(vec![gpui::MenuItem::action(
@@ -339,6 +404,33 @@ fn main() {
         ]);
 
         cx.activate(true);
+    });
+}
+
+/// Kill the managed llama-server when Jade is signalled, then exit.
+///
+/// GPUI's `on_app_quit` handles ⌘Q, but it never runs for ⌃C or `kill`, and a
+/// llama-server that outlives Jade holds its GPU memory and answers on the
+/// managed port forever. SIGKILL of Jade itself cannot be caught — the PID file
+/// covers that case, by letting the next run adopt the orphan.
+fn spawn_signal_cleanup(handle: &Handle, ai: Arc<InlineCompletionBackend>) {
+    handle.spawn(async move {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let mut hup = match signal(SignalKind::hangup()) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let code = tokio::select! {
+            _ = tokio::signal::ctrl_c() => 130, // 128 + SIGINT
+            _ = term.recv() => 143,             // 128 + SIGTERM
+            _ = hup.recv() => 129,              // 128 + SIGHUP
+        };
+        ai.kill_managed_now();
+        std::process::exit(code);
     });
 }
 
@@ -706,7 +798,8 @@ fn run_smoke(
         println!("[smoke] build ok {}", exe.display());
 
         if mode == "build-run" {
-            app.action_run();
+            // Headless: skip the pre-run tracking panel, launch directly.
+            app.launch_run();
             while app.running {
                 match app_rx.recv().await {
                     Some(ev) => app.apply_app_event(ev),
@@ -909,6 +1002,74 @@ fn run_smoke_lsp(runtime: tokio::runtime::Runtime, _deps: AppDeps, dir: Option<P
             Err(_) => println!("[smoke] lsp skipped (no diagnostics within timeout)"),
         }
         handle.shutdown().await;
+    });
+}
+
+/// `--smoke sighelp`: drive the REAL app signature-help flow against clangd —
+/// assemble the app, open a file with a call site (which spawns clangd), wait for
+/// the session, position the caret inside `add(…)`, fire `schedule_signature_help`,
+/// pump the unified event channel, and print whether a hint populated. Proves the
+/// wiring (request → `AppEvent::SignatureHelp` → `on_signature_help` → state)
+/// end-to-end. Skips gracefully if clangd never comes up.
+fn run_smoke_sighelp(
+    runtime: tokio::runtime::Runtime,
+    deps: AppDeps,
+    mut app_rx: UnboundedReceiver<AppEvent>,
+) {
+    runtime.block_on(async move {
+        let root = deps.workspace_root.clone();
+        let file = root.join("sighelp_smoke.cpp");
+        let src = "int add(int a, int b) { return a + b; }\nint main() { int z = add(1, 2); return z; }\n";
+        if std::fs::write(&file, src).is_err() {
+            println!("[smoke] FAIL sighelp: could not write {}", file.display());
+            return;
+        }
+
+        let mut app = JadeApp::assemble(deps);
+        app.open_file(file.clone()); // triggers clangd init + didOpen
+
+        // Pump until clangd is ready, or give up.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !app.lsp_active() && std::time::Instant::now() < deadline {
+            if let Ok(Some(ev)) =
+                tokio::time::timeout(std::time::Duration::from_secs(1), app_rx.recv()).await
+            {
+                app.apply_app_event(ev);
+            }
+        }
+        if !app.lsp_active() {
+            println!("[smoke] sighelp skipped (clangd never became ready)");
+            return;
+        }
+
+        // Caret just after the '(' in the CALL `add(1, 2)` (rfind → skip the
+        // definition `int add(`).
+        let open_paren = src.rfind("add(").map(|i| i + 4).unwrap();
+        if let Some(tab) = app.editor.active_tab_mut() {
+            tab.buffer.set_caret(open_paren);
+        }
+
+        // Retry: clangd may still be indexing right after didOpen.
+        let mut got: Option<String> = None;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while got.is_none() && std::time::Instant::now() < deadline {
+            app.schedule_signature_help();
+            // Drain events for a beat so the response lands and applies.
+            let beat = std::time::Instant::now() + std::time::Duration::from_millis(700);
+            while std::time::Instant::now() < beat {
+                if let Ok(Some(ev)) =
+                    tokio::time::timeout(std::time::Duration::from_millis(200), app_rx.recv()).await
+                {
+                    app.apply_app_event(ev);
+                }
+            }
+            got = app.signature.as_ref().map(|s| s.label.clone());
+        }
+
+        match got {
+            Some(label) => println!("[smoke] sighelp ok label={label:?}"),
+            None => println!("[smoke] FAIL sighelp: no hint populated in the app"),
+        }
     });
 }
 

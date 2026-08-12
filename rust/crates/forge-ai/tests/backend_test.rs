@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use forge_ai::{AiState, InfillRequest, InlineCompletionBackend};
+use forge_ai::{AiModelId, AiState, InfillRequest, InlineCompletionBackend, ModelSource};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -166,9 +166,16 @@ async fn wait_ready(backend: &InlineCompletionBackend) {
 // Env mutation is process-global; serialize the tests that touch JADE_FIM_ENDPOINT.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+/// Take `ENV_LOCK`, ignoring poison. One failing test used to poison the mutex
+/// and every other env test then failed with `PoisonError` instead of its own
+/// result, which hides the one real failure behind six invented ones.
+fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[tokio::test]
 async fn resolves_env_endpoint_and_reports_ready() {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _guard = env_lock();
     let mock = MockServer::start(MockConfig::default()).await;
 
     std::env::set_var("JADE_FIM_ENDPOINT", &mock.endpoint);
@@ -187,7 +194,7 @@ async fn resolves_env_endpoint_and_reports_ready() {
 
 #[tokio::test]
 async fn infill_request_body_matches_ts_contract() {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _guard = env_lock();
     let mock = MockServer::start(MockConfig::default()).await;
     std::env::set_var("JADE_FIM_ENDPOINT", &mock.endpoint);
     let backend = InlineCompletionBackend::new();
@@ -216,7 +223,8 @@ async fn infill_request_body_matches_ts_contract() {
     assert_eq!(body["cache_prompt"], true);
     assert_eq!(body["t_max_predict_ms"], 1500);
 
-    // Multi-line request: n_predict 96, empty stop.
+    // Multi-line request: n_predict 96, and it stops at a blank line — the
+    // client cuts there anyway, so generating past it only costs latency.
     let req2 = InfillRequest {
         prefix: "a".into(),
         suffix: "b".into(),
@@ -226,12 +234,12 @@ async fn infill_request_body_matches_ts_contract() {
     backend.infill(&req2).await.unwrap();
     let body2 = mock.last_infill.lock().unwrap().clone().unwrap();
     assert_eq!(body2["n_predict"], 96);
-    assert_eq!(body2["stop"], serde_json::json!([]));
+    assert_eq!(body2["stop"], serde_json::json!(["\n\n"]));
 }
 
 #[tokio::test]
 async fn single_flight_aborts_the_in_flight_request() {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _guard = env_lock();
     // First /infill is slow; a superseding call should abort it -> None.
     let mock = MockServer::start(MockConfig {
         infill_delay: Duration::from_millis(1500),
@@ -268,7 +276,7 @@ async fn single_flight_aborts_the_in_flight_request() {
 
 #[tokio::test]
 async fn infill_times_out_to_none() {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _guard = env_lock();
     // Response arrives well after the (shortened) request timeout.
     let mock = MockServer::start(MockConfig {
         infill_delay: Duration::from_millis(800),
@@ -306,7 +314,7 @@ async fn infill_returns_none_when_not_ready() {
 
 #[tokio::test]
 async fn stop_transitions_to_disabled_and_aborts() {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _guard = env_lock();
     let mock = MockServer::start(MockConfig::default()).await;
     std::env::set_var("JADE_FIM_ENDPOINT", &mock.endpoint);
     let backend = InlineCompletionBackend::new();
@@ -331,7 +339,7 @@ async fn stop_transitions_to_disabled_and_aborts() {
 
 #[tokio::test]
 async fn start_is_idempotent() {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _guard = env_lock();
     let mock = MockServer::start(MockConfig::default()).await;
     std::env::set_var("JADE_FIM_ENDPOINT", &mock.endpoint);
     let backend = InlineCompletionBackend::new();
@@ -339,4 +347,142 @@ async fn start_is_idempotent() {
     backend.start().await; // second call while ready is a no-op
     std::env::remove_var("JADE_FIM_ENDPOINT");
     assert_eq!(backend.status().state, AiState::Ready);
+}
+
+/// The sprite tier serves a GGUF off disk rather than a HuggingFace repo, and
+/// asks for a bigger batch because llama-server derives the kept prefix from
+/// it (`n_prefix_take = 3*(n_batch/4)`; the model trains on 1280).
+#[test]
+fn sprite_tier_serves_a_local_gguf() {
+    let _guard = env_lock();
+    std::env::set_var("FORGE_SPRITE_MODEL", "/tmp/whatever/sprite.gguf");
+    assert_eq!(
+        AiModelId::Sprite.source(),
+        ModelSource::Local(std::path::PathBuf::from("/tmp/whatever/sprite.gguf")),
+        "FORGE_SPRITE_MODEL redirects the sprite tier"
+    );
+    std::env::remove_var("FORGE_SPRITE_MODEL");
+
+    assert!(matches!(AiModelId::Fastest.source(), ModelSource::Hf(_)),
+            "the Qwen tiers still download");
+    assert_eq!(AiModelId::Sprite.batch(), 1792);
+    assert_eq!(AiModelId::Fastest.batch(), 1024, "other tiers keep the tuned 1024");
+    assert_eq!(AiModelId::Sprite.label(), "sprite-100m");
+
+    // ai.json stores the tier by name; `sprite` must round-trip.
+    let json = serde_json::to_string(&AiModelId::Sprite).unwrap();
+    assert_eq!(json, "\"sprite\"");
+    assert_eq!(
+        serde_json::from_str::<AiModelId>(&json).unwrap(),
+        AiModelId::Sprite
+    );
+
+    // The model was called `ghost` until 2026-08-09. An ai.json written before
+    // the rename must still load, or the tier silently drops to the default.
+    assert_eq!(
+        serde_json::from_str::<AiModelId>("\"ghost\"").unwrap(),
+        AiModelId::Sprite,
+        "the old name stays readable"
+    );
+}
+
+// ── Quitting Jade must stop the managed server ────────────────────────────────
+//
+// The bug these cover: nothing killed llama-server when the app quit. The tokio
+// `Child` carries `kill_on_drop`, but GPUI ends the process without dropping it,
+// so the server survived its parent, held the GPU, and kept answering on the
+// managed port. `kill_managed_now()` is the synchronous kill the quit and signal
+// handlers call.
+
+/// A stand-in for llama-server that runs until something kills it.
+fn fake_server_script(dir: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("fake-llama-server");
+    std::fs::write(&path, "#!/bin/sh\nexec sleep 300\n").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+/// `ps` state for `pid`: `None` once it is gone, `Some("Z…")` while it is a
+/// killed-but-unreaped zombie (we still hold the `Child`, so nothing has waited
+/// on it yet). Either one proves the signal landed.
+fn process_state(pid: u32) -> Option<String> {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .expect("ps runs");
+    let state = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if state.is_empty() {
+        None
+    } else {
+        Some(state)
+    }
+}
+
+fn assert_dead(pid: u32, what: &str) {
+    for _ in 0..200 {
+        match process_state(pid) {
+            None => return,
+            Some(s) if s.starts_with('Z') => return,
+            _ => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
+    panic!("{what}: pid {pid} is still running ({:?})", process_state(pid));
+}
+
+#[tokio::test]
+async fn kill_managed_now_stops_the_server_and_clears_the_pid_file() {
+    let _guard = env_lock();
+    let dir = std::env::temp_dir().join(format!("jade-ai-kill-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let bin = fake_server_script(&dir);
+    let pid_file = dir.join("llama-server.pid");
+    std::env::set_var("JADE_LLAMA_PIDFILE", &pid_file);
+
+    let backend = InlineCompletionBackend::new();
+    backend.spawn_managed_for_test(bin.to_str().unwrap()).await;
+
+    let pid = backend.managed_pid().expect("the spawn records a pid");
+    assert_eq!(
+        std::fs::read_to_string(&pid_file).unwrap().trim(),
+        pid.to_string(),
+        "the pid file names the server, so the next run can adopt an orphan"
+    );
+    assert!(process_state(pid).is_some(), "the fake server is running");
+
+    // The quit path: synchronous, no runtime, no lifecycle lock.
+    assert!(backend.kill_managed_now(), "the signal goes out");
+    assert_dead(pid, "kill_managed_now");
+
+    assert!(!pid_file.exists(), "a killed server leaves no pid file behind");
+    assert_eq!(backend.managed_pid(), None);
+    assert!(
+        !backend.kill_managed_now(),
+        "a second call has nothing to kill"
+    );
+
+    std::env::remove_var("JADE_LLAMA_PIDFILE");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn stop_kills_the_server_by_pid_as_well_as_by_handle() {
+    let _guard = env_lock();
+    let dir = std::env::temp_dir().join(format!("jade-ai-stop-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let bin = fake_server_script(&dir);
+    let pid_file = dir.join("llama-server.pid");
+    std::env::set_var("JADE_LLAMA_PIDFILE", &pid_file);
+
+    let backend = InlineCompletionBackend::new();
+    backend.spawn_managed_for_test(bin.to_str().unwrap()).await;
+    let pid = backend.managed_pid().expect("the spawn records a pid");
+
+    backend.stop().await;
+    assert_dead(pid, "stop");
+    assert_eq!(backend.status().state, AiState::Disabled);
+    assert!(!pid_file.exists());
+
+    std::env::remove_var("JADE_LLAMA_PIDFILE");
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -42,7 +42,7 @@ use std::time::Duration;
 
 use lsp_types::{
     CompletionItem, CompletionResponse, Diagnostic, GotoDefinitionResponse, Hover, Location,
-    Position, TextDocumentSyncCapability, TextDocumentSyncKind,
+    Position, SignatureHelp, TextDocumentSyncCapability, TextDocumentSyncKind,
 };
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
@@ -216,6 +216,13 @@ impl LspClient {
                             "resolveSupport": { "properties": ["documentation", "detail"] }
                         },
                         "contextSupport": true
+                    },
+                    "signatureHelp": {
+                        "signatureInformation": {
+                            "documentationFormat": ["markdown", "plaintext"],
+                            "parameterInformation": { "labelOffsetSupport": true },
+                            "activeParameterSupport": true
+                        }
                     },
                     "hover": { "contentFormat": ["markdown", "plaintext"] },
                     "definition": { "linkSupport": false },
@@ -420,6 +427,27 @@ impl LspHandle {
             CompletionResponse::Array(items) => items,
             CompletionResponse::List(list) => list.items,
         })
+    }
+
+    /// `textDocument/signatureHelp` — the parameter hint shown while filling in a
+    /// call/constructor. `None` when the cursor isn't inside an argument list.
+    pub async fn signature_help(
+        &self,
+        path: &Path,
+        position: Position,
+    ) -> Result<Option<SignatureHelp>> {
+        let uri = uri_from_path(path);
+        let params = json!({
+            "textDocument": { "uri": uri.as_str() },
+            "position": position,
+        });
+        let raw = self.request("textDocument/signatureHelp", params).await?;
+        if raw.is_null() {
+            return Ok(None);
+        }
+        serde_json::from_value(raw)
+            .map(Some)
+            .map_err(|e| LspError::Decode(e.to_string()))
     }
 
     /// `textDocument/hover` (`lsp-client.ts:137-148`). `None` when the server

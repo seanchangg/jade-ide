@@ -75,10 +75,13 @@ async fn run_task(
     mut stop_rx: oneshot::Receiver<()>,
 ) -> RunResult {
     let start = Instant::now();
+    // Run from the project root when the caller provides it (matches CLion, so
+    // relative paths like `fopen("drake_lyrics.txt")` resolve); otherwise fall
+    // back to the executable's parent (the build dir).
     let cwd = cfg
-        .executable
-        .parent()
-        .map(Path::to_path_buf)
+        .cwd
+        .clone()
+        .or_else(|| cfg.executable.parent().map(Path::to_path_buf))
         .unwrap_or_else(|| PathBuf::from("."));
 
     // ── Environment & dylib injection ──
