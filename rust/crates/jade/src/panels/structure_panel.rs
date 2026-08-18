@@ -11,60 +11,49 @@
 use gpui::{div, prelude::*, px, rgb, Context, SharedString};
 
 use crate::app::{JadeApp, SidebarTab};
+use crate::kumo::{Empty, Size as KumoSize, TabBar, TabItem, TabsAppearance};
 use crate::structure::{kind_color, Symbol, SymbolKind};
 use crate::theme::Theme;
 
 /// FILES | STRUCTURE switcher shown at the top of the left sidebar. Clicking a
 /// tab flips `JadeApp::sidebar_tab`.
 pub fn tab_switcher(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl IntoElement {
+    // A Kumo segmented Tabs at `size="sm"` — the same control the bottom panel
+    // uses for TERMINAL | OUTPUT, so the two sidebars read as one system.
+    let t = &theme.kumo;
+    let bar = TabBar::new(TabsAppearance::Segmented).size(KumoSize::Sm);
     let tab = |id: &'static str,
-               icon: &'static str,
-               label: &'static str,
-               which: SidebarTab,
-               active: bool| {
-        let color = if active { theme.text } else { theme.muted };
-        let mut el = div()
-            .id(id)
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_1()
-            .px_2()
-            .py_1()
-            .text_xs()
-            .cursor_pointer()
-            .text_color(rgb(color))
+                   icon: &'static str,
+                   label: &'static str,
+                   which: SidebarTab,
+                   active: bool| {
+        bar.trigger(TabItem::new(id, label, active).icon(icon), t)
             .on_click(cx.listener(move |a: &mut JadeApp, _e, _w, cx| {
                 a.set_sidebar_tab(which);
                 cx.notify();
             }))
-            .child(crate::assets::ui_icon(icon, 13., color))
-            .child(label);
-        if active {
-            el = el.border_b_2().border_color(rgb(theme.accent));
-        }
-        el
     };
 
-    div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap_2()
-        .child(tab(
-            "sb-files",
-            "folder",
-            "FILES",
-            SidebarTab::Files,
-            app.sidebar_tab == SidebarTab::Files,
-        ))
-        .child(tab(
-            "sb-structure",
-            "list-tree",
-            "STRUCTURE",
-            SidebarTab::Structure,
-            app.sidebar_tab == SidebarTab::Structure,
-        ))
+    let files = tab(
+        "sb-files",
+        "folder",
+        "Files",
+        SidebarTab::Files,
+        app.sidebar_tab == SidebarTab::Files,
+    );
+    let structure = tab(
+        "sb-structure",
+        "list-tree",
+        "Structure",
+        SidebarTab::Structure,
+        app.sidebar_tab == SidebarTab::Structure,
+    );
+
+    TabBar::new(TabsAppearance::Segmented)
+        .size(KumoSize::Sm)
+        .push(files)
+        .push(structure)
+        .render(t)
 }
 
 /// Render the outline for the active tab (or a muted placeholder).
@@ -74,12 +63,20 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> impl IntoElement {
 
     let mut list = div().flex().flex_col().w_full();
     if symbols.is_empty() {
-        let msg = if app.editor.active_tab().is_some() {
-            "No symbols"
+        // A Kumo Empty at `size="sm"` — the outline has nothing to show, so it
+        // says so in the panel rather than leaving a blank column.
+        let (title, body) = if app.editor.active_tab().is_some() {
+            ("No symbols", "This file has no top-level declarations.")
         } else {
-            "No file open"
+            ("No file open", "Open a file to see its outline.")
         };
-        list = list.child(div().text_color(rgb(theme.muted)).text_xs().child(msg));
+        list = list.child(
+            Empty::new(title)
+                .body(body)
+                .icon("list-tree")
+                .size(KumoSize::Sm)
+                .render(&theme.kumo),
+        );
     } else {
         for sym in symbols {
             list = list.child(node(sym, &theme, cx));

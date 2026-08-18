@@ -15,6 +15,7 @@
 use gpui::{div, prelude::*, px, rgb, Context};
 
 use crate::app::JadeApp;
+use crate::kumo::{scale, Size as KumoSize, Text as KumoText, TextTone};
 use crate::theme::Theme;
 use crate::workspace_tree::{FileKind, Row};
 
@@ -27,7 +28,13 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> impl IntoElement {
         .flex_row()
         .items_center()
         .justify_between()
-        .child(div().text_color(rgb(theme.muted)).text_xs().child("FILES"))
+        .child(
+            KumoText::new("Files")
+                .tone(TextTone::Secondary)
+                .size(KumoSize::Xs)
+                .medium(true)
+                .render(&theme.kumo),
+        )
         .child(
             div()
                 .id("files-minimize")
@@ -112,18 +119,19 @@ fn tree_row(
         .flex()
         .flex_row()
         .items_center()
-        .gap_1()
-        .h(px(22.))
+        .gap(scale::SPACE_1_5)
+        .h(px(24.))
         .pl(px(indent))
-        .pr(px(6.))
-        .rounded_sm()
-        .text_xs()
+        .pr(scale::SPACE_1_5)
+        .rounded(scale::RADIUS_MD)
+        .text_size(scale::TEXT_XS)
         .cursor_pointer()
-        // Hover affordance (§2; main.css:562-564 `.file-tree-row:hover`).
-        .hover(|s| s.bg(rgb(theme.border)));
+        // Hover affordance — Kumo's `hover:bg-kumo-fill-hover`.
+        .hover(|s| s.bg(theme.kumo.fill_hover));
 
+    // The selected row keeps `bg-kumo-tint`, one step stronger than hover.
     if is_active || is_selected {
-        el = el.bg(rgb(theme.border));
+        el = el.bg(theme.kumo.tint);
     }
 
     let is_dir = row.is_dir;

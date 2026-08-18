@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
-use jade_buffer::{Buffer, EditRecord, LspPosition, Point, Selection};
+use jade_buffer::{Buffer, EditRecord, LspPosition, Point, Selection, TAB_WIDTH};
 use jade_lsp::{CompletionItem, Diagnostic, DiagnosticSeverity, Position as LspRange};
 use lsp_types::CompletionTextEdit;
 
@@ -96,7 +96,7 @@ pub struct OpenTab {
     /// tree-sitter query from source (~20ms) — doing that per keystroke was
     /// the editor's typing latency. `None` for non-highlightable files.
     highlighter: Option<highlight::Highlighter>,
-    /// Longest line's length in chars (columns), cached so the code viewer can
+    /// Longest line's width in display columns, cached so the code viewer can
     /// size rows for horizontal scrolling without an O(file) scan every frame.
     /// Recomputed on the same per-edit text pass as [`rehighlight`](Self::rehighlight).
     pub max_cols: usize,
@@ -106,14 +106,12 @@ pub struct OpenTab {
     pub scroll_top: usize,
 }
 
-/// The longest line's length in `char`s (columns) — the horizontal-scroll extent.
-/// Wide glyphs count as one column, matching the viewer's `CHAR_W` monospace
+/// The longest line's width in **display** columns — the horizontal-scroll
+/// extent. A hard tab counts to its next tab stop (see [`DisplayLine`]); wide
+/// glyphs count as one column, matching the viewer's `CHAR_W` monospace
 /// approximation.
 fn max_line_cols(text: &str) -> usize {
-    text.split('\n')
-        .map(|l| l.chars().count())
-        .max()
-        .unwrap_or(0)
+    text.split('\n').map(line_display_cols).max().unwrap_or(0)
 }
 
 impl OpenTab {
@@ -591,7 +589,9 @@ pub fn fold_regions(text: &str) -> HashMap<usize, usize> {
     map
 }
 
-/// Round a line-relative x pixel to a char column, clamped to `max_col`.
+/// Round a line-relative x pixel to a char column, clamped to `max_col`. Correct
+/// only for a line without hard tabs; the editor calls [`px_to_char_col`], which
+/// also handles tab stops.
 pub fn px_to_col(x_rel: f32, char_w: f32, max_col: usize) -> usize {
     if x_rel <= 0.0 || char_w <= 0.0 {
         return 0;
@@ -599,9 +599,181 @@ pub fn px_to_col(x_rel: f32, char_w: f32, max_col: usize) -> usize {
     ((x_rel / char_w).round() as usize).min(max_col)
 }
 
-/// The x pixel of char column `col`.
+/// The x pixel of **display** column `col` (see [`DisplayLine`]).
 pub fn col_to_px(col: usize, char_w: f32) -> f32 {
     col as f32 * char_w
+}
+
+/// The display columns `ch` takes when it starts at column `col`: one, except a
+/// hard tab (to the next [`TAB_WIDTH`] stop) and a stray CR, which the text
+/// system draws as nothing.
+fn char_cols(ch: char, col: usize) -> usize {
+    match ch {
+        '\t' => TAB_WIDTH - col % TAB_WIDTH,
+        // The buffer splits lines on '\n' alone, so a CRLF file leaves a CR at
+        // the end of every line. It has no glyph, so it takes no column.
+        '\r' => 0,
+        _ => 1,
+    }
+}
+
+/// True when `line` draws one column per char, so display columns and char
+/// columns are the same thing.
+fn is_plain(line: &str) -> bool {
+    !line.contains('\t') && !line.contains('\r')
+}
+
+/// The width of `line` in display columns.
+pub fn line_display_cols(line: &str) -> usize {
+    let mut col = 0;
+    for ch in line.chars() {
+        col += char_cols(ch, col);
+    }
+    col
+}
+
+/// One line as the code view draws it: **hard tabs expanded to spaces** at
+/// [`TAB_WIDTH`] stops (and a stray CR counted as zero columns), plus the maps
+/// between raw and display coordinates.
+///
+/// # Why the expansion exists
+/// The renderer hands the line to CoreText, which lays a raw U+0009 out on its
+/// own default 28px tab stops — a width the editor's char grid does not know
+/// about. So on any tab-indented line the glyphs sat at 28px multiples while the
+/// caret, drawn at `char column × char advance` (~7.83px), sat somewhere else:
+/// the caret was offset from the text in every file that indents with tabs.
+/// Expanding to spaces before shaping puts both on the same 4-column grid Jade's
+/// own Tab key inserts, so the caret lands on the glyph it points at.
+///
+/// A line of plain chars keeps its raw text and both maps stay empty (the display
+/// column *is* the char column) — the common case allocates nothing extra.
+///
+/// Wide glyphs (CJK/emoji) still count as one column — the documented
+/// `CHAR_W` approximation, unchanged here.
+pub struct DisplayLine {
+    /// The text to draw (raw line, or the tab-expanded copy).
+    pub text: String,
+    /// Total display columns.
+    pub cols: usize,
+    /// Chars in the raw line.
+    chars: usize,
+    /// Display column at each raw char boundary (`chars + 1` entries). Empty when
+    /// the line needs no expansion.
+    col_at: Vec<usize>,
+    /// Display-text byte offset for each raw byte offset (`raw.len() + 1`
+    /// entries). Empty when the line needs no expansion.
+    byte_at: Vec<usize>,
+}
+
+impl DisplayLine {
+    /// Build the display form of `raw` (taken by value: a line that needs no
+    /// expansion is kept as-is).
+    pub fn new(raw: String) -> DisplayLine {
+        let chars = raw.chars().count();
+        if is_plain(&raw) {
+            return DisplayLine {
+                text: raw,
+                cols: chars,
+                chars,
+                col_at: Vec::new(),
+                byte_at: Vec::new(),
+            };
+        }
+        let mut text = String::with_capacity(raw.len() + TAB_WIDTH);
+        let mut col_at = Vec::with_capacity(chars + 1);
+        let mut byte_at = Vec::with_capacity(raw.len() + 1);
+        let mut col = 0;
+        for ch in raw.chars() {
+            col_at.push(col);
+            // Every byte of a multi-byte char maps to the char's start, so a
+            // range whose bound lands mid-char still maps inside the line.
+            for _ in 0..ch.len_utf8() {
+                byte_at.push(text.len());
+            }
+            let n = char_cols(ch, col);
+            if ch == '\t' {
+                for _ in 0..n {
+                    text.push(' ');
+                }
+            } else {
+                text.push(ch);
+            }
+            col += n;
+        }
+        col_at.push(col);
+        byte_at.push(text.len());
+        DisplayLine {
+            text,
+            cols: col,
+            chars,
+            col_at,
+            byte_at,
+        }
+    }
+
+    /// The display column of char column `col` (clamped to the line's end) — the
+    /// column the caret bar draws at.
+    pub fn display_col(&self, col: usize) -> usize {
+        let col = col.min(self.chars);
+        if self.col_at.is_empty() {
+            col
+        } else {
+            self.col_at[col]
+        }
+    }
+
+    /// The char column whose display column is nearest `x_cols` (an x pixel
+    /// divided by the char advance) — the inverse used for click → caret.
+    pub fn char_col_at_x(&self, x_cols: f32) -> usize {
+        if x_cols <= 0.0 {
+            return 0;
+        }
+        if self.col_at.is_empty() {
+            return (x_cols.round() as usize).min(self.chars);
+        }
+        // col_at ascends, so the first boundary at-or-past x_cols and the one
+        // before it are the only candidates.
+        let after = self
+            .col_at
+            .iter()
+            .position(|&c| c as f32 >= x_cols)
+            .unwrap_or(self.chars);
+        if after == 0 {
+            return 0;
+        }
+        let before = after - 1;
+        if x_cols - self.col_at[before] as f32 <= self.col_at[after] as f32 - x_cols {
+            before
+        } else {
+            after
+        }
+    }
+
+    /// A raw-line byte offset → the same position in [`text`](Self::text).
+    pub fn map_byte(&self, byte: usize) -> usize {
+        if self.byte_at.is_empty() {
+            byte.min(self.text.len())
+        } else {
+            self.byte_at[byte.min(self.byte_at.len() - 1)]
+        }
+    }
+
+    /// A raw-line byte range → the same span of [`text`](Self::text), for the
+    /// syntax / selection / diagnostic highlight runs.
+    pub fn map_range(&self, r: Range<usize>) -> Range<usize> {
+        self.map_byte(r.start)..self.map_byte(r.end)
+    }
+}
+
+/// Round a line-relative x pixel to a **char** column on `line`. Hard tabs make
+/// this differ from [`px_to_col`]: x maps to the nearest char boundary measured
+/// in display columns, so a click inside a tab's white space lands on one of its
+/// two edges.
+pub fn px_to_char_col(line: &str, x_rel: f32, char_w: f32) -> usize {
+    if x_rel <= 0.0 || char_w <= 0.0 {
+        return 0;
+    }
+    DisplayLine::new(line.to_string()).char_col_at_x(x_rel / char_w)
 }
 
 /// The char-column range of the word/identifier at char column `col` on `line`
@@ -1067,6 +1239,87 @@ mod tests {
         }
         t.on_edited(0); // rehighlight recomputes max_cols
         assert!(t.max_cols >= 40, "max_cols grew with the edited line");
+    }
+
+    /// A tab-free line: the display form is the raw line and both maps are the
+    /// identity.
+    #[test]
+    fn display_line_without_tabs_is_the_raw_line() {
+        let d = DisplayLine::new("int x = 1;".to_string());
+        assert_eq!(d.text, "int x = 1;");
+        assert_eq!(d.cols, 10);
+        assert_eq!(d.display_col(4), 4);
+        assert_eq!(d.display_col(99), 10); // clamps to the line end
+        assert_eq!(d.map_range(2..5), 2..5);
+        assert_eq!(d.char_col_at_x(3.4), 3);
+        assert_eq!(d.char_col_at_x(3.6), 4);
+    }
+
+    /// A hard tab advances to the next TAB_WIDTH stop, so the caret column of
+    /// everything after it shifts — the offset this whole layer exists to fix.
+    #[test]
+    fn display_line_expands_tabs_to_stops() {
+        let d = DisplayLine::new("\tx".to_string());
+        assert_eq!(d.text, "    x");
+        assert_eq!(d.cols, 5);
+        assert_eq!(d.display_col(0), 0); // before the tab
+        assert_eq!(d.display_col(1), 4); // the 'x' sits at the first stop
+        assert_eq!(d.display_col(2), 5);
+
+        // A tab from column 2 fills only the 2 columns left to the stop.
+        let d = DisplayLine::new("ab\tcd".to_string());
+        assert_eq!(d.text, "ab  cd");
+        assert_eq!(d.display_col(3), 4);
+        assert_eq!(d.cols, 6);
+
+        // Two leading tabs → two full stops (8 columns of indent).
+        let d = DisplayLine::new("\t\tif (x) {".to_string());
+        assert_eq!(d.display_col(2), 8);
+    }
+
+    /// A CRLF file leaves a CR at the end of each line. It draws as nothing, so
+    /// it must take no column — otherwise the caret at end of line sat one cell
+    /// past the last glyph.
+    #[test]
+    fn display_line_gives_a_stray_cr_no_column() {
+        let d = DisplayLine::new("int x;\r".to_string());
+        assert_eq!(d.cols, 6);
+        assert_eq!(d.display_col(6), 6); // before the CR
+        assert_eq!(d.display_col(7), 6); // after it — same x
+        assert_eq!(line_display_cols("int x;\r"), 6);
+    }
+
+    /// Highlight runs are byte ranges into the raw line; they must land on the
+    /// same text in the expanded copy.
+    #[test]
+    fn display_line_maps_highlight_ranges() {
+        let d = DisplayLine::new("\tint\tx".to_string());
+        assert_eq!(d.text, "    int x");
+        assert_eq!(d.map_range(1..4), 4..7); // "int"
+        assert_eq!(d.map_range(5..6), 8..9); // "x"
+        // A multi-byte char keeps its whole span (bytes map to the char start).
+        let d = DisplayLine::new("\tü".to_string());
+        assert_eq!(d.map_range(1..3), 4..6);
+    }
+
+    /// Clicking inside a tab's white space snaps to the nearer of its two edges.
+    #[test]
+    fn px_to_char_col_snaps_across_a_tab() {
+        // "\tx" draws as 4 spaces + x; char boundaries sit at columns 0, 4, 5.
+        // char_w = 8 → x=15px is 1.875 columns: nearer column 0 than column 4.
+        assert_eq!(px_to_char_col("\tx", 15.0, 8.0), 0);
+        assert_eq!(px_to_char_col("\tx", 18.0, 8.0), 1); // 2.25 cols → the 'x'
+        assert_eq!(px_to_char_col("\tx", 999.0, 8.0), 2); // clamps past EOL
+        // No tab → same rounding as px_to_col.
+        assert_eq!(px_to_char_col("abcd", 11.0, 8.0), 1);
+        assert_eq!(px_to_char_col("abcd", 13.0, 8.0), 2);
+    }
+
+    /// The h-scroll extent counts a tab to its stop, not as one column.
+    #[test]
+    fn max_cols_counts_tabs_to_their_stop() {
+        let t = tab_from("a.cpp", "\t\tx\n");
+        assert_eq!(t.max_cols, 9);
     }
 
     #[test]

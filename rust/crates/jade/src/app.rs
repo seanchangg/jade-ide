@@ -35,7 +35,7 @@ use jade_sysmon::{SystemMonitor, SystemStats};
 use jade_telemetry::{Event, Kind, TelemetryServer};
 use jade_term::{GridSnapshot, TermEvent, TermId, TermManager};
 use gpui::{
-    div, hsla, prelude::*, px, rgb, Bounds, BoxShadow, ClipboardItem, Context,
+    div, prelude::*, px, rgb, Bounds, BoxShadow, ClipboardItem, Context,
     EntityInputHandler, FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent, PathPromptOptions,
     Pixels, UTF16Selection, Window, WindowControlArea,
 };
@@ -53,6 +53,10 @@ use tokio::sync::Mutex as AsyncMutex;
 pub mod dim_input;
 
 use crate::editor_view::{self, EditorState};
+use crate::kumo::{
+    self, scale, separator_v, Badge, BadgeVariant, Button, ButtonVariant, Card, DotColor, Heading,
+    HeadingLevel, Size as KumoSize, TabBar, TabItem, TabsAppearance, Text as KumoText, TextTone,
+};
 use crate::highlight::TokenPalette;
 use crate::memory_bar::{project, Level, MemoryBarState};
 use crate::output::push_output;
@@ -4510,8 +4514,7 @@ impl JadeApp {
             };
             let row = row.min(tab.line_count().saturating_sub(1));
             let line = tab.buffer.line(row).into_owned();
-            let maxcol = line.chars().count();
-            let col = editor_view::px_to_col(x - text_left, cw, maxcol);
+            let col = editor_view::px_to_char_col(&line, x - text_left, cw);
             let byte = tab.buffer.point_to_offset(Point::new(row, col));
             match clicks {
                 n if n >= 3 => {
@@ -4563,8 +4566,7 @@ impl JadeApp {
                 return;
             };
             let row = row.min(tab.line_count().saturating_sub(1));
-            let maxcol = tab.buffer.line(row).chars().count();
-            let col = editor_view::px_to_col(x - text_left, cw, maxcol);
+            let col = editor_view::px_to_char_col(&tab.buffer.line(row), x - text_left, cw);
             let byte = tab.buffer.point_to_offset(Point::new(row, col));
             let anchor = tab.buffer.selection().anchor;
             tab.buffer.set_selection(Selection::new(anchor, byte));
@@ -5151,8 +5153,7 @@ impl JadeApp {
                 return;
             }
             let row = row.min(tab.line_count().saturating_sub(1));
-            let maxcol = tab.buffer.line(row).chars().count();
-            let col = editor_view::px_to_col(x - text_left, cw, maxcol);
+            let col = editor_view::px_to_char_col(&tab.buffer.line(row), x - text_left, cw);
             let byte = tab.buffer.point_to_offset(Point::new(row, col));
             (tab.path.clone(), tab.buffer.offset_to_lsp(byte), (row, col))
         };
@@ -5212,8 +5213,7 @@ impl JadeApp {
                 return;
             }
             let row = row.min(tab.line_count().saturating_sub(1));
-            let maxcol = tab.buffer.line(row).chars().count();
-            let col = editor_view::px_to_col(x - text_left, cw, maxcol);
+            let col = editor_view::px_to_char_col(&tab.buffer.line(row), x - text_left, cw);
             let byte = tab.buffer.point_to_offset(Point::new(row, col));
             (tab.path.clone(), tab.buffer.offset_to_lsp(byte))
         };
@@ -5906,7 +5906,8 @@ impl EntityInputHandler for JadeApp {
         let cw = self.char_w();
         // Anchor at the caret cell, using the captured text-left and the row's
         // offset from the current scroll top (best-effort IME candidate position).
-        let x = px(text_left + editor_view::col_to_px(p.col, cw));
+        let col = editor_view::DisplayLine::new(tab.line(p.row)).display_col(p.col);
+        let x = px(text_left + editor_view::col_to_px(col, cw));
         let drow = tab.display_row(p.row);
         let y = element_bounds.origin.y + px((drow.saturating_sub(top)) as f32 * LINE_H);
         Some(Bounds::new(
@@ -6277,12 +6278,11 @@ impl Render for JadeApp {
     }
 }
 
-/// The floating-card drop shadow (§2 "the look"; main.css `--shadow-sm`,
-/// main.css:85 / :2342-2344): `0 1px 2px rgba(0,0,0,0.25)`. Applied to the
-/// sidebar / editor / runtime / terminal cards so both themes share one subtle
-/// elevation.
+/// The card elevation, applied to the sidebar / editor / runtime / terminal
+/// cards so both themes share one step of lift. Kumo puts `shadow-xs` on a `LayerCard` and `shadow-sm`
+/// on anything that floats over the page, which is what these cards do.
 fn card_shadow() -> Vec<BoxShadow> {
-    vec![BoxShadow::new(px(0.), px(1.), hsla(0., 0., 0., 0.25)).blur_radius(px(2.))]
+    kumo::shadow_sm()
 }
 
 /// CLion-style project subtabs: one chip per opened project, active follows
@@ -6293,17 +6293,10 @@ fn project_tabs(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> gpui
     if app.open_projects.len() < 2 {
         return div().into_any_element();
     }
-    let mut bar = div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .h(px(26.))
-        .px(px(12.))
-        .gap_1()
-        .bg(rgb(theme.panel))
-        .border_b_1()
-        .border_color(rgb(theme.border))
-        .text_xs();
+    let t = &theme.kumo;
+    let bar = TabBar::new(TabsAppearance::Segmented).size(KumoSize::Sm);
+    let mut tabs = TabBar::new(TabsAppearance::Segmented).size(KumoSize::Sm);
+
     for (i, dir) in app.open_projects.iter().enumerate() {
         let active = *dir == app.workspace_root;
         let name = dir
@@ -6311,54 +6304,47 @@ fn project_tabs(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> gpui
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| dir.display().to_string());
         let target = dir.clone();
-        let hover_bg = theme.border;
-        let mut chip = div()
-            .id(("proj-tab", i))
-            .flex()
-            .items_center()
-            .gap_1()
-            .px_2()
-            .py(px(2.))
-            .rounded_md()
-            .cursor_pointer()
-            .text_color(rgb(if active { theme.text } else { theme.muted }))
-            .child(crate::assets::ui_icon(
-                "folder",
-                12.,
-                if active { theme.accent } else { theme.muted },
-            ))
-            .child(name);
-        if active {
-            chip = chip.bg(rgb(theme.bg));
-        } else {
-            chip = chip
-                .hover(move |st| st.bg(rgb(hover_bg)))
-                .on_click(cx.listener(move |a: &mut JadeApp, _ev, _w, cx| {
-                    a.open_project(target.clone());
-                    cx.notify();
-                }));
-        }
-        // Close (×): removes this project from the subtabs; closing the active one
-        // switches to a neighbor (see `close_project`). `stop_propagation` keeps an
-        // inactive chip's switch-on-click from also firing before the close.
+        // Close (×): removes this project from the subtabs; closing the active
+        // one switches to a neighbor (see `close_project`). `stop_propagation`
+        // keeps an inactive tab's switch-on-click from firing before the close.
         let close_target = dir.clone();
-        chip = chip.child(
-            div()
-                .id(("proj-tab-close", i))
-                .px_1()
-                .text_color(rgb(theme.muted))
-                .cursor_pointer()
-                .hover(|st| st.text_color(rgb(theme.text)))
-                .on_click(cx.listener(move |a: &mut JadeApp, _ev, _w, cx| {
-                    cx.stop_propagation();
-                    a.close_project(&close_target);
-                    cx.notify();
-                }))
-                .child(crate::assets::ui_icon("x", 11., theme.muted)),
-        );
-        bar = bar.child(chip);
+        let close = div()
+            .id(("proj-tab-close", i))
+            .px(scale::SPACE_1)
+            .cursor_pointer()
+            .on_click(cx.listener(move |a: &mut JadeApp, _ev, _w, cx| {
+                cx.stop_propagation();
+                a.close_project(&close_target);
+                cx.notify();
+            }))
+            .child(kumo::icon("x", 11., t.text_subtle))
+            .into_any_element();
+
+        let trigger = bar
+            .trigger(
+                TabItem::new(("proj-tab", i), name, active)
+                    .icon("folder")
+                    .trailing(close),
+                t,
+            )
+            .on_click(cx.listener(move |a: &mut JadeApp, _ev, _w, cx| {
+                a.open_project(target.clone());
+                cx.notify();
+            }));
+        tabs = tabs.push(trigger);
     }
-    bar.into_any_element()
+
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .h(px(32.))
+        .px(scale::SPACE_3)
+        .bg(t.elevated)
+        .border_b_1()
+        .border_color(t.hairline)
+        .child(tabs.render(t))
+        .into_any_element()
 }
 
 fn action_bar(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl IntoElement {
@@ -6399,14 +6385,14 @@ fn action_bar(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl I
         .items_center()
         .gap_2()
         .text_xs()
-        .child(diag_pill("circle-x", errs, theme.red))
-        .child(diag_pill("triangle-alert", warns, theme.amber))
-        .child(diag_pill("info", infos, theme.muted));
+        .child(diag_pill("circle-x", errs, BadgeVariant::Error, theme))
+        .child(diag_pill("triangle-alert", warns, BadgeVariant::Warning, theme))
+        .child(diag_pill("info", infos, BadgeVariant::Secondary, theme));
 
     let right_group = div()
         .flex()
         .items_center()
-        .gap_2()
+        .gap(scale::SPACE_2)
         // ASM viewer (§6, ⌘⇧A): plain icon+label, no box.
         .child(flat_btn("chip-asm", "code", "ASM", theme.muted, theme, app.asm_visible, false, cx, |a, cx| {
             a.toggle_asm(cx)
@@ -6424,12 +6410,26 @@ fn action_bar(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl I
             |a, _| a.action_open_in_clion(),
         ))
         // Build / Run: outlined accent pills (screenshot ref).
-        .child(pill_btn("btn-build", "hammer", build_label, theme.accent, theme, app.building, cx, |a, _| {
-            a.action_build()
-        }))
-        .child(pill_btn("btn-run", "play", run_label, theme.periwinkle, theme, app.running || !can_run, cx, |a, _| {
-            a.action_run()
-        }))
+        .child(pill_btn(
+            "btn-build",
+            "hammer",
+            build_label,
+            ButtonVariant::Secondary,
+            theme,
+            app.building,
+            cx,
+            |a, _| a.action_build(),
+        ))
+        .child(pill_btn(
+            "btn-run",
+            "play",
+            run_label,
+            ButtonVariant::Primary,
+            theme,
+            app.running || !can_run,
+            cx,
+            |a, _| a.action_run(),
+        ))
         .child(flat_btn("btn-debug", "bug", "Debug", theme.amber, theme, app.debugging, app.building, cx, |a, _| {
             a.action_debug()
         }))
@@ -6456,22 +6456,34 @@ fn action_bar(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl I
             a.prompt_open_project(cx)
         }));
 
+    // The bar rides on the elevated layer with a single Kumo hairline under it
+    // and no other chrome, so the controls are the only marks on the strip.
     div()
         .flex()
         .flex_row()
         .items_center()
         .justify_between()
-        .h(px(38.))
-        .pl(px(80.)) // clear the traffic lights (hiddenInset title bar; main.css:222-243)
-        .pr(px(12.))
-        .bg(rgb(theme.panel))
+        .h(px(44.))
+        .pl(px(80.)) // clear the traffic lights (hiddenInset title bar)
+        .pr(scale::SPACE_3)
+        .bg(theme.kumo.elevated)
         .border_b_1()
-        .border_color(rgb(theme.border))
+        .border_color(theme.kumo.hairline)
         // Window-drag region: empty parts of the bar drag the window; the
         // buttons' own click hitboxes take priority (`no-drag` equivalent).
         .window_control_area(WindowControlArea::Drag)
-        .child(toggles)
-        .child(diag_badges)
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(scale::SPACE_3)
+                .child(toggles)
+                // A Kumo hairline rule between the view toggles and the
+                // diagnostics, so the bar reads as clusters and not one run of
+                // controls.
+                .child(separator_v(&theme.kumo, 16.))
+                .child(diag_badges),
+        )
         .child(right_group)
 }
 
@@ -6493,8 +6505,8 @@ fn toast_overlay(app: &JadeApp, theme: &Theme) -> gpui::AnyElement {
         .gap_2();
     for t in &app.toasts {
         let (accent, icon) = match t.kind {
-            ToastKind::Success => (theme.accent, "circle-check"),
-            ToastKind::Error => (theme.red, "circle-x"),
+            ToastKind::Success => (theme.kumo.success, "circle-check"),
+            ToastKind::Error => (theme.kumo.danger, "circle-x"),
         };
         let age = now.saturating_sub(t.created_ms);
         // Fade the whole card out over its last stretch; the entrance animation
@@ -6504,26 +6516,23 @@ fn toast_overlay(app: &JadeApp, theme: &Theme) -> gpui::AnyElement {
         } else {
             1.0
         };
-        let card = div()
+        // A Kumo Card (`LAYER_CARD_SURFACE_CLASSES`) floated over the editor.
+        let card = Card::new(&theme.kumo)
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(9.))
-            .pl(px(11.))
-            .pr(px(14.))
-            .py(px(9.))
+            .gap(scale::SPACE_2_5)
+            .pl(scale::SPACE_3)
+            .pr(scale::SPACE_4)
+            .py(scale::SPACE_2_5)
             .min_w(px(210.))
             .max_w(px(340.))
-            .bg(rgb(theme.panel))
-            .border_1()
-            .border_color(rgb(theme.border))
-            .rounded_lg()
-            .shadow(card_shadow())
-            .text_sm()
-            .text_color(rgb(theme.text))
+            .shadow(kumo::shadow_md())
+            .text_size(scale::TEXT_SM)
+            .text_color(theme.kumo.text_default)
             // Colored accent pill on the leading edge (kind at a glance).
-            .child(div().w(px(3.)).h(px(20.)).rounded_full().bg(rgb(accent)))
-            .child(crate::assets::ui_icon(icon, 15., accent))
+            .child(div().w(px(3.)).h(px(20.)).rounded_full().bg(accent))
+            .child(kumo::icon(icon, 15., accent))
             .child(div().child(t.message.clone()))
             .opacity(fade);
         col = col.child(card.with_animation(
@@ -6731,6 +6740,9 @@ fn ai_menu(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> gpui::Any
 
 /// An icon-only action-bar button (no box, no label): muted at rest, accent
 /// when `active`, hover wash. 26px square hit target around a 15px glyph.
+/// An icon-only toggle. This is Kumo's `<Button shape="square" size="sm"
+/// variant="ghost">` — a 26px square (`h-6.5`) that takes the brand ink while
+/// the tool it toggles is on.
 fn icon_btn(
     id: &'static str,
     icon: &'static str,
@@ -6739,27 +6751,17 @@ fn icon_btn(
     cx: &mut Context<JadeApp>,
     f: impl Fn(&mut JadeApp, &mut Context<JadeApp>) + 'static,
 ) -> impl IntoElement {
-    let color = if active { theme.accent } else { theme.muted };
-    let hover_bg = theme.border;
-    div()
-        .id(id)
-        .flex()
-        .items_center()
-        .justify_center()
-        .w(px(26.))
-        .h(px(26.))
-        .rounded_md()
-        .cursor_pointer()
-        .hover(move |s| s.bg(rgb(hover_bg)))
-        .on_click(cx.listener(move |a, _ev, _win, cx| {
+    kumo::button::icon_button(id, icon, active, &theme.kumo).on_click(cx.listener(
+        move |a, _ev, _win, cx| {
             f(a, cx);
             cx.notify();
-        }))
-        .child(crate::assets::ui_icon(icon, 15., color))
+        },
+    ))
 }
 
-/// A flat icon+label button (no border/fill): drawn in `base` color (per the
-/// TS bar: Debug amber, Stop red, ASM muted), accent when active, hover wash.
+/// A flat icon+label button — Kumo's `variant="ghost"` at `size="sm"`. `base` is
+/// the resting ink (Debug amber, Stop red, ASM subtle); an active button takes
+/// the brand ink and a disabled one drops to `text-kumo-subtle`.
 #[allow(clippy::too_many_arguments)]
 fn flat_btn(
     id: &'static str,
@@ -6772,96 +6774,69 @@ fn flat_btn(
     cx: &mut Context<JadeApp>,
     f: impl Fn(&mut JadeApp, &mut Context<JadeApp>) + 'static,
 ) -> impl IntoElement {
-    let color = if disabled {
-        theme.muted
+    let ink = if disabled {
+        theme.kumo.text_subtle
     } else if active {
-        theme.accent
+        theme.kumo.brand
     } else {
-        base
+        rgb(base)
     };
-    let hover_bg = theme.border;
-    let el = div()
-        .id(id)
-        .flex()
-        .items_center()
-        .gap_1()
-        .px_2()
-        .py_1()
-        .rounded_md()
-        .text_xs()
-        .text_color(rgb(color))
-        .child(crate::assets::ui_icon(icon, 14., color))
-        .child(label);
+    let el = Button::new(id, label)
+        .variant(ButtonVariant::Ghost)
+        .size(KumoSize::Sm)
+        .icon(icon)
+        .ink(ink)
+        .disabled(disabled)
+        .render(&theme.kumo);
     if disabled {
         el
     } else {
-        el.cursor_pointer()
-            .hover(move |s| s.bg(rgb(hover_bg)))
-            .on_click(cx.listener(move |a, _ev, _win, cx| {
-                f(a, cx);
-                cx.notify();
-            }))
+        el.on_click(cx.listener(move |a, _ev, _win, cx| {
+            f(a, cx);
+            cx.notify();
+        }))
     }
 }
 
-/// An outlined pill button (Build/Run): 1px `color` border + `color` icon and
-/// text on the panel background, hover wash. `busy` mutes it and drops clicks.
+/// The Build / Run pair. Kumo's `variant="primary"` is the one solid fill on
+/// the bar — exactly one committing action per screen — and Build sits beside
+/// it as `variant="secondary"`.
 #[allow(clippy::too_many_arguments)]
 fn pill_btn(
     id: &'static str,
     icon: &'static str,
     label: String,
-    color: u32,
+    variant: ButtonVariant,
     theme: &Theme,
     busy: bool,
     cx: &mut Context<JadeApp>,
     f: impl Fn(&mut JadeApp, &mut Context<JadeApp>) + 'static,
 ) -> impl IntoElement {
-    let color = if busy { theme.muted } else { color };
-    let hover_bg = theme.border;
-    let el = div()
-        .id(id)
-        .flex()
-        .items_center()
-        .gap_1()
-        .px_3()
-        .py(px(3.))
-        .rounded_md()
-        .border_1()
-        // Thin hue-tinted ring (TS bar look), not a full-strength border.
-        .border_color(gpui::rgba((color << 8) | 0x66))
-        .text_xs()
-        .text_color(rgb(color))
-        .child(crate::assets::ui_icon(icon, 14., color))
-        .child(label);
+    let el = Button::new(id, label)
+        .variant(variant)
+        .size(KumoSize::Sm)
+        .icon(icon)
+        .disabled(busy)
+        .render(&theme.kumo);
     if busy {
         el
     } else {
-        el.cursor_pointer()
-            .hover(move |s| s.bg(rgb(hover_bg)))
-            .on_click(cx.listener(move |a, _ev, _win, cx| {
-                f(a, cx);
-                cx.notify();
-            }))
+        el.on_click(cx.listener(move |a, _ev, _win, cx| {
+            f(a, cx);
+            cx.notify();
+        }))
     }
 }
 
-/// One always-visible diagnostic pill: colored icon + count on a faint tinted
-/// capsule (screenshot ref — counts show even at zero).
-fn diag_pill(icon: &'static str, count: usize, color: u32) -> impl IntoElement {
-    div()
-        .flex()
-        .items_center()
-        .gap_1()
-        .px_2()
-        .py(px(1.))
-        .rounded_full()
-        .border_1()
-        .border_color(gpui::rgba((color << 8) | 0x4d)) // thin hue ring
-        .bg(gpui::rgba((color << 8) | 0x1a)) // faint hue wash
-        .text_color(rgb(color))
-        .child(crate::assets::ui_icon(icon, 12., color))
-        .child(format!("{count}"))
+/// One always-visible diagnostic count — a Kumo Badge on the matching status
+/// tint. The counts show even at zero, so the bar does not reflow as
+/// diagnostics arrive.
+fn diag_pill(icon: &'static str, count: usize, variant: BadgeVariant, theme: &Theme) -> impl IntoElement {
+    Badge::new(format!("{count}"))
+        .variant(variant)
+        .icon(icon)
+        .tabular(true)
+        .render(&theme.kumo)
 }
 
 /// Left panel: the file-tree card (deliverable §2, floating-card look §2). When
@@ -6906,7 +6881,7 @@ fn left_panel_inner(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> 
                     .child(ch.to_string()),
             );
         }
-        return div()
+        return Card::new(&theme.kumo)
             .id("sidebar-collapsed")
             .flex()
             .flex_col()
@@ -6914,14 +6889,9 @@ fn left_panel_inner(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> 
             .w(px(28.))
             .h_full()
             .flex_none()
-            .rounded_lg()
-            .bg(rgb(theme.panel))
-            .border_1()
-            .border_color(rgb(theme.border))
-            .shadow(card_shadow())
-            .overflow_hidden()
+            .bg(theme.kumo.elevated)
             .cursor_pointer()
-            .hover(|s| s.bg(rgb(theme.border)))
+            .hover(|s| s.bg(theme.kumo.tint))
             .on_click(cx.listener(|a: &mut JadeApp, _e, _w, cx| {
                 a.toggle_sidebar();
                 cx.notify();
@@ -6935,20 +6905,17 @@ fn left_panel_inner(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> 
         SidebarTab::Files => file_tree::render(app, cx).into_any_element(),
         SidebarTab::Structure => structure_panel::render(app, cx).into_any_element(),
     };
-    div()
+    // A Kumo Card on the elevated layer — the same shell every floating region
+    // in the window now wears.
+    Card::new(&theme.kumo)
         .flex()
         .flex_col()
         .flex_none()
-        .gap_2()
+        .gap(scale::SPACE_2)
         .w(px(260.))
         .h_full()
-        .p(px(10.))
-        .rounded_lg()
-        .bg(rgb(theme.panel))
-        .border_1()
-        .border_color(rgb(theme.border))
-        .shadow(card_shadow())
-        .overflow_hidden()
+        .p(scale::SPACE_2_5)
+        .bg(theme.kumo.elevated)
         .child(structure_panel::tab_switcher(app, cx, theme))
         .child(
             // The tree/outline scrolls inside the card (min_h(0) so the flex
@@ -6967,17 +6934,14 @@ fn left_panel_inner(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> 
 /// the placeholder. With no workspace open (§2) the welcome overlay covers this
 /// area instead.
 fn center_content(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl IntoElement {
-    let base = div()
+    // The editor sits on the canvas, not on `base` — the code is the content,
+    // so it takes the darkest surface and the chrome lifts off it.
+    let base = Card::new(&theme.kumo)
         .relative()
         .flex()
         .flex_col()
         .flex_1()
-        .rounded_lg()
-        .bg(rgb(theme.bg))
-        .border_1()
-        .border_color(rgb(theme.border))
-        .shadow(card_shadow()) // floating-card look (§2, main.css:2342-2344)
-        .overflow_hidden();
+        .bg(theme.kumo.canvas);
 
     // No workspace: the card hosts the welcome overlay instead of the editor.
     if !app.workspace_opened {
@@ -6999,10 +6963,12 @@ fn center_content(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> im
 /// (outline + folder-open icon), and a shortcut-hint row. Mirrors the Electron
 /// `#welcome-overlay` styling in GPUI theme colors.
 fn welcome_overlay(cx: &mut Context<JadeApp>, theme: &Theme) -> impl IntoElement {
+    let t = &theme.kumo;
     let hint = |s: &str| {
-        div()
-            .text_color(rgb(theme.muted))
-            .child(s.to_string())
+        KumoText::new(s.to_string())
+            .tone(TextTone::Secondary)
+            .size(KumoSize::Xs)
+            .render(t)
     };
     div()
         .flex_1()
@@ -7014,42 +6980,30 @@ fn welcome_overlay(cx: &mut Context<JadeApp>, theme: &Theme) -> impl IntoElement
                 .flex()
                 .flex_col()
                 .items_center()
-                // welcome-title
-                .child(
-                    div()
-                        .text_color(rgb(theme.accent))
-                        .text_2xl()
-                        .child("Jade"),
-                )
+                // welcome-title — Kumo `heading1` (`text-3xl font-semibold`).
+                .child(Heading::new(HeadingLevel::One, "Jade").render(t))
                 // welcome-subtitle
                 .child(
-                    div()
-                        .mt(px(8.))
-                        .text_color(rgb(theme.muted))
-                        .text_sm()
-                        .child("Open a folder to get started"),
+                    div().mt(scale::SPACE_2).child(
+                        KumoText::new("Open a folder to get started")
+                            .tone(TextTone::Secondary)
+                            .size(KumoSize::Base)
+                            .render(t),
+                    ),
                 )
-                // Open Folder button (outline + folder-open icon).
+                // The one primary action on the screen, so it takes the brand
+                // fill — Kumo `variant="primary" size="lg"`.
                 .child(
-                    div()
-                        .id("open-folder-btn")
-                        .mt(px(24.))
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .px(px(24.))
-                        .py(px(8.))
-                        .rounded_md()
-                        .border_1()
-                        .border_color(rgb(theme.border))
-                        .text_color(rgb(theme.text))
-                        .text_sm()
-                        .cursor_pointer()
-                        .on_click(cx.listener(|a: &mut JadeApp, _ev, _win, cx| {
-                            a.prompt_open_project(cx);
-                        }))
-                        .child(crate::assets::ui_icon("folder-open", 14., theme.text))
-                        .child("Open Folder"),
+                    div().mt(scale::SPACE_6).child(
+                        Button::new("open-folder-btn", "Open Folder")
+                            .variant(ButtonVariant::Primary)
+                            .size(KumoSize::Lg)
+                            .icon("folder-open")
+                            .render(t)
+                            .on_click(cx.listener(|a: &mut JadeApp, _ev, _win, cx| {
+                                a.prompt_open_project(cx);
+                            })),
+                    ),
                 )
                 // welcome-shortcuts hint row.
                 .child(
@@ -7057,7 +7011,6 @@ fn welcome_overlay(cx: &mut Context<JadeApp>, theme: &Theme) -> impl IntoElement
                         .mt(px(32.))
                         .flex()
                         .gap(px(20.))
-                        .text_xs()
                         .child(hint("⌘B File tree"))
                         .child(hint("⌘` Terminal"))
                         .child(hint("⌘E Flow arrows"))
@@ -7084,21 +7037,17 @@ fn runtime_sidebar(
     if !app.runtime_visible {
         return div().into_any_element();
     }
-    let card = div()
+    let card = Card::new(&theme.kumo)
         .id("runtime-sidebar")
         .flex()
         .flex_none()
         .flex_col()
-        .gap_3()
+        .gap(scale::SPACE_3)
         .w(px(280.))
         .h_full()
         .min_h(px(0.))
-        .p(px(10.))
-        .rounded_lg()
-        .bg(rgb(theme.panel))
-        .border_1()
-        .border_color(rgb(theme.border))
-        .shadow(card_shadow()) // floating-card look (§2, main.css:2342-2344)
+        .p(scale::SPACE_2_5)
+        .bg(theme.kumo.elevated)
         .overflow_y_scroll()
         .child(runtime_panel::render(app, bench_handle, cx))
         .child(training_view::render(app, cx))
@@ -7134,20 +7083,16 @@ fn bottom_panel(
 ) -> impl IntoElement {
     let is_term = app.bottom_view == BottomView::Terminal;
 
-    // View-toggle tabs: TERMINAL | OUTPUT.
+    // View-toggle tabs: TERMINAL | OUTPUT. A Kumo segmented Tabs at `size="sm"`
+    // — a raised pill riding in a recessed trough.
+    let bar = TabBar::new(TabsAppearance::Segmented).size(KumoSize::Sm);
     let view_tab = |id: &'static str, label: &'static str, active: bool, view: BottomView| {
-        let color = if active { theme.text } else { theme.muted };
-        div()
-            .id(id)
-            .px_2()
-            .text_xs()
-            .cursor_pointer()
-            .text_color(rgb(color))
-            .on_click(cx.listener(move |a: &mut JadeApp, _ev, _win, cx| {
+        bar.trigger(TabItem::new(id, label, active), &theme.kumo).on_click(
+            cx.listener(move |a: &mut JadeApp, _ev, _win, cx| {
                 a.set_bottom_view(view);
                 cx.notify();
-            }))
-            .child(label)
+            }),
+        )
     };
 
     let header = div()
@@ -7155,23 +7100,24 @@ fn bottom_panel(
         .flex_row()
         .items_center()
         .justify_between()
-        .h(px(22.))
-        .px(px(8.))
+        .h(px(34.))
+        .px(scale::SPACE_2)
+        .border_b_1()
+        .border_color(theme.kumo.hairline)
         .child(
             div()
                 .flex()
                 .flex_row()
                 .items_center()
-                .gap_2()
+                .gap(scale::SPACE_2)
+                .child(kumo::icon("terminal", 13., theme.kumo.text_subtle))
                 .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .text_color(rgb(theme.muted))
-                        .child(crate::assets::ui_icon("terminal", 13., theme.muted)),
-                )
-                .child(view_tab("bv-terminal", "TERMINAL", is_term, BottomView::Terminal))
-                .child(view_tab("bv-output", "OUTPUT", !is_term, BottomView::Output)),
+                    TabBar::new(TabsAppearance::Segmented)
+                        .size(KumoSize::Sm)
+                        .push(view_tab("bv-terminal", "Terminal", is_term, BottomView::Terminal))
+                        .push(view_tab("bv-output", "Output", !is_term, BottomView::Output))
+                        .render(&theme.kumo),
+                ),
         )
         .child(
             div()
@@ -7180,33 +7126,19 @@ fn bottom_panel(
                 .items_center()
                 .gap_2()
                 // New-terminal.
-                .child(
-                    div()
-                        .id("term-new")
-                        .flex()
-                        .items_center()
-                        .text_color(rgb(theme.muted))
-                        .cursor_pointer()
-                        .on_click(cx.listener(|a: &mut JadeApp, _ev, _win, cx| {
-                            a.action_new_terminal();
-                            cx.notify();
-                        }))
-                        .child(crate::assets::ui_icon("plus", 14., theme.muted)),
-                )
+                .child(kumo::button::icon_button("term-new", "plus", false, &theme.kumo).on_click(
+                    cx.listener(|a: &mut JadeApp, _ev, _win, cx| {
+                        a.action_new_terminal();
+                        cx.notify();
+                    }),
+                ))
                 // Minimize (hide the strip).
-                .child(
-                    div()
-                        .id("term-min")
-                        .flex()
-                        .items_center()
-                        .text_color(rgb(theme.muted))
-                        .cursor_pointer()
-                        .on_click(cx.listener(|a: &mut JadeApp, _ev, _win, cx| {
-                            a.action_toggle_output(cx);
-                            cx.notify();
-                        }))
-                        .child(crate::assets::ui_icon("minus", 14., theme.muted)),
-                ),
+                .child(kumo::button::icon_button("term-min", "minus", false, &theme.kumo).on_click(
+                    cx.listener(|a: &mut JadeApp, _ev, _win, cx| {
+                        a.action_toggle_output(cx);
+                        cx.notify();
+                    }),
+                )),
         );
 
     let body = if is_term {
@@ -7246,18 +7178,12 @@ fn bottom_panel(
         .px(px(6.))
         .child(resize_handle)
         .child(
-            div()
+            Card::new(&theme.kumo)
                 .id("bottom-panel")
                 .flex()
                 .flex_col()
                 .h(px(app.bottom_height))
                 .w_full()
-                .rounded_lg()
-                .bg(rgb(theme.bg))
-                .border_1()
-                .border_color(rgb(theme.border))
-                .shadow(card_shadow())
-                .overflow_hidden()
                 .child(header)
                 .child(body),
         )
@@ -7356,47 +7282,71 @@ fn memory_bar(app: &JadeApp, theme: &Theme) -> impl IntoElement {
         .flex_row()
         .items_center()
         .justify_between()
-        .h(px(24.))
-        .px(px(10.))
-        .bg(rgb(theme.panel))
+        .h(px(26.))
+        .px(scale::SPACE_3)
+        .bg(theme.kumo.elevated)
         .border_t_1()
-        .border_color(rgb(theme.border))
+        .border_color(theme.kumo.hairline)
         .child(
             div()
                 .flex()
                 .items_center()
-                .gap_3()
-                .child(metric("SYS MEM", v.sys_mem, Level::Normal, theme))
-                .child(metric("HEAP", v.heap, v.heap_level, theme))
-                .child(metric("PEAK", v.peak, v.peak_level, theme))
-                .child(metric("PRESSURE", v.pressure_dots, v.pressure_level, theme)),
+                .gap(scale::SPACE_4)
+                .child(metric("Sys mem", v.sys_mem, Level::Normal, theme))
+                .child(metric("Heap", v.heap, v.heap_level, theme))
+                .child(metric("Peak", v.peak, v.peak_level, theme))
+                .child(metric("Pressure", v.pressure_dots, v.pressure_level, theme)),
         )
         .child(
             div()
                 .flex()
                 .items_center()
-                .gap_3()
+                .gap(scale::SPACE_4)
                 .child(metric("CPU", v.cpu, v.cpu_level, theme))
                 .child(metric("GPU", v.gpu, v.gpu_level, theme)),
         )
 }
 
+/// One label/value pair on the memory bar. The value is monospaced, because a
+/// number that changes every frame must not shift the label beside it.
 fn metric(label: &str, value: String, level: Level, theme: &Theme) -> impl IntoElement {
     let vc = match level {
-        Level::Normal => theme.text,
-        Level::Warn => theme.amber,
-        Level::Danger => theme.red,
+        Level::Normal => theme.kumo.text_default,
+        Level::Warn => theme.kumo.text_warning,
+        Level::Danger => theme.kumo.text_danger,
     };
     div()
         .flex()
         .items_center()
-        .gap_1()
-        .text_xs()
-        .child(div().text_color(rgb(theme.muted)).child(label.to_string()))
-        .child(div().text_color(rgb(vc)).child(value))
+        .gap(scale::SPACE_1)
+        .text_size(scale::TEXT_XS)
+        .child(
+            KumoText::new(label.to_string())
+                .tone(TextTone::Secondary)
+                .size(KumoSize::Xs)
+                .render(&theme.kumo),
+        )
+        .child(
+            div()
+                .font_family("JetBrains Mono")
+                .text_color(vc)
+                .child(value),
+        )
 }
 
 fn status_strip(app: &JadeApp, theme: &Theme) -> impl IntoElement {
+    // A Kumo dot Badge leads the strip: green once telemetry has arrived, a
+    // neutral dot while the socket is still quiet. One glance answers "is the
+    // probe talking to me", which is what the strip is for.
+    let live = app.scalars_seen + app.timings_seen + app.tensors_seen > 0;
+    let status = Badge::new(if live { "Live" } else { "Idle" })
+        .dot(if live {
+            DotColor::Success
+        } else {
+            DotColor::Neutral
+        })
+        .render(&theme.kumo);
+
     let mut text = format!(
         "socket {}   ·   scalars {}   timings {}   tensors {}",
         app.server.socket_path().display(),
@@ -7413,12 +7363,19 @@ fn status_strip(app: &JadeApp, theme: &Theme) -> impl IntoElement {
     div()
         .flex()
         .items_center()
-        .h(px(22.))
-        .px(px(10.))
-        .bg(rgb(theme.panel))
+        .gap(scale::SPACE_2_5)
+        .h(px(26.))
+        .px(scale::SPACE_3)
+        .bg(theme.kumo.elevated)
         .border_t_1()
-        .border_color(rgb(theme.border))
-        .child(div().text_color(rgb(theme.muted)).text_xs().child(text))
+        .border_color(theme.kumo.hairline)
+        .child(status)
+        .child(
+            KumoText::new(text)
+                .tone(TextTone::Secondary)
+                .size(KumoSize::Xs)
+                .render(&theme.kumo),
+        )
 }
 
 #[cfg(test)]

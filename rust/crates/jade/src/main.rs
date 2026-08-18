@@ -49,6 +49,7 @@ mod format;
 mod frequency;
 mod ghost;
 mod highlight;
+mod kumo;
 #[cfg(test)]
 mod interaction_tests;
 mod memory_bar;

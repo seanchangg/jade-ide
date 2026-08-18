@@ -21,6 +21,7 @@ use crate::app::{CompletionState, HoverState, JadeApp, SignatureState};
 use crate::decorations::flow::GlyphKind;
 use crate::decorations::{self, RuntimeAlloc};
 use crate::editor_view::{self, CellStyle};
+use crate::kumo::{scale, Badge, BadgeVariant, Meter, Size as KumoSize, Text as KumoText, TextTone};
 use crate::theme::Theme;
 
 /// Editor metrics (§4.1 "editor look").
@@ -195,11 +196,16 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> gpui::AnyElement {
                     marked,
                     &line_matches,
                 );
+                // Hard tabs expand to spaces before shaping (CoreText would lay
+                // a raw tab out on its own 28px stops, off the char grid the
+                // caret uses), so the highlight runs move onto the expanded text.
+                let display = editor_view::DisplayLine::new(text);
                 let highlights = cells
                     .into_iter()
-                    .map(|(r, s)| (r, cell_to_style(&s, &theme)))
+                    .map(|(r, s)| (display.map_range(r), cell_to_style(&s, &theme)))
                     .collect::<Vec<_>>();
-                let styled = gpui::StyledText::new(text).with_highlights(highlights);
+                let styled =
+                    gpui::StyledText::new(display.text.clone()).with_highlights(highlights);
 
                 // Merged end-of-line annotation (§4.5).
                 let size = tab.sizes.get(&line_no).map(String::as_str);
@@ -438,7 +444,10 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> gpui::AnyElement {
                         div()
                             .absolute()
                             .top_0()
-                            .left(px(editor_view::col_to_px(caret_point.col, char_w)))
+                            .left(px(editor_view::col_to_px(
+                                display.display_col(caret_point.col),
+                                char_w,
+                            )))
                             .w(px(2.))
                             .h(px(LINE_H))
                             .bg(rgba_a(theme.accent, if focused { 1.0 } else { 0.35 }))
@@ -614,20 +623,24 @@ fn find_btn(
     cx: &mut Context<JadeApp>,
     on_click: impl Fn(&mut JadeApp, &mut Context<JadeApp>) + 'static,
 ) -> gpui::Stateful<gpui::Div> {
-    let hover_bg = theme.border;
+    // Kumo Button geometry at `size="sm"` (`h-6.5 rounded-md px-2 text-xs`),
+    // ghost at rest and brand-tinted while its toggle is on.
+    let t = &theme.kumo;
+    let hover_bg = t.tint;
     let mut b = div()
         .id(id)
         .flex()
         .items_center()
         .justify_center()
-        .h(px(20.))
-        .min_w(px(22.))
-        .px(px(5.))
-        .rounded_md()
-        .text_xs()
+        .h(scale::H_6_5)
+        .min_w(px(24.))
+        .px(scale::SPACE_2)
+        .rounded(scale::RADIUS_MD)
+        .text_size(scale::TEXT_XS)
+        .font_weight(gpui::FontWeight::MEDIUM)
         .cursor_pointer()
-        .text_color(rgb(if active { theme.accent } else { theme.muted }))
-        .hover(move |st| st.bg(rgb(hover_bg)))
+        .text_color(if active { t.brand } else { t.text_subtle })
+        .hover(move |st| st.bg(hover_bg))
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |app: &mut JadeApp, _ev: &MouseDownEvent, _w, cx| {
@@ -637,7 +650,7 @@ fn find_btn(
         )
         .child(label.into());
     if active {
-        b = b.bg(rgba_a(theme.accent, 0.15));
+        b = b.bg(t.success_tint);
     }
     b
 }
@@ -806,7 +819,7 @@ fn find_bar(app: &JadeApp, focus: FocusHandle, cx: &mut Context<JadeApp>) -> gpu
         .items_center()
         .justify_center()
         .w(px(16.))
-        .h(px(22.))
+        .h(scale::H_6_5)
         .flex_none()
         .cursor_pointer()
         .on_mouse_down(
@@ -824,7 +837,7 @@ fn find_bar(app: &JadeApp, focus: FocusHandle, cx: &mut Context<JadeApp>) -> gpu
                 cx.notify();
             }),
         )
-        .child(crate::assets::ui_icon(chevron, 12., theme.muted));
+        .child(crate::kumo::icon(chevron, 12., theme.kumo.text_subtle));
 
     // Find row: [chevron] [ query field ] [k of N] [Aa] [‹] [›] [×]
     let find_row = div()
@@ -847,9 +860,10 @@ fn find_bar(app: &JadeApp, focus: FocusHandle, cx: &mut Context<JadeApp>) -> gpu
         ))
         .child(
             div()
-                .min_w(px(58.))
-                .text_xs()
-                .text_color(rgb(theme.muted))
+                .min_w(px(62.))
+                .font_family("JetBrains Mono") // the count must not reflow the row
+                .text_size(scale::TEXT_XS)
+                .text_color(theme.kumo.text_subtle)
                 .child(count_label),
         )
         .child(find_btn("find-case", "Aa", state.case_sensitive, &theme, cx, |app, _cx| {
@@ -897,15 +911,13 @@ fn find_bar(app: &JadeApp, focus: FocusHandle, cx: &mut Context<JadeApp>) -> gpu
         bar = bar.child(replace_row);
     }
 
-    div()
+    // A Kumo overlay surface floated over the editor: `bg-kumo-overlay`,
+    // `rounded-lg`, the standard ring, and a drop shadow.
+    crate::kumo::Surface::overlay(&theme.kumo)
         .absolute()
-        .top(px(8.))
-        .right(px(16.))
-        .p(px(6.))
-        .rounded_lg()
-        .bg(rgb(theme.panel))
-        .border_1()
-        .border_color(rgb(theme.border))
+        .top(scale::SPACE_2)
+        .right(scale::SPACE_4)
+        .p(scale::SPACE_1_5)
         // Absorb mouse events so a click on the bar never falls through to the
         // editor rows painted underneath (which would move the caret / focus).
         .occlude()
@@ -1043,6 +1055,16 @@ fn popup_x(col: usize, flow_visible: bool, char_w: f32, h_scroll: f32) -> f32 {
     8.0 + GUTTER_W + FOLD_W + glyph + editor_view::col_to_px(col, char_w) + h_scroll
 }
 
+/// The display column of char column `col` on buffer row `row` of the active tab
+/// — what the popups anchor at, so a tab-indented row puts them under the glyph
+/// (see [`editor_view::DisplayLine`]).
+fn display_col(app: &JadeApp, row: usize, col: usize) -> usize {
+    app.editor
+        .active_tab()
+        .map(|t| editor_view::DisplayLine::new(t.line(row)).display_col(col))
+        .unwrap_or(col)
+}
+
 /// The y pixel (top) of the row below `row`, given the current scroll top.
 fn popup_y(row: usize, scroll_top: usize) -> f32 {
     let rel = row.saturating_sub(scroll_top);
@@ -1062,6 +1084,7 @@ fn completion_popup(
     }
     let theme = app.theme.clone();
     let (row, col) = c.anchor;
+    let col = display_col(app, row, col);
     let row = app.editor.active_tab().map(|t| t.display_row(row)).unwrap_or(row);
     let left = popup_x(col, flow_visible, app.char_w(), app.editor_h_scroll());
     let top = popup_y(row, scroll_top);
@@ -1142,6 +1165,7 @@ fn signature_popup(
     }
     let theme = app.theme.clone();
     let (row, col) = s.anchor;
+    let col = display_col(app, row, col);
     let row = app.editor.active_tab().map(|t| t.display_row(row)).unwrap_or(row);
     let left = popup_x(col, flow_visible, app.char_w(), app.editor_h_scroll());
     let rel = row.saturating_sub(scroll_top);
@@ -1208,8 +1232,9 @@ fn signature_popup(
 fn hover_popup(app: &JadeApp, flow_visible: bool, scroll_top: usize) -> Option<gpui::AnyElement> {
     let h: &HoverState = app.hover.as_ref()?;
     let theme = app.theme.clone();
+    let col = display_col(app, h.row, h.col);
     let row = app.editor.active_tab().map(|t| t.display_row(h.row)).unwrap_or(h.row);
-    let left = popup_x(h.col, flow_visible, app.char_w(), app.editor_h_scroll());
+    let left = popup_x(col, flow_visible, app.char_w(), app.editor_h_scroll());
     let top = popup_y(row, scroll_top);
     Some(
         div()
@@ -1278,17 +1303,19 @@ fn runtime_allocs_for(app: &JadeApp, tab: &crate::editor_view::OpenTab) -> HashM
 /// an `x` close icon, the active tab underlined. Middle-click also closes (GPUI exposes
 /// the mouse button on the down event).
 pub fn tab_strip(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl IntoElement {
-    // Seamless strip (screenshot ref): darker band, active tab shares the
-    // editor's background and carries the accent underline — no chip boxes.
+    // Kumo Tabs at `appearance="underline"`: flat triggers on the strip with a
+    // 2px brand bar under the active one, and a hairline along the whole list.
     let mut strip = div()
         .id("tab-strip")
         .flex()
         .flex_row()
-        .items_end()
-        .h(px(34.))
+        .items_stretch()
+        .h(px(36.))
         .w_full()
-        .px(px(6.))
-        .bg(rgb(theme.panel))
+        .px(scale::SPACE_1_5)
+        .bg(theme.kumo.elevated)
+        .border_b_1()
+        .border_color(theme.kumo.hairline)
         .overflow_x_hidden();
 
     for (i, tab) in app.editor.tabs.iter().enumerate() {
@@ -1312,47 +1339,34 @@ fn xp_bar(app: &JadeApp, theme: &Theme) -> impl IntoElement {
         0.0
     };
 
+    let t = &theme.kumo;
+    // A Kumo Meter (`h-2 rounded-full bg-kumo-fill` with a brand bar) plus the
+    // level and streak as Badges.
     let mut bar = div()
         .id("xp-bar")
         .flex()
         .flex_row()
         .items_center()
-        .gap_2()
-        .px(px(6.))
+        .gap(scale::SPACE_2)
+        .px(scale::SPACE_2)
         // Tooltip parity with the TS: progress / needed to next level · total.
         .child(
-            div()
-                .text_xs()
-                .text_color(rgb(theme.accent))
-                .child(format!("L{}", info.level)),
+            Badge::new(format!("L{}", info.level))
+                .variant(BadgeVariant::Success)
+                .render(t),
         )
+        .child(div().w(px(60.)).child(Meter::new(pct / 100.0).render(t)))
         .child(
-            // Progress track + fill.
-            div()
-                .w(px(60.))
-                .h(px(6.))
-                .rounded_full()
-                .bg(rgb(theme.border))
-                .overflow_hidden()
-                .child(
-                    div()
-                        .h_full()
-                        .w(gpui::relative(pct / 100.0))
-                        .bg(rgb(theme.accent)),
-                ),
-        )
-        .child(
-            div()
-                .text_xs()
-                .text_color(rgb(theme.muted))
-                .child(format!("{}/{}", info.progress, info.needed)),
+            KumoText::new(format!("{}/{}", info.progress, info.needed))
+                .tone(TextTone::MonoSecondary)
+                .size(KumoSize::Xs)
+                .render(t),
         );
     if streak > 1 {
         bar = bar.child(
-            div()
-                .text_xs()
-                .text_color(rgb(theme.amber))
-                .child(format!("×{streak}")),
+            Badge::new(format!("×{streak}"))
+                .variant(BadgeVariant::Warning)
+                .render(t),
         );
     }
     bar
@@ -1366,24 +1380,24 @@ fn tab_chip(
     theme: &Theme,
     cx: &mut Context<JadeApp>,
 ) -> impl IntoElement {
-    let fg = if active { theme.text } else { theme.muted };
-    let hover_bg = theme.border;
+    let t = &theme.kumo;
+    // One Kumo underline trigger: `text-kumo-subtle` at rest,
+    // `aria-selected:text-kumo-default` with the brand bar when active.
+    let fg = if active { t.text_default } else { t.text_subtle };
+    let hover_bg = t.tint;
 
-    // Seamless tab: full strip height, the active tab takes the editor's own
-    // background (merging into the code below) + a 2px accent underline;
-    // inactive tabs are flat text on the strip band.
     let mut chip = div()
         .id(("tab", index))
+        .relative()
         .flex()
         .flex_row()
         .items_center()
-        .gap_1()
-        .h(px(30.))
-        .px(px(14.))
-        .rounded_t_md()
-        .text_xs()
+        .gap(scale::SPACE_1)
+        .h_full()
+        .px(scale::SPACE_3)
+        .text_size(scale::TEXT_XS)
         .cursor_pointer()
-        .text_color(rgb(fg))
+        .text_color(fg)
         // Middle-click closes (mouse-down carries the button).
         .on_mouse_down(
             gpui::MouseButton::Middle,
@@ -1402,28 +1416,38 @@ fn tab_chip(
         .child(div().child(name.to_string()));
 
     if active {
-        chip = chip.bg(rgb(theme.bg)).border_b_2().border_color(rgb(theme.accent));
+        // `isUnderline && "absolute bottom-0 h-0.5 bg-kumo-brand"`.
+        chip = chip
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .child(
+                div()
+                    .absolute()
+                    .bottom_0()
+                    .left_0()
+                    .right_0()
+                    .h(px(2.))
+                    .bg(t.brand),
+            );
     } else {
-        chip = chip.hover(move |st| st.bg(rgb(hover_bg)));
+        chip = chip.hover(move |st| st.bg(hover_bg));
     }
 
     // Dirty dot ● from buffer.is_dirty() (§3); silent-close semantics preserved.
     if dirty {
-        chip = chip.child(div().text_color(rgb(theme.accent)).child("●"));
+        chip = chip.child(div().size(px(6.)).rounded_full().bg(t.brand));
     }
 
     // Close button.
     chip.child(
         div()
             .id(("tab-close", index))
-            .px_1()
-            .text_color(rgb(theme.muted))
+            .px(scale::SPACE_1)
             .cursor_pointer()
             .on_click(cx.listener(move |app, _ev, _win, cx| {
                 app.close_tab(index);
                 app.schedule_ui_save(cx);
                 cx.notify();
             }))
-            .child(crate::assets::ui_icon("x", 12., theme.muted)),
+            .child(crate::kumo::icon("x", 12., t.text_subtle)),
     )
 }

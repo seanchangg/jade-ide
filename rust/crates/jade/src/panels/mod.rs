@@ -36,7 +36,7 @@ pub fn input_line(
     cursor: usize,
 ) -> Div {
     let caret = || {
-        let mut c = div().w(px(1.5)).h(px(13.)).flex_none();
+        let mut c = div().w(px(1.5)).h(px(14.)).flex_none();
         if lit {
             c = c.bg(rgb(caret_color));
         }
@@ -46,7 +46,7 @@ pub fn input_line(
         div()
             .whitespace_nowrap()
             .flex_none()
-            .text_color(rgb(theme.text))
+            .text_color(theme.kumo.text_default)
             .child(s.to_string())
     };
 
@@ -55,9 +55,11 @@ pub fn input_line(
         if focused {
             row = row.child(caret());
         }
+        // Kumo's `kumo-input-placeholder` uses its own token, one step fainter
+        // than the secondary text color.
         row = row.child(
             div()
-                .text_color(rgb(theme.muted))
+                .text_color(theme.kumo.text_placeholder)
                 .child(placeholder.to_string()),
         );
     } else if focused {

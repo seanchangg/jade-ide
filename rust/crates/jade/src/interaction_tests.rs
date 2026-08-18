@@ -2253,3 +2253,63 @@ async fn sync_scope_follows_tree_selection(cx: &mut TestAppContext) {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A tab-indented file: the caret bar must land on the glyph the caret column
+/// points at, and a click on that glyph must come back as the same column.
+///
+/// The regression: the renderer handed CoreText a raw `\t`, which lays it out on
+/// its own 28px stops, while the caret drew at `char column × 7.83px`. Every
+/// tab-indented line drew the caret away from its text. Tabs now expand to
+/// spaces at 4-column stops, and x ↔ column mapping goes through the display
+/// column.
+#[gpui::test]
+async fn tab_indented_line_places_the_caret_on_the_glyph(cx: &mut TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("jade-tabs-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("tabs.cpp");
+    // Row 1 is "\tint alpha = 1;" — it draws as "    int alpha = 1;", so char
+    // column 4 ('t' of "int") sits at display column 7.
+    std::fs::write(&file, "int main() {\n\tint alpha = 1;\n}\n").unwrap();
+    let (deps, app_rx) = test_deps(dir.clone());
+
+    let (app, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps, app_rx));
+    app.update_in(cx, |app, _window, cx| {
+        app.open_file(file.clone());
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    let cw = app.update_in(cx, |app, _w, _cx| app.char_w());
+    let cell = cx
+        .debug_bounds("code-cell-1")
+        .expect("code cell for row 1 was painted");
+    // Click at display column 7 → char column 4.
+    let x = cell.origin.x + px(7.0 * cw);
+    let y = cell.origin.y + px(crate::panels::code_view::LINE_H / 2.0);
+    cx.simulate_click(point(x, y), Modifiers::default());
+    app.update_in(cx, |app, _window, _cx| {
+        let caret = app.editor.active_tab().unwrap().caret_point();
+        assert_eq!((caret.row, caret.col), (1, 4), "click on a tab-indented row");
+    });
+    cx.run_until_parked();
+
+    // The painted caret bar sits at the display column, not the char column
+    // (which would draw it 3 columns to the left, inside the indent). Both
+    // bounds come from the same post-click frame.
+    let cell = cx.debug_bounds("code-cell-1").expect("code cell repainted");
+    let caret = cx
+        .debug_bounds("editor-caret")
+        .expect("caret bar was painted");
+    let offset = f32::from(caret.origin.x - cell.origin.x);
+    assert!(
+        (offset - 7.0 * cw).abs() < 1.0,
+        "caret bar at display column 7 ({} px), got {offset} px (the char column \
+         would be {} px)",
+        7.0 * cw,
+        4.0 * cw
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+

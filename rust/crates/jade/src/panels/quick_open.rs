@@ -10,9 +10,10 @@
 //! The matcher, the 10-result cap, and the relative-path-hint rule all live in
 //! the pure `crate::quick_open` module; this file only paints.
 
-use gpui::{div, prelude::*, px, rgb, Context, FocusHandle, KeyDownEvent, SharedString};
+use gpui::{div, prelude::*, px, Context, FocusHandle, KeyDownEvent, SharedString};
 
 use crate::app::JadeApp;
+use crate::kumo::{scale, Size as KumoSize, Surface, Text as KumoText, TextTone};
 
 /// True when a keystroke should type a character: a printable `key_char` with no
 /// command/control/alt modifier (so ⌘P / ⌃C don't insert text).
@@ -32,14 +33,18 @@ pub fn overlay(app: &JadeApp, focus: FocusHandle, cx: &mut Context<JadeApp>) -> 
 
     // Input row: the captured query buffer + caret (before the placeholder
     // when empty — shared fake-input rule).
+    // Kumo input geometry at `size="lg"`: `h-10 px-4`, with the search glyph
+    // leading the field the way Kumo's InputGroup places an adornment.
     let input = div()
         .flex()
         .flex_row()
         .items_center()
-        .h(px(34.))
-        .px(px(10.))
+        .gap(scale::SPACE_2)
+        .h(scale::H_10)
+        .px(scale::SPACE_4)
         .border_b_1()
-        .border_color(rgb(theme.border))
+        .border_color(theme.kumo.hairline)
+        .child(crate::kumo::icon("search", 15., theme.kumo.text_subtle))
         .child(crate::panels::input_line(
             &query,
             "Search files by name…",
@@ -51,15 +56,15 @@ pub fn overlay(app: &JadeApp, focus: FocusHandle, cx: &mut Context<JadeApp>) -> 
         ));
 
     // Results list.
-    let mut list = div().flex().flex_col().py_1();
+    let mut list = div().flex().flex_col().p(px(4.));
     if results.is_empty() {
         list = list.child(
-            div()
-                .px(px(10.))
-                .py_1()
-                .text_color(rgb(theme.muted))
-                .text_xs()
-                .child("No matching files"),
+            div().px(scale::SPACE_2_5).py(scale::SPACE_2).child(
+                KumoText::new("No matching files")
+                    .tone(TextTone::Secondary)
+                    .size(KumoSize::Sm)
+                    .render(&theme.kumo),
+            ),
         );
     } else {
         for (idx, m) in results.iter().enumerate() {
@@ -71,22 +76,26 @@ pub fn overlay(app: &JadeApp, focus: FocusHandle, cx: &mut Context<JadeApp>) -> 
                 .flex_row()
                 .items_center()
                 .justify_between()
-                .h(px(24.))
-                .px(px(10.))
-                .text_xs()
+                .h(px(28.))
+                .px(scale::SPACE_2_5)
+                .rounded(scale::RADIUS_MD)
+                .text_size(scale::TEXT_SM)
                 .cursor_pointer()
                 .on_click(cx.listener(move |a: &mut JadeApp, _e, _w, cx| {
                     a.quick_open_open(path.clone());
                     cx.notify();
                 }))
-                .child(div().text_color(rgb(theme.text)).child(m.name.clone()));
+                .child(div().text_color(theme.kumo.text_default).child(m.name.clone()));
             if is_sel {
-                row = row.bg(rgb(theme.border));
+                row = row.bg(theme.kumo.tint);
+            } else {
+                let hover = theme.kumo.fill_hover;
+                row = row.hover(move |s| s.bg(hover));
             }
             if let Some(hint) = &m.hint {
                 row = row.child(
                     div()
-                        .text_color(rgb(theme.muted))
+                        .text_color(theme.kumo.text_subtle)
                         .child(SharedString::from(hint.clone())),
                 );
             }
@@ -94,15 +103,14 @@ pub fn overlay(app: &JadeApp, focus: FocusHandle, cx: &mut Context<JadeApp>) -> 
         }
     }
 
-    let panel = div()
+    // Kumo's overlay surface: `bg-kumo-overlay` in a `rounded-lg` shell with
+    // the standard ring and a drop shadow, so the panel reads as floating over
+    // the editor rather than cut into it.
+    let panel = Surface::overlay(&theme.kumo)
         .w(px(520.))
         .max_h(px(360.))
         .flex()
         .flex_col()
-        .rounded_lg()
-        .bg(rgb(theme.panel))
-        .border_1()
-        .border_color(rgb(theme.border))
         .overflow_hidden()
         .child(input)
         .child(
@@ -140,6 +148,9 @@ pub fn overlay(app: &JadeApp, focus: FocusHandle, cx: &mut Context<JadeApp>) -> 
                 .top_0()
                 .left_0()
                 .size_full()
+                // Kumo's Dialog backdrop: the page dims so the panel is the
+                // only lit surface while it is open.
+                .bg(gpui::rgba(0x00000066))
                 .on_click(cx.listener(|a: &mut JadeApp, _e, _w, cx| {
                     a.close_quick_open();
                     cx.notify();
